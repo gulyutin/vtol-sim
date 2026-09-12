@@ -1,4 +1,5 @@
 import type { Profile } from '../sim/profile';
+import osmUrl from './osm.bin?url';
 
 /*
  * Демо-профиль: условный VTOL-самолёт схемы «4 + 1» массой около 15 кг. Числа правдоподобные,
@@ -12,6 +13,7 @@ const PAYLOAD_REF_KG = 1.0;
 export const PROFILE: Profile = {
   title: 'VTOL-симулятор миссии',
   modelName: 'aircraft',
+  osmUrl,
 
   cruiseReference: { iasMs: 22, powerW: 950, massKg: TAKEOFF_MASS_REF_KG, air: { altitudeM: 300, temperatureC: 15 } },
   hoverReference: { rotorPowerW: 2600, massKg: TAKEOFF_MASS_REF_KG, air: { altitudeM: 150, temperatureC: 15 } },

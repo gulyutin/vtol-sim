@@ -2,6 +2,9 @@ import 'leaflet/dist/leaflet.css';
 import * as THREE from 'three';
 import './ui/style.css';
 import { PROFILE } from '@profile';
+import { parseOsm } from './sim/osm';
+import { loadQuality, QUALITY, saveQuality } from './ui/quality';
+import { Preparation, PREP_STEPS, type PrepStepId } from './game/preparation';
 import { buildMission, departure, forecastWeather, REGION, SCENARIOS, type Mission, type Scenario, type Settings } from './game/scenarios';
 import { blocked, preflightChecks, type Check } from './game/preflight';
 import { actualWeather } from './game/weather';
@@ -78,6 +81,17 @@ function run(terrain: Terrain, bounds: Bounds) {
   let pastDistanceM = 0;
   let profile: ProfileData = { dist: [], terrain: [], plan: [] };
   let checks: Check[] = [];
+  // Предполётная подготовка (РЛЭ, прил. А); по желанию оператора — обязательна перед АРМ.
+  const PREP_KEY = 'vtol-sim.prepRequired';
+  const prep = new Preparation();
+  let prepRequired = (() => {
+    try {
+      return localStorage.getItem(PREP_KEY) === '1';
+    } catch {
+      return false;
+    }
+  })();
+  let prepView = '';
 
   const luxAt = (t: number) =>
     illuminanceLux(sunPosition(new Date(departure(scenario, settings).getTime() + t * 1000), siteA).elevationDeg, scenario.cloudCover);
@@ -119,6 +133,7 @@ function run(terrain: Terrain, bounds: Bounds) {
     },
     onRestart() {
       started = false;
+      prep.reset();
       targetMode = false;
       gcs.targetMode(false);
       replan();
@@ -137,6 +152,24 @@ function run(terrain: Terrain, bounds: Bounds) {
     onCamera(m) {
       world.setCameraMode(m);
     },
+    onQuality(q) {
+      saveQuality(q);
+      world.setQuality(QUALITY[q]);
+    },
+    onPrepStep(id) {
+      const s = flight.state;
+      if (s.mode !== 'ground' || s.armed) return gcs.log(s.t, 'Подготовка — на земле, до АРМ', 'warn');
+      const err = prep.start(id, performance.now() / 1000);
+      if (err) gcs.log(s.t, err, 'warn');
+    },
+    onPrepRequired(on) {
+      prepRequired = on;
+      try {
+        localStorage.setItem(PREP_KEY, on ? '1' : '0');
+      } catch {
+        // Не сохранится — не страшно.
+      }
+    },
     onResize() {
       world.resize();
       map.invalidate();
@@ -150,7 +183,8 @@ function run(terrain: Terrain, bounds: Bounds) {
   });
 
   document.title = PROFILE.title;
-  const world = new World(gcs.viewEl, { terrain, site: siteA, bounds, area: [], maxImageryZoom: 18, cloudBaseM: 1500, cloudCover: 0.3 });
+  const quality = QUALITY[loadQuality()];
+  const world = new World(gcs.viewEl, { terrain, site: siteA, bounds, area: [], maxImageryZoom: quality.maxImageryZoom, cloudBaseM: 1500, cloudCover: 0.3, quality });
   // По умолчанию камера за хвостом: аппарат на экране смотрит туда же, куда летит.
   world.setCameraMode('chase');
   // Модель аппарата — из профиля; ?model=… в адресе или VITE_MODEL при сборке её заменяют.
@@ -158,6 +192,13 @@ function run(terrain: Terrain, bounds: Bounds) {
   loadAircraft(`${import.meta.env.BASE_URL}models/${modelName.replace(/[^a-z0-9-]/gi, '')}.glb`)
     .then((model) => world.setAircraft(model))
     .catch((e) => console.warn('CAD-модель аппарата не загрузилась, остаётся упрощённая:', e));
+  // Дома, леса и полосы из OpenStreetMap — если они есть в профиле.
+  if (PROFILE.osmUrl) {
+    fetch(PROFILE.osmUrl)
+      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((buf) => world.setOsm(parseOsm(buf)))
+      .catch((e) => console.warn('Дома и лес не загрузились:', e));
+  }
 
   const map = new Map2D(gcs.mapEl, siteA);
   map.onAreaChange = (area) => {
@@ -199,6 +240,8 @@ function run(terrain: Terrain, bounds: Bounds) {
 
   function command(c: GcsCommand) {
     const s = flight.state;
+    if (c === 'arm' && prep.running) return gcs.log(s.t, 'Идёт проверка подготовки — дождитесь окончания', 'warn');
+    if (c === 'arm' && prepRequired && !prep.done) return gcs.log(s.t, 'Сначала предполётная подготовка — окно «Подготовка»', 'warn');
     if (c === 'target') {
       if (!airborne()) return gcs.log(s.t, 'ЦЕЛЬ — только в полёте', 'warn');
       targetMode = !targetMode;
@@ -210,6 +253,7 @@ function run(terrain: Terrain, bounds: Bounds) {
       if (scenario.kind !== 'delivery' || stage !== 0 || s.mode !== 'landed' || !atDestination) {
         return gcs.log(s.t, 'Разгрузка — только после посадки в пункте доставки', 'warn');
       }
+      if (s.armed) return gcs.log(s.t, 'Сначала ДИЗАРМ: разгружать при работающих моторах нельзя', 'warn');
       pastDistanceM += s.distanceM;
       startStage(1, s.t + scenario.unloadS, s.energyWh);
       gcs.log(flight.state.t, `Груз ${fmt(settings.cargoKg, 1)} кг снят за ${scenario.unloadS} с. Можно взлетать обратно`);
@@ -219,6 +263,9 @@ function run(terrain: Terrain, bounds: Bounds) {
     if (c === 'manual') {
       controls = { ...controls, courseDeg: Math.round(s.trackDeg / 5) * 5, heightAglM: Math.round(Math.max(40, s.aglM) / 5) * 5 };
       gcs.setControls(controls);
+    }
+    if (c === 'arm' && s.mode === 'ground' && blocked(checks)) {
+      return gcs.log(s.t, 'НЕ ГОТОВ: РЛЭ запрещает АРМ — см. предполётные проверки', 'warn');
     }
     if (c === 'takeoff' && s.mode === 'ground' && blocked(checks)) {
       return gcs.log(s.t, 'НЕ ГОТОВ: РЛЭ запрещает взлёт — см. предполётные проверки', 'warn');
@@ -236,6 +283,7 @@ function run(terrain: Terrain, bounds: Bounds) {
 
   function loadScenario(sc: Scenario) {
     started = false;
+    prep.reset();
     scenario = cloneScenario(sc);
     settings = { ...scenario.defaults };
     gcs.loadScenario(scenario, settings, forecastError);
@@ -360,6 +408,11 @@ function run(terrain: Terrain, bounds: Bounds) {
       ]),
     );
     world.setPads(mission.destination ? [local(mission.destination)] : []);
+    world.setMarkers(
+      scenario.kind === 'survey'
+        ? []
+        : scenario.route.map((p, i) => ({ ...local(p), up: terrain.elevationM(p) + p.heightAglM - siteA.elevationM, label: String(i + 1) })),
+    );
     gcs.setRoute(
       scenario.kind === 'survey' ? null : scenario.route,
       scenario.siteName,
@@ -462,6 +515,42 @@ function run(terrain: Terrain, bounds: Bounds) {
   let hudTimer = 0;
   let pip: { eye: { east: number; north: number; up: number }; look: { east: number; north: number; up: number }; up: THREE.Vector3 } | null = null;
 
+  /** Итог шага подготовки: что показала проверка. Миссия, ориентация и опрос зависят от обстановки. */
+  function evaluatePrep(id: PrepStepId): { ok: boolean; text: string } {
+    switch (id) {
+      case 'power':
+        return { ok: true, text: 'Автопилот загружен' };
+      case 'link':
+        return { ok: true, text: 'Связь есть; крен, тангаж и координаты в норме' };
+      case 'servos':
+        return { ok: true, text: 'Элероны ходят в обе стороны без заеданий' };
+      case 'airdata':
+        return { ok: true, text: 'Приборная растёт при обдуве ПВД и возвращается к нулю' };
+      case 'vtol':
+        return { ok: true, text: 'Роторы 1–4 раскручиваются, каждый в свою сторону' };
+      case 'lights':
+        return { ok: true, text: 'Огни и строб работают' };
+      case 'pusher':
+        return { ok: true, text: 'Маршевый раскручивается и останавливается' };
+      case 'mission': {
+        const points = mission.stages.reduce((n, p) => n + p.waypoints.length, 0);
+        return { ok: true, text: `Миссия принята бортом: ${points} точек, посадочная точка есть` };
+      }
+      case 'heading': {
+        const w = windAt(actual, 10);
+        if (w.speedMs < 1) return { ok: true, text: 'Штиль — нос на первую точку маршрута' };
+        flight.setGroundHeading(w.fromDeg);
+        return { ok: true, text: `Нос на ${fmt(w.fromDeg)}° — против ветра` };
+      }
+      case 'rc':
+        return { ok: true, text: 'Пульт в автоматическом режиме' };
+      case 'poll': {
+        const bad = checks.find((c) => !c.ok && c.level === 'block');
+        return bad ? { ok: false, text: `Не готов: ${bad.text}` } : { ok: true, text: 'Чек-лист выполнен — можно АРМ' };
+      }
+    }
+  }
+
   function step(dt: number) {
     const s = flight.state;
     world.setSun(sunPosition(new Date(departure(scenario, settings).getTime() + s.t * 1000), siteA));
@@ -486,7 +575,7 @@ function run(terrain: Terrain, bounds: Bounds) {
       gcs.log(e.t, e.text, e.text.startsWith('АВАРИЯ') ? 'bad' : 'info');
     }
 
-    const plane = ['transition', 'auto', 'guided', 'manual', 'rtl', 'backtransition'].includes(s.mode);
+    const plane = ['transition', 'auto', 'guided', 'manual', 'rtl', 'backtransition', 'falling'].includes(s.mode);
     const pose = {
       position: { east: s.east, north: s.north, up: s.up },
       headingDeg: s.headingDeg,
@@ -501,7 +590,25 @@ function run(terrain: Terrain, bounds: Bounds) {
       pose.pitchDeg = pose.position.up > floor ? -35 : -8;
     }
     world.setPose(pose);
-    world.aircraft.animate(dt, s.lift, s.pusher);
+    // Предполётная подготовка: проверки на земле видны на модели; разворот носом против ветра — плавно.
+    const test = s.mode === 'ground' && !s.armed ? prep.update(performance.now() / 1000, evaluatePrep) : null;
+    if (test && test.turnToWind !== null) {
+      const w = windAt(actual, 10);
+      const d = ((((w.fromDeg - s.headingDeg + 180) % 360) + 360) % 360) - 180;
+      if (w.speedMs >= 1) flight.setGroundHeading(s.headingDeg + Math.max(-60 * dt, Math.min(60 * dt, d)));
+    }
+    world.aircraft.animate(dt, s.lift, s.pusher, prep.running ? test : null);
+    const live =
+      test && prep.running === 'airdata'
+        ? `ПВД: приборная ${fmt(test.airspeedMs, 1)} м/с`
+        : test && prep.running === 'vtol'
+          ? `Ротор ${test.rotors.findIndex((v) => v > 0.02) + 1 || '…'}`
+          : null;
+    const view = `${prep.running}|${PREP_STEPS.map((x) => prep.status[x.id]).join()}|${live}|${prepRequired}|${s.mode}|${s.armed}`;
+    if (view !== prepView) {
+      prepView = view;
+      gcs.showPreparation(prep, prepRequired, live);
+    }
     world.updateDust(dt, pose.position, s.lift * Math.max(0, 1 - s.aglM / 12));
     world.updateCamera(dt, pose);
 
@@ -524,7 +631,7 @@ function run(terrain: Terrain, bounds: Bounds) {
       if (!last && d < 30 && scenario.kind === 'delivery') {
         atDestination = true;
         gcs.toast(
-          `<b>Посадка: ${scenario.destinationName}</b>Израсходовано ${fmt(s.energyWh)} Вт·ч, заряд ${fmt(s.soc * 100)} %. Нажмите «Разгрузка», затем «Взлёт».`,
+          `<b>Посадка: ${scenario.destinationName}</b>Израсходовано ${fmt(s.energyWh)} Вт·ч, заряд ${fmt(s.soc * 100)} %. Задизармьте, нажмите «Разгрузка», затем АРМ и «Взлёт».`,
           'good',
         );
       } else announce();

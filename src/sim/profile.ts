@@ -157,6 +157,8 @@ export interface Profile {
   title: string;
   /** Модель аппарата: public/models/<modelName>.glb. */
   modelName: string;
+  /** Дома, леса и полосы района (src/sim/osm.ts): адрес файла, `import url from './osm.bin?url'`. */
+  osmUrl?: string;
   aircraft: AircraftSpec;
   cruiseReference: CruiseReference;
   hoverReference: HoverReference;

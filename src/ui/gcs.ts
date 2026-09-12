@@ -2,6 +2,8 @@ import type { Check } from '../game/preflight';
 import type { RoutePoint, Scenario, ScenarioKind, Settings } from '../game/scenarios';
 import { MODE_NAMES, type Command, type Controls, type LiveState } from '../sim/flight';
 import { CAMERAS } from '../sim/payload';
+import { loadQuality, QUALITY, type Quality } from './quality';
+import { PREP_STEPS, type Preparation, type PrepStepId } from '../game/preparation';
 import { footprintM, type Coverage, type Frame, type SurveyCamera, type SurveyPlan } from '../sim/survey';
 import type { MissionResult, Wind } from '../sim/types';
 import { drawAttitude, drawProfile, type ProfileData } from './instruments';
@@ -28,6 +30,9 @@ export interface GcsHandlers {
   onFollow(on: boolean): void;
   onZoom(delta: number): void;
   onCamera(m: CameraMode): void;
+  onQuality(q: Quality): void;
+  onPrepStep(id: PrepStepId): void;
+  onPrepRequired(on: boolean): void;
   onResize(): void;
   onRouteEdit(points: RoutePoint[]): void;
 }
@@ -75,6 +80,8 @@ export interface Gcs {
   setRoute(points: RoutePoint[] | null, first: string, last: string, editable: boolean): void;
   showPlan(info: PlanInfo): void;
   showPreflight(checks: Check[]): void;
+  /** Предполётная подготовка: состояние шагов, обязательна ли перед АРМ, что показывает идущая проверка. */
+  showPreparation(p: Preparation, required: boolean, live: string | null): void;
   /** keepRoute — точки маршрута остаются редактируемыми и в полёте. */
   lockPlanning(locked: boolean, keepRoute?: boolean): void;
   update(tm: Telemetry): void;
@@ -103,6 +110,8 @@ const ICON: Record<string, string> = {
   takeoff: '<path d="M12 20V5M6 11l6-6 6 6"/>',
   mode: '<path d="M5 3v18M12 3v18M19 3v18"/><circle cx="5" cy="9" r="2.2"/><circle cx="12" cy="15" r="2.2"/><circle cx="19" cy="7" r="2.2"/>',
   emergency: '<path d="M12 3 22 21H2Z"/><path d="M12 10v5M12 18v.5"/>',
+  arm: '<path d="M12 3v8"/><path d="M6.8 6.8a7.5 7.5 0 1 0 10.4 0"/>',
+  prep: '<path d="M10 6h10M10 12h10M10 18h10"/><path d="M3.5 6l1.5 1.5L7.5 5M3.5 12l1.5 1.5 2.5-2.5M3.5 18l1.5 1.5 2.5-2.5"/>',
   task: '<path d="M4 20 20 12 4 4v6l10 2-10 2z"/>',
   unload: '<rect x="4" y="11" width="16" height="9" rx="1"/><path d="M12 2v10M8 8l4 4 4-4"/>',
   telemetry: '<path d="M2 12h4l3-7 4 14 3-7h6"/>',
@@ -172,6 +181,9 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     <div class="tb field photo">📷 Фото <b data-v="photos">0</b></div>
     <button class="tb field" data-a="rate" title="Ускорение времени">1x</button>
     <button class="tb field" data-a="pause" title="Пауза (пробел)">❚❚</button>
+    <select class="tb quality" title="Качество графики: дома, деревья, тени, сглаживание">${(Object.keys(QUALITY) as Quality[])
+      .map((k) => `<option value="${k}" ${k === loadQuality() ? 'selected' : ''}>Графика: ${QUALITY[k].label.toLowerCase()}</option>`)
+      .join('')}</select>
     <div class="status" data-v="status">ГОТОВ</div>
     <div class="tb-right">
       <span class="batt" title="Заряд и напряжение (оценка без просадки)">🔋 <b data-v="soc">100%</b> <small data-v="volt">50,4 В</small></span>
@@ -184,12 +196,13 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       <div class="map"></div>
       <div class="map-top"><button class="small" data-a="clear">Очистить траекторию</button></div>
       <div class="col left top">
+        ${button('arm', 'АРМ', icon('arm'))}
         ${button('takeoff', 'Взлёт', icon('takeoff'))}
         ${button('mode', 'Режим', icon('mode'))}
         ${button('emergency', 'Аварийная', icon('emergency'))}
         ${button('unload', 'Разгрузка', icon('unload'), 'hidden')}
       </div>
-      <div class="col left mid">${button('task', 'Задача', icon('task'))}</div>
+      <div class="col left mid">${button('task', 'Задача', icon('task'))}${button('prep', 'Подготовка', icon('prep'))}</div>
       <div class="col right top">${button('telemetry', 'Телеметрия', icon('telemetry'))}</div>
       <div class="col right mid">
         ${button('follow', 'Навигация', icon('nav'))}
@@ -217,14 +230,22 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     <section class="view-pane">
       <div class="view"></div>
       <select class="camera">
-        <option value="chase">3D: за хвостом</option>
-        <option value="follow">3D: следовать</option>
+        <option value="chase" title="Мышь — повернуть, колёсико — ближе/дальше, двойной щелчок — сброс">3D: за хвостом</option>
+        <option value="follow">3D: облёт мышью</option>
         <option value="pad">3D: с площадки</option>
+        <option value="cinema">3D: кино</option>
       </select>
       <div class="pip" hidden><i></i><span></span></div>
     </section>
   </main>
   ${win('task', 'Задача', '<div class="task-body"></div>', 'left:80px;top:52px;width:330px', true)}
+  ${win(
+    'prep',
+    'Предполётная подготовка (РЛЭ, прил. А)',
+    `<label class="prep-req"><input type="checkbox" data-prep-req> Требовать подготовку перед АРМ</label>
+    <ol class="prep">${PREP_STEPS.map((s) => `<li data-step="${s.id}" data-status="todo"><button class="small" data-prep="${s.id}">Выполнить</button><div><b>${s.title}</b><small>${s.hint}</small><em></em></div></li>`).join('')}</ol>`,
+    'left:80px;top:52px;width:380px',
+  )}
   ${win('control', 'Управление', controlBody, 'right:calc(45% + 84px);bottom:78px;width:250px')}
   ${win('telemetry', 'Телеметрия', '<dl class="tm"></dl>', 'right:calc(45% + 84px);top:52px;width:220px')}
   ${win('horizon', 'Авиагоризонт', '<canvas class="adi" width="150" height="150"></canvas><dl class="tm adi-tm"></dl>', 'right:calc(45% + 84px);top:330px;width:170px')}
@@ -274,14 +295,16 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   };
 
   let follow = false;
+  let armed = false;
   el.querySelectorAll<HTMLButtonElement>('[data-a]').forEach((b) =>
     b.addEventListener('click', () => {
       const a = b.dataset.a!;
-      if (a === 'takeoff') h.onCommand('takeoff');
+      if (a === 'arm') h.onCommand(armed ? 'disarm' : 'arm');
+      else if (a === 'takeoff') h.onCommand('takeoff');
       else if (a === 'unload') h.onCommand('unload');
       else if (a === 'mode' || a === 'emergency') openMenu(a, b);
       else if (a === 'task' || a === 'menu') toggle('task');
-      else if (['telemetry', 'horizon', 'console', 'profile', 'control'].includes(a)) toggle(a);
+      else if (['telemetry', 'horizon', 'console', 'profile', 'control', 'prep'].includes(a)) toggle(a);
       else if (a === 'follow') {
         follow = !follow;
         b.classList.toggle('on', follow);
@@ -318,6 +341,9 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     }),
   );
   q<HTMLSelectElement>('.camera').addEventListener('change', (e) => h.onCamera((e.target as HTMLSelectElement).value as CameraMode));
+  q<HTMLSelectElement>('.quality').addEventListener('change', (e) => h.onQuality((e.target as HTMLSelectElement).value as Quality));
+  el.querySelectorAll<HTMLButtonElement>('[data-prep]').forEach((b) => b.addEventListener('click', () => h.onPrepStep(b.dataset.prep as PrepStepId)));
+  q<HTMLInputElement>('[data-prep-req]').addEventListener('change', (e) => h.onPrepRequired((e.target as HTMLInputElement).checked));
 
   // Граница карта | 3D.
   q<HTMLElement>('.splitter').addEventListener('pointerdown', (e) => {
@@ -535,6 +561,21 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         .join('');
     },
 
+    showPreparation(p, required, live) {
+      q<HTMLInputElement>('[data-prep-req]').checked = required;
+      for (const s of PREP_STEPS) {
+        const li = q<HTMLLIElement>(`[data-step="${s.id}"]`);
+        const st = p.status[s.id];
+        li.dataset.status = st;
+        const btn = li.querySelector('button')!;
+        const why = p.blocker(s.id);
+        btn.disabled = why !== null;
+        btn.title = why ?? '';
+        btn.textContent = st === 'running' ? '…' : st === 'done' ? 'Повтор' : 'Выполнить';
+        li.querySelector('em')!.textContent = st === 'running' ? (live ?? 'Выполняется…') : (p.result[s.id] ?? '');
+      }
+    },
+
     lockPlanning(on, keepRoute = false) {
       locked = on;
       keepRouteOpen = keepRoute;
@@ -548,7 +589,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       const s = tm.state;
       const status = q<HTMLDivElement>('[data-v="status"]');
       const notReady = s.mode === 'ground' && tm.notReady;
-      status.textContent = s.mode === 'crashed' ? `АВАРИЯ: ${s.reason ?? ''}` : notReady ? 'НЕ ГОТОВ' : `${MODE_NAMES[s.mode]}${tm.stageName ? ` · ${tm.stageName}` : ''}`;
+      const armedOnGround = s.armed && (s.mode === 'ground' || s.mode === 'landed') ? ' · АРМ' : '';
+      status.textContent = s.mode === 'crashed' ? `АВАРИЯ: ${s.reason ?? ''}` : notReady ? 'НЕ ГОТОВ' : `${MODE_NAMES[s.mode]}${armedOnGround}${tm.stageName ? ` · ${tm.stageName}` : ''}`;
       status.dataset.mode = notReady ? 'crashed' : s.mode;
       const soc = Math.max(0, s.soc);
       q<HTMLElement>('[data-v="soc"]').textContent = `${fmt(soc * 100)}%`;
@@ -559,7 +601,14 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       q<HTMLElement>('[data-v="time"]').textContent = `T+${fmtTime(s.t)}`;
       q<HTMLButtonElement>('[data-a="rate"]').textContent = `${tm.rate}x`;
       q<HTMLButtonElement>('[data-a="pause"]').textContent = tm.paused ? '▶' : '❚❚';
-      q<HTMLButtonElement>('[data-a="takeoff"]').disabled = s.mode !== 'ground' || tm.notReady;
+      q<HTMLButtonElement>('[data-a="takeoff"]').disabled = s.mode !== 'ground' || tm.notReady || !s.armed;
+      // АРМ ↔ ДИЗАРМ. ДИЗАРМ доступен и в полёте — для отработки отказа моторов.
+      armed = s.armed;
+      const armBtn = q<HTMLButtonElement>('[data-a="arm"]');
+      armBtn.classList.toggle('on', s.armed);
+      armBtn.querySelector('span')!.textContent = s.armed ? 'ДИЗАРМ' : 'АРМ';
+      armBtn.title = s.armed ? 'Задизармить: моторы остановятся (в полёте — падение)' : 'Заармить: разрешить моторам работать';
+      armBtn.disabled = !s.armed && (s.mode !== 'ground' || tm.notReady);
       q<HTMLButtonElement>('[data-a="unload"]').hidden = !tm.canUnload;
 
       const tmRows: [string, string][] = [

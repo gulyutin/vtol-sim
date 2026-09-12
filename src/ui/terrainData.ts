@@ -17,9 +17,27 @@ export function expandBounds(b: Bounds, marginM: number): Bounds {
   return { south: b.south - dLat, north: b.north + dLat, west: b.west - dLon, east: b.east + dLon };
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Запрос с повтором: сеть и серверы тайлов иногда отвечают ошибкой — пробуем ещё с растущей паузой. */
+export async function fetchWithRetry(url: string, attempts = 4): Promise<Response> {
+  let last: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url);
+      if (res.ok) return res;
+      last = new Error(`${url}: HTTP ${res.status}`);
+      if (res.status === 404) break;
+    } catch (e) {
+      last = e;
+    }
+    await sleep(400 * 2 ** i);
+  }
+  throw last;
+}
+
 async function pixels(url: string): Promise<Uint8ClampedArray> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  const res = await fetchWithRetry(url);
   // Цвета здесь — закодированные числа: никакой цветокоррекции при декодировании.
   const bitmap = await createImageBitmap(await res.blob(), { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
   const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
@@ -39,11 +57,22 @@ export async function loadTerrain(b: Bounds, zoom = 12, onProgress?: (done: numb
   const width = cols * 256;
   const heights = new Float32Array(width * rows * 256);
   let done = 0;
+  let failed = 0;
   const tiles: [number, number][] = [];
   for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) tiles.push([i, j]);
   await Promise.all(
     tiles.map(async ([i, j]) => {
-      const data = await pixels(terrariumUrl(zoom, tx0 + i, ty0 + j));
+      let data: Uint8ClampedArray;
+      try {
+        data = await pixels(terrariumUrl(zoom, tx0 + i, ty0 + j));
+      } catch (e) {
+        // Тайл так и не пришёл — его клетки станут пустотой и заполнятся по соседям (fillVoids).
+        console.warn('Тайл рельефа не загрузился:', e);
+        failed++;
+        for (let y = 0; y < 256; y++) heights.fill(-1e4, (j * 256 + y) * width + i * 256, (j * 256 + y) * width + i * 256 + 256);
+        onProgress?.(++done, tiles.length);
+        return;
+      }
       for (let y = 0; y < 256; y++) {
         for (let x = 0; x < 256; x++) {
           const k = (y * 256 + x) * 4;
@@ -53,6 +82,7 @@ export async function loadTerrain(b: Bounds, zoom = 12, onProgress?: (done: numb
       onProgress?.(++done, tiles.length);
     }),
   );
+  if (failed === tiles.length) throw new Error('Рельеф не загрузился — проверьте подключение к интернету');
   const voids = fillVoids(heights, width, rows * 256);
   if (voids > 0) console.info(`Рельеф: заполнено пустот в данных — ${voids} клеток`);
   return new GridTerrain(heights, width, rows * 256, zoom, tx0 * 256, ty0 * 256);

@@ -727,6 +727,74 @@ select.tb.scen {
   font-weight: 600;
 }
 
+/* Качество графики — рядом с ускорением и паузой, покороче */
+select.tb.quality {
+  max-width: 170px;
+  font-size: 12px;
+}
+
+/* Предполётная подготовка */
+.prep-req {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin: 2px 0 8px;
+  font-size: 12px;
+}
+ol.prep {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: prep;
+}
+ol.prep li {
+  display: grid;
+  grid-template-columns: 76px 1fr;
+  gap: 8px;
+  align-items: start;
+  padding: 5px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  counter-increment: prep;
+}
+ol.prep li b {
+  display: block;
+  font-size: 12px;
+}
+ol.prep li b::before {
+  content: counter(prep) '. ';
+  opacity: 0.6;
+}
+ol.prep li small {
+  display: block;
+  opacity: 0.65;
+  font-size: 11px;
+}
+ol.prep li em {
+  display: block;
+  font-style: normal;
+  font-size: 11px;
+  margin-top: 2px;
+}
+ol.prep li[data-status='done'] b::before {
+  content: '✓ ';
+  color: #4fd08a;
+  opacity: 1;
+}
+ol.prep li[data-status='done'] em {
+  color: #7de3a8;
+}
+ol.prep li[data-status='failed'] b::before {
+  content: '✕ ';
+  color: #ff5d5d;
+  opacity: 1;
+}
+ol.prep li[data-status='failed'] em {
+  color: #ff8a8a;
+}
+ol.prep li[data-status='running'] em {
+  color: #ffc24d;
+}
+
 /* Точки маршрута оператора и пункт доставки */
 .wp-pin.edit b {
   background: #ffb35c;

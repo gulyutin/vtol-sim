@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import type { GroundTest } from '../game/preparation';
+import { glowSprite } from './props';
 
 /** Высота стоек упрощённой модели: начало координат — точка касания земли. */
 const GEAR_M = 0.24;
@@ -14,8 +16,11 @@ const LIVERY_PARTS = ['airframe', 'tail', 'aileron'];
 export interface AircraftModel {
   /** Позицию и ориентацию задают снаружи. Нос смотрит в −Z, правое крыло — в +X, размеры в метрах. */
   group: THREE.Group;
-  /** dt — реальное время кадра, с; lift и pusher — загрузка подъёмных роторов и маршевого винта 0…1. */
-  animate(dt: number, lift: number, pusher: number): void;
+  /**
+   * dt — реальное время кадра, с; lift и pusher — загрузка подъёмных роторов и маршевого винта 0…1.
+   * test — проверка на земле (предполётная подготовка): роторы по отдельности, элероны, огни.
+   */
+  animate(dt: number, lift: number, pusher: number, test?: GroundTest | null): void;
 }
 
 interface Rig {
@@ -28,9 +33,25 @@ interface Rig {
   rotorBlade: THREE.Material;
   pusherBlade: THREE.Material;
   strobe: THREE.Object3D;
+  /** Элероны на шарнире (вращение вокруг своей оси X); sign — чтобы левый и правый шли в разные стороны. */
+  ailerons: { node: THREE.Object3D; sign: number }[];
 }
 
 const approach = (cur: number, target: number, dt: number, tau: number) => cur + (target - cur) * (1 - Math.exp(-dt / tau));
+
+/** Лакированная краска корпуса: плотный цвет и прозрачный лак с бликами неба. */
+function paint(from?: THREE.MeshStandardMaterial): THREE.MeshPhysicalMaterial {
+  return new THREE.MeshPhysicalMaterial({
+    name: from?.name ?? 'airframe',
+    color: RAL_3024,
+    roughness: 0.42,
+    metalness: 0,
+    clearcoat: 0.85,
+    clearcoatRoughness: 0.12,
+    envMapIntensity: 1.1,
+    side: from?.side ?? THREE.FrontSide,
+  });
+}
 const smooth01 = (x: number) => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
 
 function discMaterial() {
@@ -40,6 +61,8 @@ function discMaterial() {
 function navLight(color: number, at: THREE.Vector3): THREE.Mesh {
   const m = new THREE.Mesh(new THREE.SphereGeometry(0.025, 10, 8), new THREE.MeshBasicMaterial({ color }));
   m.position.copy(at);
+  // Ореол огня — виден издалека и подхватывается свечением при высоком качестве.
+  m.add(glowSprite(color, 0.5));
   return m;
 }
 
@@ -62,12 +85,14 @@ function rigged(group: THREE.Group, rig: Rig): AircraftModel {
   let clock = 0;
   return {
     group,
-    animate(dt, lift, pusherLoad) {
+    animate(dt, lift, pusherLoad, test) {
       clock += dt;
-      for (const r of rotors) {
-        const target = lift * 62;
+      rotors.forEach((r, i) => {
+        // На проверке регуляторов роторы крутятся по одному.
+        const load = test ? (test.rotors[i] ?? 0) : lift;
+        const target = load * 62;
         r.omega = approach(r.omega, target, dt, target > r.omega ? 0.5 : 1.2);
-        if (r.omega < 1.5 && lift < 0.01) {
+        if (r.omega < 1.5 && load < 0.01) {
           // Остановленные винты встают вдоль балки — так они меньше мешают в крейсере.
           const rel = r.node.rotation.y - r.base - Math.PI / 2;
           const aligned = r.base + Math.PI / 2 + Math.round(rel / Math.PI) * Math.PI;
@@ -75,19 +100,21 @@ function rigged(group: THREE.Group, rig: Rig): AircraftModel {
         } else {
           r.node.rotation.y += r.dir * r.omega * dt;
         }
-      }
-      const rotorBlur = smooth01((rotors[0]!.omega - 12) / 40);
+      });
+      const defl = (test?.aileron ?? 0) * 0.35;
+      for (const a of rig.ailerons) a.node.rotation.x = approach(a.node.rotation.x, a.sign * defl, dt, 0.06);
+      const rotorBlur = smooth01((Math.max(...rotors.map((r) => r.omega)) - 12) / 40);
       rotorDisc.opacity = 0.28 * rotorBlur;
       blade(rig.rotorBlade, 1 - 0.75 * rotorBlur);
 
-      const pusherTarget = pusherLoad * 80;
+      const pusherTarget = (test ? test.pusher : pusherLoad) * 80;
       pusherOmega = approach(pusherOmega, pusherTarget, dt, pusherTarget > pusherOmega ? 0.4 : 1.0);
       rig.pusher.rotation.z += pusherOmega * dt;
       const pusherBlur = smooth01((pusherOmega - 12) / 40);
       pusherDisc.opacity = 0.25 * pusherBlur;
       blade(rig.pusherBlade, 1 - 0.75 * pusherBlur);
 
-      rig.strobe.visible = clock % 1.2 < 0.08;
+      rig.strobe.visible = test?.lights ? clock % 0.25 < 0.12 : clock % 1.2 < 0.08;
     },
   };
 }
@@ -100,9 +127,13 @@ export async function loadAircraft(url: string): Promise<AircraftModel> {
     const mesh = o as THREE.Mesh;
     if (!mesh.isMesh) return;
     mesh.castShadow = true;
-    // Окраска аппарата — RAL 3024 (Leuchtrot); винты и подвес остаются тёмными.
+    mesh.receiveShadow = true;
+    // Окраска аппарата — RAL 3024 (Leuchtrot) под лаком, с отражениями неба; винты и подвес остаются тёмными.
     const m = mesh.material as THREE.MeshStandardMaterial;
-    if (!Array.isArray(m) && LIVERY_PARTS.includes(m.name)) m.color.set(RAL_3024);
+    if (Array.isArray(m)) return;
+    if (LIVERY_PARTS.includes(m.name)) mesh.material = paint(m);
+    else if (m.name === 'gimbal') Object.assign(m, { roughness: 0.28, metalness: 0.45 });
+    else m.roughness = 0.45;
   });
   const need = (name: string) => {
     const o = root.getObjectByName(name);
@@ -152,9 +183,30 @@ export async function loadAircraft(url: string): Promise<AircraftModel> {
   const strobe = navLight(0xffffff, extremes.top.clone().add(new THREE.Vector3(0, 0.02, 0)));
   root.add(navLight(0xff2a2a, extremes.left), navLight(0x2aff6a, extremes.right), strobe);
 
+  // Элероны — отдельные тела с материалом aileron: каждое ставим на шарнир по передней кромке.
+  const surfaces: THREE.Mesh[] = [];
+  root.traverse((o) => {
+    const m = (o as THREE.Mesh).material;
+    if ((o as THREE.Mesh).isMesh && m && !Array.isArray(m) && m.name === 'aileron') surfaces.push(o as THREE.Mesh);
+  });
+  root.updateMatrixWorld(true);
+  const ailerons: Rig['ailerons'] = [];
+  for (const mesh of surfaces) {
+    const box = new THREE.Box3().setFromObject(mesh);
+    const hinge = new THREE.Vector3((box.min.x + box.max.x) / 2, (box.min.y + box.max.y) / 2, box.min.z);
+    const parent = mesh.parent!;
+    const pivot = new THREE.Group();
+    pivot.position.copy(parent.worldToLocal(hinge.clone()));
+    parent.add(pivot);
+    pivot.updateMatrixWorld(true);
+    pivot.attach(mesh);
+    ailerons.push({ node: pivot, sign: hinge.x < 0 ? -1 : 1 });
+  }
+
   const group = new THREE.Group();
   group.add(root);
   return rigged(group, {
+    ailerons,
     rotors,
     pusher,
     rotorRadius: radius(rotors[0]!.node, ['x', 'z']),
@@ -172,7 +224,7 @@ export function createAircraft(): AircraftModel {
   body.position.y = GEAR_M;
   group.add(body);
 
-  const white = new THREE.MeshStandardMaterial({ color: RAL_3024, roughness: 0.45, metalness: 0.05 });
+  const white = paint();
   const orange = new THREE.MeshStandardMaterial({ color: 0xff6a1a, roughness: 0.5 });
   const grey = new THREE.MeshStandardMaterial({ color: 0x3b4046, roughness: 0.55, metalness: 0.3 });
   const black = new THREE.MeshStandardMaterial({ color: 0x15171a, roughness: 0.4, metalness: 0.2 });
@@ -193,7 +245,15 @@ export function createAircraft(): AircraftModel {
   ].map(([r, y]) => new THREE.Vector2(r, y));
   add(new THREE.LatheGeometry(profile, 28), white, 0, 0.02, 0).rotation.x = -Math.PI / 2;
   add(new THREE.BoxGeometry(3.0, 0.035, 0.2), white, 0, 0.13, -0.08);
-  for (const sx of [-1, 1]) add(new THREE.BoxGeometry(0.16, 0.038, 0.202), orange, sx * 1.42, 0.13, -0.08);
+  const ailerons: Rig['ailerons'] = [];
+  for (const sx of [-1, 1]) {
+    // Законцовка-элерон на шарнире по передней кромке.
+    const hinge = new THREE.Group();
+    hinge.position.set(sx * 1.42, 0.13, -0.181);
+    body.add(hinge);
+    add(new THREE.BoxGeometry(0.16, 0.038, 0.202), orange, 0, 0, 0.101, hinge);
+    ailerons.push({ node: hinge, sign: sx });
+  }
   add(new THREE.SphereGeometry(0.075, 20, 14), black, 0, -0.15, -0.45);
 
   const rotors: Rig['rotors'] = [];
@@ -222,5 +282,5 @@ export function createAircraft(): AircraftModel {
   const strobe = navLight(0xffffff, new THREE.Vector3(0, 0.41, 1.1));
   body.add(navLight(0xff2a2a, new THREE.Vector3(-1.51, 0.13, -0.08)), navLight(0x2aff6a, new THREE.Vector3(1.51, 0.13, -0.08)), strobe);
 
-  return rigged(group, { rotors, pusher, rotorRadius: 0.212, pusherRadius: 0.2125, rotorBlade, pusherBlade, strobe });
+  return rigged(group, { rotors, pusher, rotorRadius: 0.212, pusherRadius: 0.2125, rotorBlade, pusherBlade, strobe, ailerons });
 }

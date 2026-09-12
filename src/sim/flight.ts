@@ -1,5 +1,5 @@
 import { AIRCRAFT } from './aircraft';
-import { brakeDecel, climbPowerW, HOVER_TRANSLATE_MS, hoverPowerW, takeoffMassKg } from './aero';
+import { brakeDecel, climbPowerW, HOVER_TRANSLATE_MS, hoverPowerW, polar, takeoffMassKg } from './aero';
 import { airDensity, batteryCapacityWh, G, RHO0, tasFromIas, temperatureAt } from './atmosphere';
 import { fromLocal, toLocal } from './mission';
 import { windProcedures } from './procedures';
@@ -16,6 +16,12 @@ import { windAt, windTriangle } from './wind';
 
 const RAD = Math.PI / 180;
 const VT = AIRCRAFT.vtol;
+/** Заармлен на земле: роторы на холостых — доля загрузки для отрисовки и мощности. */
+const ARMED_IDLE_LIFT = 0.08;
+/** Установившаяся скорость падения без моторов, м/с. */
+const TERMINAL_FALL_MS = 22;
+/** Касание без моторов мягче этого — жёсткая посадка, жёстче — авария. */
+const SAFE_IMPACT_MS = 2.5;
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 const wrap180 = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
 const norm360 = (d: number) => ((d % 360) + 360) % 360;
@@ -35,6 +41,7 @@ export type LiveMode =
   | 'backtransition'
   | 'descent'
   | 'final'
+  | 'falling'
   | 'landed'
   | 'crashed';
 
@@ -52,6 +59,7 @@ export const MODE_NAMES: Record<LiveMode, string> = {
   backtransition: 'ПОСАДКА · торможение',
   descent: 'ПОСАДКА · снижение',
   final: 'ПОСАДКА · касание',
+  falling: 'МОТОРЫ ВЫКЛЮЧЕНЫ',
   landed: 'НА ЗЕМЛЕ',
   crashed: 'АВАРИЯ',
 };
@@ -79,11 +87,14 @@ export interface Controls {
   target: { east: number; north: number } | null;
 }
 
-export type Command = 'takeoff' | 'auto' | 'manual' | 'guided' | 'hold' | 'rtl' | 'land';
+/** arm / disarm — «заармить» и «задизармить» по РЛЭ: разрешение моторам работать. */
+export type Command = 'arm' | 'disarm' | 'takeoff' | 'auto' | 'manual' | 'guided' | 'hold' | 'rtl' | 'land';
 
 export interface LiveState {
   t: number;
   mode: LiveMode;
+  /** Заармлен: моторам разрешено работать. Взлёт — только заармленным. */
+  armed: boolean;
   /** Сколько длится текущий режим, с. */
   modeT: number;
   east: number;
@@ -147,6 +158,8 @@ export class LiveFlight {
   private readonly weather: Weather;
   private afterTransition: LiveMode = 'auto';
   private landAt: { east: number; north: number } | null = null;
+  /** Почему моторы остановились в воздухе — для сообщения об ударе. */
+  private fallCause = '';
   /** Курс для висения над точкой посадки — против ветра. */
   private hoverHeadingDeg = 0;
   /** Посадочный маршрут для ВОЗВРАТА: две точки захода и этап. */
@@ -173,6 +186,7 @@ export class LiveFlight {
     this.state = {
       t: setup.startT ?? 0,
       mode: 'ground',
+      armed: false,
       modeT: 0,
       east: takeoff.east,
       north: takeoff.north,
@@ -254,13 +268,39 @@ export class LiveFlight {
     return this.terrain.elevationM(fromLocal(this.site, east, north)) - this.site.elevationM;
   }
 
+  /** Развернуть аппарат на площадке (предполётная подготовка: носом против ветра). Только на земле. */
+  setGroundHeading(deg: number) {
+    const s = this.state;
+    if (s.mode !== 'ground') return;
+    s.headingDeg = norm360(deg);
+    s.trackDeg = s.headingDeg;
+  }
+
   /** Команда оператора. Возвращает причину отказа или null. */
   command(c: Command): string | null {
     const s = this.state;
     const airborne = AIRBORNE.includes(s.mode);
     switch (c) {
+      case 'arm':
+        if (s.mode !== 'ground') return 'АРМ — только на земле перед взлётом';
+        if (s.armed) return 'Уже заармлен';
+        s.armed = true;
+        this.events.push({ t: s.t, text: 'АРМ: моторы на холостых' });
+        return null;
+      case 'disarm':
+        if (!s.armed) return 'Уже задизармлен';
+        if (s.mode === 'ground' || s.mode === 'landed') {
+          this.disarm('ДИЗАРМ');
+          return null;
+        }
+        // В воздухе моторы останавливаются по-настоящему — для отработки аварийной ситуации.
+        this.fallCause = 'моторы были выключены (ДИЗАРМ в полёте)';
+        this.disarm('ДИЗАРМ в полёте: моторы остановлены');
+        this.setMode('falling');
+        return null;
       case 'takeoff':
         if (s.mode !== 'ground') return 'Взлёт — только с земли';
+        if (!s.armed) return 'Сначала АРМ';
         this.setMode('spool');
         return null;
       case 'auto':
@@ -307,11 +347,35 @@ export class LiveFlight {
     for (let i = 0; i < n; i++) {
       if (this.state.mode === 'landed' || this.state.mode === 'crashed') {
         this.state.t += dt / n;
+        // После касания роторы на холостых, пока оператор не задизармит (по РЛЭ — сразу после касания).
+        if (this.state.armed && this.state.mode === 'landed') this.idle(dt / n);
         continue;
       }
       this.tick(dt / n, c);
       onTick?.(this.state);
     }
+  }
+
+  private disarm(text: string) {
+    this.state.armed = false;
+    this.state.lift = 0;
+    this.state.pusher = 0;
+    this.state.powerW = 0;
+    this.events.push({ t: this.state.t, text });
+  }
+
+  /** Мощность заармленного аппарата на земле: роторы на холостых, моторы под питанием, Вт. */
+  private idlePowerW(): number {
+    return AIRCRAFT.idlePowerPlaneW + 0.5 * ARMED_IDLE_LIFT * hoverPowerW(this.mass, this.rho(this.state.up));
+  }
+
+  /** Заармлен на земле после посадки: холостые обороты и расход (шаг вне tick). */
+  private idle(h: number) {
+    const s = this.state;
+    s.lift = ARMED_IDLE_LIFT;
+    s.powerW = this.idlePowerW() + this.payloadW;
+    s.energyWh += (s.powerW * h) / 3600;
+    s.soc = (this.capacityWh - s.energyWh) / this.capacityWh;
   }
 
   private landHere() {
@@ -420,6 +484,17 @@ export class LiveFlight {
         break;
       }
 
+      case 'ground':
+        // Заармлен — роторы на холостых, моторы под питанием, пока не взлетели или не задизармили.
+        s.lift = s.armed ? ARMED_IDLE_LIFT : 0;
+        power = s.armed ? this.idlePowerW() : 0;
+        break;
+
+      case 'falling':
+        power = 0;
+        this.fall(h, rho);
+        break;
+
       case 'auto':
       case 'guided':
       case 'hold':
@@ -475,13 +550,79 @@ export class LiveFlight {
     s.energyWh += (s.powerW * h) / 3600;
     s.soc = (this.capacityWh - s.energyWh) / this.capacityWh;
     s.aglM = s.up - this.groundUp(s.east, s.north);
-    if (s.energyWh >= this.capacityWh) this.crash('Батарея разряжена');
-    else if ((AIRBORNE.includes(s.mode) || s.mode === 'backtransition') && s.aglM < 0.5) this.crash('Столкновение с рельефом');
+    const powered = s.mode !== 'falling' && s.mode !== 'crashed' && s.mode !== 'landed';
+    if (s.energyWh >= this.capacityWh) s.energyWh = this.capacityWh;
+    if (s.energyWh >= this.capacityWh && powered && (s.mode !== 'ground' || s.armed)) {
+      // Батарея села — моторы встают. На земле просто дизарм, в воздухе — планирование или падение до удара.
+      if (s.mode === 'ground') this.disarm('Батарея разряжена: моторы остановлены');
+      else {
+        this.fallCause = 'батарея разряжена';
+        this.disarm('Батарея разряжена: моторы остановлены');
+        this.setMode('falling');
+      }
+    } else if ((AIRBORNE.includes(s.mode) || s.mode === 'backtransition') && s.aglM < 0.5) this.crash('Столкновение с рельефом');
+  }
+
+  /**
+   * Моторы остановлены (ДИЗАРМ в воздухе). Пока скорость выше сваливания, крыло держит: аппарат
+   * планирует без тяги, скорость держится снижением, Vz = −D·V / (m·g) по поляре. Медленнее —
+   * падение с кувырком: вертикальная скорость растёт до установившейся, горизонтальная гаснет.
+   */
+  private fall(h: number, rho: number) {
+    const s = this.state;
+    s.lift = 0;
+    s.pusher = 0;
+    const wind = windAt(this.weather, Math.max(0, s.aglM));
+    s.wind = wind;
+    const to = (wind.fromDeg + 180) * RAD;
+    const tas = Math.max(0, s.tasMs);
+    const stall = 0.85 * tasFromIas(AIRCRAFT.transitionLowIasMs, rho);
+    let ve: number;
+    let vn: number;
+    if (tas > stall) {
+      const sink = -(polar(this.mass, tas, rho).dragN * tas) / (this.mass * G);
+      s.vzMs += clamp(sink - s.vzMs, -2 * h, 2 * h);
+      s.bankDeg += clamp(-s.bankDeg, -15 * h, 15 * h);
+      // Без тяги скорость понемногу уходит: автопилот не успевает разменивать высоту.
+      s.tasMs = tas - 0.15 * h;
+      ve = s.tasMs * Math.sin(s.headingDeg * RAD) + wind.speedMs * Math.sin(to);
+      vn = s.tasMs * Math.cos(s.headingDeg * RAD) + wind.speedMs * Math.cos(to);
+    } else {
+      s.vzMs += (-G + (G * s.vzMs * s.vzMs) / (TERMINAL_FALL_MS * TERMINAL_FALL_MS)) * h;
+      s.tasMs = Math.max(0, tas - 4 * h);
+      s.bankDeg = wrap180(s.bankDeg + 70 * h);
+      s.headingDeg = norm360(s.headingDeg + 35 * h);
+      // Горизонтально — остаток скорости и снос ветром.
+      const along = s.groundSpeedMs * Math.exp(-h / 1.5);
+      ve = along * Math.sin(s.trackDeg * RAD) + 0.7 * wind.speedMs * Math.sin(to) * (1 - Math.exp(-h));
+      vn = along * Math.cos(s.trackDeg * RAD) + 0.7 * wind.speedMs * Math.cos(to) * (1 - Math.exp(-h));
+    }
+    s.iasMs = s.tasMs * Math.sqrt(rho / RHO0);
+    s.east += ve * h;
+    s.north += vn * h;
+    s.up += s.vzMs * h;
+    s.groundSpeedMs = Math.hypot(ve, vn);
+    if (s.groundSpeedMs > 0.5) s.trackDeg = norm360(Math.atan2(ve, vn) / RAD);
+    s.distanceM += s.groundSpeedMs * h;
+    const g = this.groundUp(s.east, s.north);
+    if (s.up <= g) {
+      const impact = Math.hypot(s.vzMs, s.groundSpeedMs);
+      s.up = g;
+      if (-s.vzMs < SAFE_IMPACT_MS && s.groundSpeedMs < 3) {
+        s.vzMs = 0;
+        s.groundSpeedMs = 0;
+        s.bankDeg = 0;
+        this.setMode('landed', 'Жёсткая посадка без моторов');
+      } else {
+        this.crash(`Удар о землю на ${Math.round(impact)} м/с — ${this.fallCause}`);
+      }
+    }
   }
 
   private crash(reason: string) {
     const s = this.state;
     s.reason = reason;
+    s.armed = false;
     s.lift = 0;
     s.pusher = 0;
     s.powerW = 0;

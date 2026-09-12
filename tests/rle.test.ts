@@ -52,6 +52,7 @@ describe('план совпадает с живым полётом', () => {
       let used = 0;
       for (const plan of m.stages) {
         const f = new LiveFlight({ plan, terrain, weather, origin: m.site, home: m.site, startT, initialEnergyWh: used });
+        f.command('arm');
         f.command('takeoff');
         while (f.state.mode !== 'landed' && f.state.mode !== 'crashed' && f.state.t < startT + 4 * 3600) f.step(0.5, controls);
         expect(f.state.mode).toBe('landed');
@@ -90,6 +91,7 @@ describe('живой полёт: взлёт и посадка против ве�
   const weather = windy(route, 6, 250);
   const m = buildMission(route, route.defaults, terrain, weather);
   const f = new LiveFlight({ plan: m.stages[0]!, terrain, weather, origin: m.site, home: m.site });
+  f.command('arm');
   f.command('takeoff');
   let takeoffHeading = NaN;
   let pusherOffAt = NaN;
@@ -121,6 +123,7 @@ describe('живой полёт: взлёт и посадка против ве�
 
   it('ВОЗВРАТ садится против фактического ветра', () => {
     const g = new LiveFlight({ plan: m.stages[0]!, terrain, weather, origin: m.site, home: m.site });
+    g.command('arm');
     g.command('takeoff');
     while (g.state.t < 500) g.step(0.5, controls);
     expect(g.command('rtl')).toBeNull();
@@ -140,6 +143,7 @@ describe('маршрут в реальном времени', () => {
     const weather = windy(route, 3, 250);
     const m = buildMission(route, route.defaults, terrain, weather);
     const f = new LiveFlight({ plan: m.stages[0]!, terrain, weather, origin: m.site, home: m.site });
+    f.command('arm');
     f.command('takeoff');
     // Участок 2 ведёт к точке 2 оператора (участок 0 — взлётный маршрут).
     while (f.state.routeLeg !== 2 && f.state.t < 3600) f.step(0.5, controls);

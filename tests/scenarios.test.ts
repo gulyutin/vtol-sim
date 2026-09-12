@@ -12,6 +12,7 @@ const calm = (w: Weather): Weather => ({ ...w, wind: { speedMs: 0, fromDeg: 0 } 
 const controls: Controls = { iasMs: 21, heightAglM: 150, courseDeg: 0, target: null };
 
 function fly(f: LiveFlight) {
+  f.command('arm');
   f.command('takeoff');
   while (f.state.mode !== 'landed' && f.state.mode !== 'crashed' && f.state.t < 4 * 3600) f.step(0.5, controls);
 }

@@ -1,16 +1,26 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { Sky } from 'three/addons/objects/Sky.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { AIRCRAFT } from '../sim/aircraft';
 import { fromLocal, toLocal } from '../sim/mission';
+import type { OsmData } from '../sim/osm';
 import type { SunPosition } from '../sim/sun';
 import type { Coverage, Frame } from '../sim/survey';
 import type { LocalPoint } from '../sim/timeline';
 import type { GeoPoint, Site, Terrain } from '../sim/types';
 import { createAircraft, type AircraftModel } from './aircraftModel';
+import { OsmLayer } from './osmLayer';
+import { createGroundStation, createLandingPad, createLandingZone, createVehicle, createWaypointMarker, RotorDust } from './props';
+import { QUALITY, type QualitySettings } from './quality';
+import { SkyDome } from './skyDome';
 import type { Bounds } from './terrainData';
 import { TerrainLod } from './terrainLod';
 
-export type CameraMode = 'follow' | 'chase' | 'pad';
+/** follow — облёт мышью; chase — за хвостом (тоже можно вращать); pad — с площадки; cinema — смена ракурсов. */
+export type CameraMode = 'follow' | 'chase' | 'pad' | 'cinema';
 
 export interface Pose {
   position: LocalPoint;
@@ -20,6 +30,14 @@ export interface Pose {
   bankDeg: number;
 }
 
+/** Точка маршрута в 3D: положение, высота (над площадкой взлёта) и подпись. */
+export interface Marker {
+  east: number;
+  north: number;
+  up: number;
+  label: string;
+}
+
 export interface Environment {
   terrain: Terrain;
   site: Site;
@@ -27,11 +45,12 @@ export interface Environment {
   bounds: Bounds;
   /** Участок съёмки. */
   area: GeoPoint[];
-  /** Наибольший уровень снимков (ESRI над Уралом есть до z19). */
+  /** Наибольший уровень снимков до выбора качества. */
   maxImageryZoom: number;
   /** Нижняя граница облаков над площадкой, м; покрытие 0…1. */
   cloudBaseM: number;
   cloudCover: number;
+  quality?: QualitySettings;
 }
 
 const DEG = Math.PI / 180;
@@ -40,6 +59,8 @@ const TRAIL_MAX = 40_000;
 const FRAMES_MAX = 5_000;
 /** Отрезков на сторону кадра — чтобы контур лёг на рельеф. */
 const EDGE_STEPS = 4;
+/** Смена ракурса в режиме «кино», с. */
+const CINEMA_SHOT_S = 9;
 
 /** Локальные координаты задания → сцена: x — восток, y — вверх (над площадкой взлёта), z — юг. */
 export function toScene(p: LocalPoint, out = new THREE.Vector3()): THREE.Vector3 {
@@ -81,10 +102,14 @@ export class World {
   readonly controls: OrbitControls;
   aircraft: AircraftModel = createAircraft();
   private cameraMode: CameraMode = 'follow';
+  private q: QualitySettings;
+  private readonly composer: EffectComposer;
+  private readonly bloom: UnrealBloomPass;
   private readonly terrain: Terrain;
   private readonly site: Site;
   private readonly lod: TerrainLod;
-  private readonly sky = new Sky();
+  private osm: OsmLayer | null = null;
+  private readonly sky = new SkyDome();
   private readonly skyEnv = new THREE.Scene();
   private readonly pmrem: THREE.PMREMGenerator;
   private envTarget: THREE.WebGLRenderTarget | null = null;
@@ -94,29 +119,43 @@ export class World {
   private readonly sunDir = new THREE.Vector3(0, 1, 0);
   private readonly clouds: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
   private readonly routeGroup = new THREE.Group();
+  private readonly markerGroup = new THREE.Group();
   private areaLine: THREE.LineLoop | null = null;
-  private pads: THREE.Mesh[] = [];
+  private pads: THREE.Group[] = [];
   private readonly trail: THREE.Line;
   private trailCount = 0;
   private readonly frameLines: THREE.LineSegments;
   private frameCount = 0;
   private coverage: THREE.Mesh | null = null;
-  private readonly dust: THREE.Mesh<THREE.RingGeometry, THREE.MeshBasicMaterial>;
+  private readonly dust: RotorDust;
+  private readonly blob: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
+  private readonly groundWind = new THREE.Vector2();
   private readonly sockPivot = new THREE.Group();
   private readonly target = new THREE.Vector3();
   private readonly lastTarget = new THREE.Vector3();
   private readonly padCamera: THREE.Vector3;
   private readonly chaseOffset = new THREE.Vector3(0, 3.5, 13);
   private readonly pipCamera = new THREE.PerspectiveCamera(6, 3 / 2, 0.5, 30000);
+  private readonly tmp = new THREE.Vector3();
   private clock = 0;
   private readonly windOffset = new THREE.Vector2();
   private readonly cloudWind = new THREE.Vector2();
+  // Камера за хвостом: поворот мышью вокруг аппарата и расстояние колёсиком.
+  private orbitYaw = 0;
+  private orbitPitch = 0;
+  private chaseDist = 13.5;
+  private speed = 0;
+  // Режим «кино».
+  private shot = -1;
+  private shotLeft = 0;
+  private readonly shotEye = new THREE.Vector3();
 
   constructor(private readonly container: HTMLElement, env: Environment) {
     this.terrain = env.terrain;
     this.site = env.site;
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.q = env.quality ?? QUALITY.medium;
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.q.pixelRatio));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 0.55;
@@ -125,29 +164,32 @@ export class World {
     container.appendChild(this.renderer.domElement);
     this.pmrem = new THREE.PMREMGenerator(this.renderer);
 
-    // Небо по модели рассеяния Прити; тот же купол даёт отражения на модели аппарата.
-    this.sky.scale.setScalar(450000);
-    const u = this.sky.material.uniforms;
-    u['turbidity']!.value = 5;
-    u['rayleigh']!.value = 1.4;
-    u['mieCoefficient']!.value = 0.004;
-    u['mieDirectionalG']!.value = 0.8;
-    this.scene.add(this.sky);
-    this.skyEnv.add(new Sky().copy(this.sky));
+    // Композитор: сцена в HDR с MSAA, свечение ярких мест, затем тональная кривая и sRGB.
+    this.composer = new EffectComposer(this.renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 }));
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.32, 0.55, 0.92);
+    this.composer.addPass(this.bloom);
+    this.composer.addPass(new OutputPass());
 
-    this.scene.fog = new THREE.Fog(0xbfd0e0, 6000, 38000);
+    // Небо — градиент с явными цветами (skyDome.ts); тот же купол даёт отражения на модели аппарата.
+    this.scene.add(this.sky.mesh);
+    this.skyEnv.add(this.sky.envMesh);
+
+    // Дымка: чем дальше, тем больше рельеф уходит в цвет неба.
+    this.scene.fog = new THREE.Fog(0xbfd0e0, 4000, 34000);
     this.scene.add(this.hemi);
     this.sun.castShadow = true;
-    this.sun.shadow.mapSize.set(2048, 2048);
+    this.sun.shadow.mapSize.set(this.q.shadowMapSize, this.q.shadowMapSize);
     const sc = this.sun.shadow.camera;
-    sc.left = -10;
-    sc.right = 10;
-    sc.top = 10;
-    sc.bottom = -10;
+    sc.left = -12;
+    sc.right = 12;
+    sc.top = 12;
+    sc.bottom = -12;
     sc.near = 1;
     sc.far = 3000;
     this.sun.shadow.bias = -0.0004;
     this.sun.shadow.normalBias = 0.02;
+    this.sun.shadow.radius = 3;
     this.scene.add(this.sun, this.sun.target);
 
     this.lod = new TerrainLod(env.terrain, env.site, env.bounds, env.maxImageryZoom, this.renderer.capabilities.getMaxAnisotropy());
@@ -166,8 +208,8 @@ export class World {
     this.frameLines = new THREE.LineSegments(frameGeo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.75, depthWrite: false }));
     this.frameLines.frustumCulled = false;
 
-    this.scene.add(this.lod.group, this.createGroundFill(env.bounds), this.routeGroup, this.trail, this.frameLines, this.createPad());
-    this.scene.add(this.createWindsock({ east: 8, north: 6 }));
+    this.scene.add(this.lod.group, this.createGroundFill(env.bounds), this.routeGroup, this.markerGroup, this.trail, this.frameLines, this.createPad(0, 0));
+    this.scene.add(this.createWindsock({ east: 8, north: 6 }), this.createCamp());
     this.setArea(env.area);
 
     this.clouds = new THREE.Mesh(
@@ -192,12 +234,22 @@ export class World {
     this.clouds.position.y = env.cloudBaseM;
     this.scene.add(this.clouds);
 
-    this.dust = new THREE.Mesh(
-      new THREE.RingGeometry(0.4, 1, 48),
-      new THREE.MeshBasicMaterial({ color: 0xcbb893, transparent: true, opacity: 0, depthWrite: false }),
+    this.dust = new RotorDust(this.q.dustParticles);
+    // Мягкая тень под аппаратом: видна на любой высоте, в отличие от карты теней вокруг него.
+    const blobTex = canvasTexture(128, (g) => {
+      const grad = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+      grad.addColorStop(0, 'rgba(0,0,0,1)');
+      grad.addColorStop(0.45, 'rgba(0,0,0,0.55)');
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      g.fillStyle = grad;
+      g.fillRect(0, 0, 128, 128);
+    });
+    this.blob = new THREE.Mesh(
+      new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({ map: blobTex, transparent: true, opacity: 0, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -6, polygonOffsetUnits: -6 }),
     );
-    this.dust.rotation.x = -Math.PI / 2;
-    this.scene.add(this.dust, this.aircraft.group);
+    this.blob.rotation.x = -Math.PI / 2;
+    this.scene.add(this.dust.object, this.blob, this.aircraft.group);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
@@ -207,7 +259,9 @@ export class World {
     this.controls.target.set(0, 1, 0);
     this.lastTarget.set(0, 0.4, 0);
     this.padCamera = new THREE.Vector3(24, this.groundAt(24, -16) + 1.7, 16);
+    this.bindChaseMouse();
 
+    this.setQuality(this.q);
     this.resize();
     window.addEventListener('resize', () => this.resize());
   }
@@ -221,8 +275,37 @@ export class World {
     const w = Math.max(1, this.container.clientWidth);
     const h = Math.max(1, this.container.clientHeight);
     this.renderer.setSize(w, h);
+    this.composer.setSize(w, h);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+  }
+
+  /** Качество графики: разрешение, тени, постобработка, детальность рельефа, дома и деревья, пыль. */
+  setQuality(q: QualitySettings) {
+    this.q = q;
+    const ratio = Math.min(window.devicePixelRatio, q.pixelRatio);
+    this.renderer.setPixelRatio(ratio);
+    this.composer.setPixelRatio(ratio);
+    if (this.sun.shadow.mapSize.x !== q.shadowMapSize) {
+      this.sun.shadow.mapSize.set(q.shadowMapSize, q.shadowMapSize);
+      this.sun.shadow.map?.dispose();
+      this.sun.shadow.map = null;
+    }
+    this.bloom.enabled = q.bloom;
+    this.lod.setQuality(q.lodSplit, q.maxImageryZoom, q.detailTexture, q.cloudShadows);
+    this.osm?.setQuality(q);
+    this.dust.setMax(q.dustParticles);
+    this.resize();
+  }
+
+  /** Дома, леса и полосы из OpenStreetMap. */
+  setOsm(data: OsmData) {
+    if (this.osm) {
+      this.scene.remove(this.osm.group);
+      this.osm.dispose();
+    }
+    this.osm = new OsmLayer(data, (e, n) => this.groundAt(e, n), this.q);
+    this.scene.add(this.osm.group);
   }
 
   setAircraft(model: AircraftModel) {
@@ -236,6 +319,7 @@ export class World {
   setCameraMode(mode: CameraMode) {
     this.cameraMode = mode;
     this.controls.enabled = mode === 'follow';
+    this.shot = -1;
     if (mode === 'follow') {
       this.camera.fov = 50;
       this.camera.position.copy(this.target).add(new THREE.Vector3(9, 4, 12));
@@ -249,11 +333,12 @@ export class World {
     this.aircraft.group.rotation.set(pose.pitchDeg * DEG, -pose.headingDeg * DEG, -pose.bankDeg * DEG, 'YXZ');
   }
 
-  /** Ветер у земли (для ветроуказателя) и на высоте облаков (для их сноса). Направление — откуда дует. */
+  /** Ветер у земли (для ветроуказателя и пыли) и на высоте облаков (для их сноса). Направление — откуда дует. */
   setWind(groundMs: number, fromDeg: number, cloudsMs: number) {
     const to = (fromDeg + 180) * DEG;
     const droop = (1 - Math.min(1, groundMs / 9)) * 75 * DEG;
     this.sockPivot.rotation.set(0, Math.PI / 2 - to, -droop, 'YZX');
+    this.groundWind.set(Math.sin(to) * groundMs, -Math.cos(to) * groundMs);
     this.cloudWind.set(Math.sin(to) * cloudsMs, -Math.cos(to) * cloudsMs);
   }
 
@@ -264,15 +349,14 @@ export class World {
     const el = sun.elevationDeg * DEG;
     const az = sun.azimuthDeg * DEG;
     this.sunDir.set(Math.cos(el) * Math.sin(az), Math.sin(el), -Math.cos(el) * Math.cos(az));
-    this.sky.material.uniforms['sunPosition']!.value.copy(this.sunDir);
-    (this.skyEnv.children[0] as Sky).material.uniforms['sunPosition']!.value.copy(this.sunDir);
 
     const day = THREE.MathUtils.smoothstep(sun.elevationDeg, -4, 12);
     const warm = 1 - THREE.MathUtils.smoothstep(sun.elevationDeg, 2, 30);
     this.sun.color.setRGB(1, 0.96 - 0.25 * warm, 0.9 - 0.45 * warm);
     this.sun.intensity = 3.2 * day;
     this.hemi.intensity = 0.35 + 0.9 * day;
-    (this.scene.fog as THREE.Fog).color.setRGB(0.55 + 0.2 * day - 0.05 * warm, 0.62 + 0.2 * day - 0.1 * warm, 0.7 + 0.18 * day - 0.2 * warm);
+    // Дымка — цвет неба у горизонта: вдали рельеф уходит в небо без шва.
+    (this.scene.fog as THREE.Fog).color.copy(this.sky.setSun(this.sunDir, day, warm));
     const clouds = this.clouds.material.uniforms;
     (clouds['lit']!.value as THREE.Color).setRGB(1, 1 - 0.15 * warm, 1 - 0.3 * warm).multiplyScalar(0.4 + 0.6 * day);
     (clouds['shade']!.value as THREE.Color).setRGB(0.55, 0.6, 0.68).multiplyScalar(0.4 + 0.6 * day);
@@ -324,6 +408,16 @@ export class World {
       new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.35 }),
     );
     this.routeGroup.add(ground, air);
+  }
+
+  /** Точки маршрута оператора: мачта от земли до высоты полёта, кольцо и номер. */
+  setMarkers(markers: Marker[]) {
+    this.markerGroup.clear();
+    for (const m of markers) {
+      const marker = createWaypointMarker(m.label, this.groundAt(m.east, m.north), m.up);
+      marker.position.set(m.east, 0, -m.north);
+      this.markerGroup.add(marker);
+    }
   }
 
   resetTrail() {
@@ -412,12 +506,16 @@ export class World {
     this.scene.add(this.coverage);
   }
 
-  /** amount 0…1 — насколько сильно поток от винтов поднимает пыль. */
+  /** Пыль от роторов (amount 0…1 — насколько сильно поток поднимает пыль) и тень под аппаратом. */
   updateDust(dt: number, position: LocalPoint, amount: number) {
     this.clock += dt;
-    this.dust.position.set(position.east, this.groundAt(position.east, position.north) + 0.15, -position.north);
-    this.dust.scale.setScalar(2.2 + 1.2 * Math.sin(this.clock * 7) ** 2 + 1.5 * amount);
-    this.dust.material.opacity = 0.45 * amount;
+    const g = this.groundAt(position.east, position.north);
+    this.dust.update(dt, toScene(position, this.tmp), g, amount, this.groundWind);
+    const agl = Math.max(0, position.up - g);
+    const s = 3.6 + agl * 0.05;
+    this.blob.position.set(position.east, g + 0.06, -position.north);
+    this.blob.scale.set(s, s, 1);
+    this.blob.material.opacity = 0.42 * (1 - THREE.MathUtils.smoothstep(agl, 1, 110));
   }
 
   updateCamera(dt: number, pose: Pose) {
@@ -425,6 +523,7 @@ export class World {
     this.target.y += 0.4;
     const h = pose.headingDeg * DEG;
     const forward = new THREE.Vector3(Math.sin(h), 0, -Math.cos(h));
+    if (dt > 0) this.speed += (this.target.distanceTo(this.lastTarget) / dt - this.speed) * (1 - Math.exp(-dt * 2));
 
     if (this.cameraMode === 'follow') {
       this.camera.position.add(this.target.clone().sub(this.lastTarget));
@@ -432,22 +531,19 @@ export class World {
       this.controls.update();
     } else if (this.cameraMode === 'chase') {
       // Смещение держится относительно аппарата: при ускорении времени камера не отстаёт,
-      // сглаживается только поворот вслед за курсом.
-      const desired = forward.clone().multiplyScalar(-13).addScaledVector(UP, 3.5);
+      // сглаживается только поворот вслед за курсом. Мышью — поворот вокруг, колёсиком — расстояние.
+      const pitch = 0.26 + this.orbitPitch;
+      const back = forward.clone().negate().applyAxisAngle(UP, this.orbitYaw);
+      const desired = back.multiplyScalar(Math.cos(pitch) * this.chaseDist).addScaledVector(UP, Math.sin(pitch) * this.chaseDist);
       this.chaseOffset.lerp(desired, 1 - Math.exp(-dt * 2.5));
       this.camera.position.copy(this.target).add(this.chaseOffset);
       this.camera.lookAt(this.target);
-      if (this.camera.fov !== 50) {
-        this.camera.fov = 50;
-        this.camera.updateProjectionMatrix();
-      }
+      // На скорости поле зрения чуть шире — ощущение движения.
+      this.setFov(50 + THREE.MathUtils.clamp((this.speed - 12) * 0.3, 0, 7));
+    } else if (this.cameraMode === 'cinema') {
+      this.cinema(dt, forward);
     } else {
-      // С площадки — как наблюдатель с телевиком: аппарат держится в кадре одного размера.
-      this.camera.position.copy(this.padCamera);
-      this.camera.lookAt(this.target);
-      const d = this.camera.position.distanceTo(this.target);
-      this.camera.fov = Math.min(55, Math.max(1.2, (2 * Math.atan(6 / d)) / DEG));
-      this.camera.updateProjectionMatrix();
+      this.telephoto(this.padCamera);
     }
     const floor = this.groundAt(this.camera.position.x, -this.camera.position.z) + 1.5;
     if (this.camera.position.y < floor) this.camera.position.y = floor;
@@ -458,12 +554,22 @@ export class World {
   }
 
   render(dt = 0) {
+    this.sky.follow(this.camera.position);
     this.windOffset.addScaledVector(this.cloudWind, -dt);
-    (this.clouds.material.uniforms['cam']!.value as THREE.Vector3).copy(this.camera.position);
+    const cu = this.clouds.material.uniforms;
+    (cu['cam']!.value as THREE.Vector3).copy(this.camera.position);
     this.clouds.position.x = this.camera.position.x;
     this.clouds.position.z = this.camera.position.z;
-    this.lod.update(this.camera.position);
-    this.renderer.render(this.scene, this.camera);
+    this.lod.update(this.camera.position, {
+      camera: this.camera.position,
+      cloudOffset: this.windOffset,
+      cloudCover: cu['cover']!.value as number,
+      cloudBaseY: this.clouds.position.y,
+      sunDir: this.sunDir,
+    });
+    this.osm?.update(this.camera.position);
+    if (this.q.postprocess) this.composer.render(dt);
+    else this.renderer.render(this.scene, this.camera);
   }
 
   /**
@@ -488,6 +594,86 @@ export class World {
     this.renderer.setViewport(0, 0, size.x, size.y);
   }
 
+  private setFov(fov: number) {
+    if (Math.abs(this.camera.fov - fov) < 0.05) return;
+    this.camera.fov = fov;
+    this.camera.updateProjectionMatrix();
+  }
+
+  /** Наблюдатель с телевиком из точки eye: аппарат держится в кадре примерно одного размера. */
+  private telephoto(eye: THREE.Vector3, sizeM = 6) {
+    this.camera.position.copy(eye);
+    this.camera.lookAt(this.target);
+    const d = this.camera.position.distanceTo(this.target);
+    this.setFov(Math.min(55, Math.max(1.2, (2 * Math.atan(sizeM / d)) / DEG)));
+  }
+
+  /** «Кино»: сбоку, пролёт мимо неподвижной камеры, с площадки, сверху-сзади — по очереди. */
+  private cinema(dt: number, forward: THREE.Vector3) {
+    this.shotLeft -= dt;
+    const side = new THREE.Vector3(-forward.z, 0, forward.x);
+    const passed = this.shot === 1 && this.shotEye.distanceTo(this.target) > 220;
+    if (this.shotLeft <= 0 || passed) {
+      this.shot = (this.shot + 1) % 4;
+      this.shotLeft = CINEMA_SHOT_S;
+      if (this.shot === 1) {
+        // Камера на пути впереди и чуть в стороне — аппарат проходит мимо.
+        const ahead = Math.max(60, this.speed * 5);
+        this.shotEye.copy(this.target).addScaledVector(forward, ahead).addScaledVector(side, 22);
+        this.shotEye.y = Math.max(this.target.y - 6, this.groundAt(this.shotEye.x, -this.shotEye.z) + 2);
+      }
+    }
+    if (this.shot === 0) {
+      const eye = this.target.clone().addScaledVector(side, 16).addScaledVector(forward, 4).addScaledVector(UP, 2);
+      this.camera.position.lerp(eye, 1 - Math.exp(-dt * 3));
+      this.camera.lookAt(this.target);
+      this.setFov(45);
+    } else if (this.shot === 1) {
+      this.telephoto(this.shotEye, 9);
+    } else if (this.shot === 2) {
+      this.telephoto(this.padCamera);
+    } else {
+      const eye = this.target.clone().addScaledVector(forward, -30).addScaledVector(UP, 32);
+      this.camera.position.lerp(eye, 1 - Math.exp(-dt * 2));
+      this.camera.lookAt(this.target);
+      this.setFov(50);
+    }
+  }
+
+  /** В режиме «за хвостом» мышь поворачивает камеру вокруг аппарата, колёсико — расстояние, двойной щелчок — сброс. */
+  private bindChaseMouse() {
+    const el = this.renderer.domElement;
+    let drag: { x: number; y: number } | null = null;
+    el.addEventListener('pointerdown', (e) => {
+      if (this.cameraMode !== 'chase') return;
+      drag = { x: e.clientX, y: e.clientY };
+      el.setPointerCapture(e.pointerId);
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (!drag) return;
+      this.orbitYaw -= (e.clientX - drag.x) * 0.006;
+      this.orbitPitch = THREE.MathUtils.clamp(this.orbitPitch + (e.clientY - drag.y) * 0.004, -0.3, 1.2);
+      drag = { x: e.clientX, y: e.clientY };
+    });
+    const end = () => (drag = null);
+    el.addEventListener('pointerup', end);
+    el.addEventListener('pointercancel', end);
+    el.addEventListener(
+      'wheel',
+      (e) => {
+        if (this.cameraMode !== 'chase') return;
+        e.preventDefault();
+        this.chaseDist = THREE.MathUtils.clamp(this.chaseDist * Math.exp(e.deltaY * 0.001), 5, 90);
+      },
+      { passive: false },
+    );
+    el.addEventListener('dblclick', () => {
+      this.orbitYaw = 0;
+      this.orbitPitch = 0;
+      this.chaseDist = 13.5;
+    });
+  }
+
   /** Равнина вокруг загруженного рельефа — чтобы до горизонта не было пустоты. */
   private createGroundFill(bounds: Bounds): THREE.Mesh {
     let min = Infinity;
@@ -502,46 +688,39 @@ export class World {
 
   /** Дополнительные площадки посадки (пункт доставки), локальные метры. */
   setPads(points: { east: number; north: number }[]) {
-    for (const p of this.pads) {
-      this.scene.remove(p);
-      p.geometry.dispose();
-    }
+    for (const p of this.pads) this.scene.remove(p);
     this.pads = points.map((p) => this.createPad(p.east, p.north));
     for (const p of this.pads) this.scene.add(p);
   }
 
-  private createPad(east = 0, north = 0): THREE.Mesh {
-    const tex = canvasTexture(256, (g) => {
-      g.fillStyle = '#6b6f73';
-      g.beginPath();
-      g.arc(128, 128, 126, 0, Math.PI * 2);
-      g.fill();
-      g.strokeStyle = '#f4f4f0';
-      g.lineWidth = 9;
-      g.beginPath();
-      g.arc(128, 128, 106, 0, Math.PI * 2);
-      g.stroke();
-      g.fillStyle = '#f4f4f0';
-      g.font = 'bold 150px system-ui, sans-serif';
-      g.textAlign = 'center';
-      g.textBaseline = 'middle';
-      g.fillText('H', 128, 136);
-    });
-    const pad = new THREE.Mesh(
-      new THREE.CircleGeometry(4.5, 48),
-      new THREE.MeshLambertMaterial({ map: tex, transparent: true, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }),
-    );
-    pad.rotation.x = -Math.PI / 2;
-    pad.position.set(east, this.groundAt(east, north) + 0.25, -north);
-    pad.receiveShadow = true;
-    return pad;
+  /** Площадка и круг зоны посадки вокруг неё. */
+  private createPad(east: number, north: number): THREE.Group {
+    const g = new THREE.Group();
+    g.position.set(east, this.groundAt(east, north), -north);
+    g.add(createLandingPad(), createLandingZone(AIRCRAFT.limits.landingZoneRadiusM));
+    return g;
+  }
+
+  /** Лагерь экипажа у площадки: НСУ со штативом-антенной и машина. */
+  private createCamp(): THREE.Group {
+    const g = new THREE.Group();
+    const place = (o: THREE.Object3D, east: number, north: number, yawDeg: number) => {
+      o.position.set(east, this.groundAt(east, north), -north);
+      o.rotation.y = yawDeg * DEG;
+      g.add(o);
+    };
+    // С западной стороны — не на линии камеры «с площадки» (она к юго-востоку от площадки).
+    place(createGroundStation(), -12, -9, 150);
+    place(createVehicle(), -21, -15, 70);
+    return g;
   }
 
   private createWindsock(at: { east: number; north: number }): THREE.Group {
     const g = new THREE.Group();
     g.position.set(at.east, this.groundAt(at.east, at.north), -at.north);
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.06, 5, 10), new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness: 0.4 }));
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.06, 5, 10), new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness: 0.4, roughness: 0.4 }));
     pole.position.y = 2.5;
+    pole.castShadow = true;
     g.add(pole);
     const tex = canvasTexture(64, (ctx) => {
       for (let i = 0; i < 5; i++) {
@@ -555,6 +734,7 @@ export class World {
     );
     sock.rotation.z = -Math.PI / 2;
     sock.position.x = 1.2;
+    sock.castShadow = true;
     this.sockPivot.position.y = 4.9;
     this.sockPivot.add(sock);
     g.add(this.sockPivot);

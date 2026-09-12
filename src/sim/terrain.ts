@@ -148,21 +148,26 @@ export function followTerrain(
   return samples.slice(1, -1).map((s, i) => ({ lat: s.lat, lon: s.lon, altitudeM: alt[i + 1]!, routeLeg: s.leg }));
 }
 
+/** Метка «нет данных» в сетке высот (тайл не загрузился). */
+export const NO_DATA = -9000;
+
 /**
  * Пустоты в данных высот (в тайлах Terrarium встречаются над водой: −5…90 м там, где рядом
- * 140 м) заполняются от соседей. Пустота — ниже 2-го процентиля всех высот больше чем на dropM.
+ * 140 м) заполняются от соседей. Пустота — ниже 2-го процентиля всех высот больше чем на dropM
+ * или не выше NO_DATA.
  * Возвращает число заполненных клеток.
  */
 export function fillVoids(heights: Float32Array, width: number, height: number, dropM = 40): number {
   const stride = Math.max(1, Math.floor(heights.length / 200_000));
   const sample: number[] = [];
-  for (let i = 0; i < heights.length; i += stride) sample.push(heights[i]!);
+  // NO_DATA (незагруженный тайл) — пустота всегда и в порог не входит.
+  for (let i = 0; i < heights.length; i += stride) if (heights[i]! > NO_DATA) sample.push(heights[i]!);
   sample.sort((a, b) => a - b);
-  const floor = sample[Math.floor(sample.length * 0.02)]! - dropM;
+  const floor = (sample[Math.floor(sample.length * 0.02)] ?? 0) - dropM;
   const bad = new Uint8Array(heights.length);
   let left = 0;
   for (let i = 0; i < heights.length; i++) {
-    if (heights[i]! < floor) {
+    if (heights[i]! < floor || heights[i]! <= NO_DATA) {
       bad[i] = 1;
       left++;
     }

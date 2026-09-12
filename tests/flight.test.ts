@@ -25,6 +25,7 @@ describe('живой полёт', () => {
   it('задание в АВТО сходится с расчётом планировщика по энергии и времени', () => {
     const planned = simulateMission(plan, weather);
     const f = new LiveFlight({ plan, terrain, weather });
+    f.command('arm');
     expect(f.command('takeoff')).toBeNull();
     const maxBank = runUntil(f, controls, (x) => x.state.mode === 'landed' || x.state.mode === 'crashed');
     expect(f.state.mode).toBe('landed');
@@ -36,6 +37,7 @@ describe('живой полёт', () => {
 
   it('ВОЗВРАТ с середины задания приводит на площадку', () => {
     const f = new LiveFlight({ plan, terrain, weather });
+    f.command('arm');
     f.command('takeoff');
     runUntil(f, controls, (x) => x.state.t > 600);
     expect(f.state.mode).toBe('auto');
@@ -47,6 +49,7 @@ describe('живой полёт', () => {
 
   it('ЦЕЛЬ: аппарат кружит вокруг точки', () => {
     const f = new LiveFlight({ plan, terrain, weather });
+    f.command('arm');
     f.command('takeoff');
     runUntil(f, controls, (x) => x.state.mode === 'auto');
     const target = { east: 1500, north: 800 };
@@ -66,6 +69,7 @@ describe('живой полёт', () => {
   it('РУЧНОЙ низко на стену выше предельного набора — столкновение с рельефом', () => {
     const wall: Terrain = { elevationM: (p) => (p.lon > plan.takeoff.lon + 0.03 ? 900 : 320) };
     const f = new LiveFlight({ plan, terrain: wall, weather });
+    f.command('arm');
     f.command('takeoff');
     runUntil(f, controls, (x) => x.state.mode === 'auto');
     f.command('manual');
@@ -75,6 +79,7 @@ describe('живой полёт', () => {
 
   it('шаг нулевой длины ничего не меняет и не портит энергию', () => {
     const f = new LiveFlight({ plan, terrain, weather });
+    f.command('arm');
     f.command('takeoff');
     runUntil(f, controls, (x) => x.state.mode === 'auto');
     const before = { ...f.state };
@@ -87,8 +92,83 @@ describe('живой полёт', () => {
 
   it('разряд батареи в воздухе — авария', () => {
     const f = new LiveFlight({ plan, terrain, weather, capacityWh: 60 });
+    f.command('arm');
     f.command('takeoff');
     runUntil(f, controls, (x) => x.state.mode === 'crashed' || x.state.mode === 'landed');
-    expect(f.state.reason).toBe('Батарея разряжена');
+    // Моторы встают, аппарат падает и разбивается — причина в сообщении об ударе.
+    expect(f.state.mode).toBe('crashed');
+    expect(f.state.reason).toMatch(/батарея разряжена/i);
+  });
+});
+
+describe('АРМ и ДИЗАРМ', () => {
+  it('без АРМ взлёт не начинается; заармленный на земле — роторы на холостых и расход', () => {
+    const f = new LiveFlight({ plan, terrain, weather });
+    expect(f.command('takeoff')).not.toBeNull();
+    expect(f.command('arm')).toBeNull();
+    f.step(10, controls);
+    expect(f.state.mode).toBe('ground');
+    expect(f.state.armed).toBe(true);
+    expect(f.state.lift).toBeGreaterThan(0);
+    expect(f.state.energyWh).toBeGreaterThan(0);
+    expect(f.command('disarm')).toBeNull();
+    expect(f.state.armed).toBe(false);
+    expect(f.command('takeoff')).not.toBeNull();
+  });
+
+  it('после посадки остаётся заармленным и тратит батарею, пока оператор не задизармит', () => {
+    const f = new LiveFlight({ plan, terrain, weather });
+    f.command('arm');
+    f.command('takeoff');
+    while (f.state.mode !== 'auto' && f.state.t < 600) f.step(0.5, controls);
+    expect(f.command('land')).toBeNull();
+    while (f.state.mode !== 'landed' && f.state.t < 1200) f.step(0.5, controls);
+    expect(f.state.mode).toBe('landed');
+    const e = f.state.energyWh;
+    f.step(30, controls);
+    expect(f.state.armed).toBe(true);
+    expect(f.state.lift).toBeGreaterThan(0);
+    expect(f.state.energyWh).toBeGreaterThan(e);
+    expect(f.command('disarm')).toBeNull();
+    const e2 = f.state.energyWh;
+    f.step(30, controls);
+    expect(f.state.energyWh).toBe(e2);
+    expect(f.state.lift).toBe(0);
+  });
+
+  it('ДИЗАРМ в крейсере — моторы стоят, аппарат планирует со снижением и разбивается', () => {
+    const f = new LiveFlight({ plan, terrain, weather });
+    f.command('arm');
+    f.command('takeoff');
+    while (!(f.state.mode === 'auto' && f.state.aglM > 100) && f.state.t < 1200) f.step(0.5, controls);
+    const start = { e: f.state.east, n: f.state.north, agl: f.state.aglM };
+    expect(f.command('disarm')).toBeNull();
+    expect(f.state.mode).toBe('falling');
+    let thrust = 0;
+    let power = 0;
+    while (f.state.mode === 'falling' && f.state.t < 3600) {
+      f.step(0.2, controls);
+      thrust = Math.max(thrust, f.state.lift, f.state.pusher);
+      power = Math.max(power, f.state.powerW);
+    }
+    // Моторы стоят; от батареи питается только нагрузка (камера).
+    expect(thrust).toBe(0);
+    expect(power).toBeLessThanOrEqual((plan.payload?.powerW ?? 0) + 1e-9);
+    expect(f.state.mode).toBe('crashed');
+    expect(f.state.reason).toMatch(/ДИЗАРМ/);
+    // Крыло держит: пролетел в несколько раз дальше, чем был высоко.
+    expect(Math.hypot(f.state.east - start.e, f.state.north - start.n)).toBeGreaterThan(3 * start.agl);
+  });
+
+  it('ДИЗАРМ на висении — падение почти вертикально и авария', () => {
+    const f = new LiveFlight({ plan, terrain, weather: { ...weather, wind: { speedMs: 0, fromDeg: 0 } } });
+    f.command('arm');
+    f.command('takeoff');
+    while (!(f.state.mode === 'climb' && f.state.aglM > 25) && f.state.t < 120) f.step(0.1, controls);
+    const start = { e: f.state.east, n: f.state.north };
+    expect(f.command('disarm')).toBeNull();
+    while (f.state.mode === 'falling' && f.state.t < 300) f.step(0.1, controls);
+    expect(f.state.mode).toBe('crashed');
+    expect(Math.hypot(f.state.east - start.e, f.state.north - start.n)).toBeLessThan(15);
   });
 });
