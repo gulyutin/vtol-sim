@@ -5,7 +5,7 @@ import type { Site, Terrain } from '../sim/types';
 import { fetchWithRetry, type Bounds } from './terrainData';
 
 export const IMAGERY_ATTRIBUTION =
-  'Снимки © Esri, Maxar, Earthstar Geographics · Рельеф: AWS Terrain Tiles (SRTM и др.) · Дома и лес: © участники OpenStreetMap';
+  'Снимки © Esri, Maxar, Earthstar Geographics · Рельеф: AWS Terrain Tiles (SRTM и др.) · Дома, дороги, вода и лес: © участники OpenStreetMap';
 const imageryUrl = (z: number, x: number, y: number) =>
   `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
 

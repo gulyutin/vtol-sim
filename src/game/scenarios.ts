@@ -33,7 +33,7 @@ export interface Settings {
   localHour: number;
 }
 
-export type ScenarioKind = 'survey' | 'delivery' | 'route';
+export type ScenarioKind = 'transfer' | 'survey' | 'delivery' | 'route';
 
 export type { RoutePoint };
 
@@ -80,7 +80,15 @@ export interface RouteScenario extends ScenarioBase {
   route: RoutePoint[];
 }
 
-export type Scenario = SurveyScenario | DeliveryScenario | RouteScenario;
+/** Перелёт из А в Б: один полёт, посадка в пункте Б. */
+export interface TransferScenario extends ScenarioBase {
+  kind: 'transfer';
+  destination: GeoPoint;
+  destinationName: string;
+  route: RoutePoint[];
+}
+
+export type Scenario = TransferScenario | SurveyScenario | DeliveryScenario | RouteScenario;
 
 /** Район заданий — из профиля. */
 const L = PROFILE.location;
@@ -114,6 +122,17 @@ const DEFAULTS: Settings = {
 
 /** Первое задание — стартовое. */
 export const SCENARIOS: readonly Scenario[] = [
+  {
+    ...COMMON,
+    id: 'transfer',
+    kind: 'transfer',
+    title: L.transfer.title,
+    briefing: L.transfer.briefing,
+    destination: L.transfer.destination,
+    destinationName: L.transfer.destinationName,
+    route: L.transfer.route,
+    defaults: { ...DEFAULTS },
+  },
   {
     ...COMMON,
     id: 'route',
@@ -169,6 +188,9 @@ export function forecastWeather(sc: Scenario, s: Settings): Weather {
     groundTemperatureC: s.temperatureC,
     wind: { speedMs: s.windSpeedMs, fromDeg: s.windFromDeg },
     windProfile: { referenceHeightM: 10, shearExponent: sc.shearExponent },
+    cloudCover: sc.cloudCover,
+    cloudBaseM: sc.cloudBaseM,
+    precipitation: null,
   };
 }
 
@@ -337,6 +359,21 @@ export function buildMission(sc: Scenario, s: Settings, terrain: Terrain, weathe
         stages: [out.plan, back.plan],
         stageNames: [`Туда с грузом ${s.cargoKg.toLocaleString('ru-RU')} кг`, 'Обратно пустым'],
         procedures: [out.proc, back.proc],
+        site,
+        destination: dest,
+        camera: null,
+        params: null,
+        survey: null,
+      };
+    }
+    case 'transfer': {
+      const dest = siteAt(terrain, sc.destination);
+      const r = routeStage(site, dest, sc.route, null, s, terrain, weather, (i, n) => (i === n - 1 ? 'К посадочному маршруту' : `Перелёт: участок ${i + 1} из ${n}`), ` в ${sc.destinationName}`);
+      return {
+        kind: 'transfer',
+        stages: [r.plan],
+        stageNames: ['Перелёт'],
+        procedures: [r.proc],
         site,
         destination: dest,
         camera: null,

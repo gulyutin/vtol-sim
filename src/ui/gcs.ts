@@ -4,6 +4,8 @@ import { MODE_NAMES, type Command, type Controls, type LiveState } from '../sim/
 import { CAMERAS } from '../sim/payload';
 import { loadQuality, QUALITY, type Quality } from './quality';
 import { PREP_STEPS, type Preparation, type PrepStepId } from '../game/preparation';
+import { DIFFICULTY } from '../game/scoring';
+import { FAILURES } from '../sim/failures';
 import { footprintM, type Coverage, type Frame, type SurveyCamera, type SurveyPlan } from '../sim/survey';
 import type { MissionResult, Wind } from '../sim/types';
 import { drawAttitude, drawProfile, type ProfileData } from './instruments';
@@ -31,6 +33,15 @@ export interface GcsHandlers {
   onZoom(delta: number): void;
   onCamera(m: CameraMode): void;
   onQuality(q: Quality): void;
+  /** Источник погоды: 'scenario' — ползунки задания, 'live' — Open-Meteo сейчас, иначе пресет weatherPreset. */
+  onWeatherSource(src: string): void;
+  onSound(): void;
+  /** Режим: тренировка, штатный полёт, сложные условия, зачёт (DIFFICULTY). */
+  onDifficulty(id: string): void;
+  onDebrief(): void;
+  /** Инструктор: ввести отказ / восстановить связь или ГНСС. */
+  onInject(id: string): void;
+  onRestore(id: 'link' | 'gnss'): void;
   onPrepStep(id: PrepStepId): void;
   onPrepRequired(on: boolean): void;
   onResize(): void;
@@ -71,6 +82,15 @@ export interface Telemetry {
   canUnload: boolean;
   /** Предполётные проверки не пройдены — статус «НЕ ГОТОВ», взлёт запрещён. */
   notReady: boolean;
+  /** Тревоги поверх 3D: нет связи, отказы с порядком действий по РЛЭ, «Фэйлсейф». */
+  alerts: Alert[];
+}
+
+export interface Alert {
+  level: 'bad' | 'warn' | 'info';
+  text: string;
+  /** Порядок действий оператора (РЛЭ). */
+  actions?: string[];
 }
 
 export interface Gcs {
@@ -93,6 +113,11 @@ export interface Gcs {
   flash(): void;
   setControls(c: Controls): void;
   targetMode(on: boolean): void;
+  /** Строка под выбором погоды: откуда погода и что в ней. */
+  setWeatherSummary(text: string): void;
+  setSoundMuted(muted: boolean): void;
+  /** Выбрать источник погоды в списке (режим задаёт свою погоду). */
+  setWeatherSource(src: string): void;
 }
 
 const COMPASS = ['С', 'СВ', 'В', 'ЮВ', 'Ю', 'ЮЗ', 'З', 'СЗ'];
@@ -111,6 +136,8 @@ const ICON: Record<string, string> = {
   mode: '<path d="M5 3v18M12 3v18M19 3v18"/><circle cx="5" cy="9" r="2.2"/><circle cx="12" cy="15" r="2.2"/><circle cx="19" cy="7" r="2.2"/>',
   emergency: '<path d="M12 3 22 21H2Z"/><path d="M12 10v5M12 18v.5"/>',
   arm: '<path d="M12 3v8"/><path d="M6.8 6.8a7.5 7.5 0 1 0 10.4 0"/>',
+  debrief: '<path d="M4 20V4M4 20h16"/><path d="M7 15l4-5 3 3 5-7"/>',
+  instructor: '<circle cx="12" cy="7" r="3.2"/><path d="M5 20c1.2-4 3.8-6 7-6s5.8 2 7 6"/><path d="M12 14l-1.5 3 1.5 3 1.5-3z"/>',
   prep: '<path d="M10 6h10M10 12h10M10 18h10"/><path d="M3.5 6l1.5 1.5L7.5 5M3.5 12l1.5 1.5 2.5-2.5M3.5 18l1.5 1.5 2.5-2.5"/>',
   task: '<path d="M4 20 20 12 4 4v6l10 2-10 2z"/>',
   unload: '<rect x="4" y="11" width="16" height="9" rx="1"/><path d="M12 2v10M8 8l4 4 4-4"/>',
@@ -125,6 +152,20 @@ const ICON: Record<string, string> = {
   control: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
 };
 const icon = (k: string) => `<svg viewBox="0 0 24 24">${ICON[k]}</svg>`;
+/** Источник погоды: задание, фактическая сейчас или пресет (weatherPreset в game/weather.ts). */
+const WEATHER_SOURCES: [string, string][] = [
+  ['scenario', 'По заданию — ползунки ниже'],
+  ['live', 'Сейчас на площадке — Open-Meteo'],
+  ['calm', 'Штиль'],
+  ['breezy', 'Ветрено'],
+  ['gusty', 'Порывистый ветер'],
+  ['rain', 'Дождь'],
+  ['snow', 'Снег'],
+  ['fog', 'Туман'],
+  ['lowcloud', 'Низкая облачность'],
+  ['storm', 'Гроза'],
+];
+
 const button = (a: string, label: string, ic: string, extra = '') => `<button class="gbtn" data-a="${a}" ${extra}>${ic}<span>${label}</span></button>`;
 
 type NumKey = Exclude<keyof Settings, 'cameraId' | 'shutter'>;
@@ -184,6 +225,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     <select class="tb quality" title="Качество графики: дома, деревья, тени, сглаживание">${(Object.keys(QUALITY) as Quality[])
       .map((k) => `<option value="${k}" ${k === loadQuality() ? 'selected' : ''}>Графика: ${QUALITY[k].label.toLowerCase()}</option>`)
       .join('')}</select>
+    <button class="tb field" data-a="sound" title="Звук: вкл/выкл">🔊</button>
     <div class="status" data-v="status">ГОТОВ</div>
     <div class="tb-right">
       <span class="batt" title="Заряд и напряжение (оценка без просадки)">🔋 <b data-v="soc">100%</b> <small data-v="volt">50,4 В</small></span>
@@ -202,7 +244,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         ${button('emergency', 'Аварийная', icon('emergency'))}
         ${button('unload', 'Разгрузка', icon('unload'), 'hidden')}
       </div>
-      <div class="col left mid">${button('task', 'Задача', icon('task'))}${button('prep', 'Подготовка', icon('prep'))}</div>
+      <div class="col left mid">${button('task', 'Задача', icon('task'))}${button('prep', 'Подготовка', icon('prep'))}${button('debrief', 'Разбор', icon('debrief'))}${button('instructor', 'Инструктор', icon('instructor'))}</div>
       <div class="col right top">${button('telemetry', 'Телеметрия', icon('telemetry'))}</div>
       <div class="col right mid">
         ${button('follow', 'Навигация', icon('nav'))}
@@ -224,13 +266,17 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       <div class="menu" data-menu="emergency" hidden>
         <button data-cmd="rtl">Возврат на аэродром</button>
         <button data-cmd="land">Посадка на месте</button>
+        <button data-cmd="failsafe">ФЭЙЛСЕЙФ — ручное управление с ПДУ</button>
+        <button data-cmd="copter">КОПТЕР — в фэйлсейфе перейти на роторы</button>
       </div>
     </section>
     <div class="splitter" title="Потяните, чтобы изменить доли"></div>
     <section class="view-pane">
       <div class="view"></div>
+      <div class="alerts" hidden></div>
       <select class="camera">
         <option value="chase" title="Мышь — повернуть, колёсико — ближе/дальше, двойной щелчок — сброс">3D: за хвостом</option>
+        <option value="tail" title="Камера на оперении смотрит вперёд — горизонт кренится вместе с аппаратом">3D: камера на хвосте</option>
         <option value="follow">3D: облёт мышью</option>
         <option value="pad">3D: с площадки</option>
         <option value="cinema">3D: кино</option>
@@ -245,6 +291,14 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     `<label class="prep-req"><input type="checkbox" data-prep-req> Требовать подготовку перед АРМ</label>
     <ol class="prep">${PREP_STEPS.map((s) => `<li data-step="${s.id}" data-status="todo"><button class="small" data-prep="${s.id}">Выполнить</button><div><b>${s.title}</b><small>${s.hint}</small><em></em></div></li>`).join('')}</ol>`,
     'left:80px;top:52px;width:380px',
+  )}
+  ${win(
+    'instructor',
+    'Инструктор — особые случаи',
+    `<p class="hint">Отказ вводится сразу — как в таблице особых случаев РЛЭ. Оператор действует по порядку, разбор оценит реакцию.</p>
+    <ul class="inject">${FAILURES.map((f) => `<li><button class="small" data-inject="${f.id}">Ввести</button><div><b>${f.title}</b><small>${f.effect}</small></div></li>`).join('')}</ul>
+    <div class="row"><button class="small" data-restore="link">Восстановить связь</button><button class="small" data-restore="gnss">Восстановить ГНСС</button></div>`,
+    'right:calc(45% + 84px);top:52px;width:380px',
   )}
   ${win('control', 'Управление', controlBody, 'right:calc(45% + 84px);bottom:78px;width:250px')}
   ${win('telemetry', 'Телеметрия', '<dl class="tm"></dl>', 'right:calc(45% + 84px);top:52px;width:220px')}
@@ -295,6 +349,10 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   };
 
   let follow = false;
+  let weatherSource = 'scenario';
+  let weatherSummary = '';
+  let difficulty = 'train';
+  let alertsKey = '';
   let armed = false;
   el.querySelectorAll<HTMLButtonElement>('[data-a]').forEach((b) =>
     b.addEventListener('click', () => {
@@ -304,7 +362,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       else if (a === 'unload') h.onCommand('unload');
       else if (a === 'mode' || a === 'emergency') openMenu(a, b);
       else if (a === 'task' || a === 'menu') toggle('task');
-      else if (['telemetry', 'horizon', 'console', 'profile', 'control', 'prep'].includes(a)) toggle(a);
+      else if (['telemetry', 'horizon', 'console', 'profile', 'control', 'prep', 'instructor'].includes(a)) toggle(a);
       else if (a === 'follow') {
         follow = !follow;
         b.classList.toggle('on', follow);
@@ -314,6 +372,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       else if (a === 'zoomOut') h.onZoom(-1);
       else if (a === 'rate') h.onRate();
       else if (a === 'pause') h.onPause();
+      else if (a === 'sound') h.onSound();
+      else if (a === 'debrief') h.onDebrief();
       else if (a === 'restart') h.onRestart();
       else if (a === 'clear') h.onClearTrail();
     }),
@@ -344,6 +404,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   q<HTMLSelectElement>('.quality').addEventListener('change', (e) => h.onQuality((e.target as HTMLSelectElement).value as Quality));
   el.querySelectorAll<HTMLButtonElement>('[data-prep]').forEach((b) => b.addEventListener('click', () => h.onPrepStep(b.dataset.prep as PrepStepId)));
   q<HTMLInputElement>('[data-prep-req]').addEventListener('change', (e) => h.onPrepRequired((e.target as HTMLInputElement).checked));
+  el.querySelectorAll<HTMLButtonElement>('[data-inject]').forEach((b) => b.addEventListener('click', () => h.onInject(b.dataset.inject!)));
+  el.querySelectorAll<HTMLButtonElement>('[data-restore]').forEach((b) => b.addEventListener('click', () => h.onRestore(b.dataset.restore as 'link' | 'gnss')));
 
   // Граница карта | 3D.
   q<HTMLElement>('.splitter').addEventListener('pointerdown', (e) => {
@@ -397,6 +459,17 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     );
     const err = taskBody.querySelector<HTMLInputElement>('[data-a="error"]')!;
     err.addEventListener('change', () => h.onForecastError(err.checked));
+    const diff = taskBody.querySelector<HTMLSelectElement>('[data-a="diff"]')!;
+    diff.addEventListener('change', () => {
+      difficulty = diff.value;
+      taskBody.querySelector<HTMLElement>('.dsum')!.textContent = DIFFICULTY.find((d) => d.id === difficulty)?.description ?? '';
+      h.onDifficulty(diff.value);
+    });
+    const wsrc = taskBody.querySelector<HTMLSelectElement>('[data-a="wsrc"]')!;
+    wsrc.addEventListener('change', () => {
+      weatherSource = wsrc.value;
+      h.onWeatherSource(wsrc.value);
+    });
     taskBody.querySelector<HTMLButtonElement>('[data-a="day"]')!.addEventListener('click', () => h.onNewDay());
   };
 
@@ -413,6 +486,10 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       const survey = sc.kind === 'survey';
       taskBody.innerHTML = `
         <div class="brief"><b>${sc.title}</b><p>${sc.briefing}</p></div>
+        <label class="select"><span>Режим</span><select data-a="diff">
+          ${DIFFICULTY.map((d) => `<option value="${d.id}" ${d.id === difficulty ? 'selected' : ''}>${d.title}</option>`).join('')}
+        </select></label>
+        <p class="hint dsum">${DIFFICULTY.find((d) => d.id === difficulty)?.description ?? ''}</p>
         ${
           survey
             ? `<details open><summary>Съёмка</summary>
@@ -430,6 +507,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         </details>`
             : ''
         }
+        ${sc.kind === 'transfer' ? '<details open><summary>Пункт «Б»</summary><p class="hint">Точку «Б» можно перетащить на карте до взлёта; посадка — в «Б». Промежуточные точки — в маршруте ниже, заход на посадку строится по ветру.</p></details>' : ''}
         ${sc.kind === 'delivery' ? `<details open><summary>Груз</summary>${range('cargoKg', 'Масса груза', 0, 2, 0.1, s.cargoKg)}<p class="hint">Пункт «Б» можно перетащить на карте. Обратный путь — те же точки в обратном порядке.</p></details>` : ''}
         ${survey ? '' : '<details open><summary>Маршрут</summary><div class="route-box"></div></details>'}
         <details open><summary>Полёт</summary>
@@ -437,6 +515,10 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           ${range('localHour', 'Время вылета (местное)', 5, 21, 0.25, s.localHour)}
         </details>
         <details ${survey ? '' : 'open'}><summary>Погода — прогноз</summary>
+          <label class="select"><span>Погода</span><select data-a="wsrc">
+            ${WEATHER_SOURCES.map(([v, t]) => `<option value="${v}" ${v === weatherSource ? 'selected' : ''}>${t}</option>`).join('')}
+          </select></label>
+          <p class="hint wsum">${weatherSummary}</p>
           ${range('windSpeedMs', 'Ветер на 10 м', 0, 12, 0.5, s.windSpeedMs)}
           ${range('windFromDeg', 'Откуда дует', 0, 355, 5, s.windFromDeg)}
           ${range('temperatureC', 'Температура', -35, 35, 1, s.temperatureC)}
@@ -561,6 +643,24 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         .join('');
     },
 
+    setWeatherSummary(text) {
+      weatherSummary = text;
+      const p = taskBody.querySelector<HTMLElement>('.wsum');
+      if (p) p.textContent = text;
+    },
+
+    setWeatherSource(src) {
+      weatherSource = src;
+      const sel = taskBody.querySelector<HTMLSelectElement>('[data-a="wsrc"]');
+      if (sel) sel.value = src;
+    },
+
+    setSoundMuted(muted) {
+      const b = q<HTMLButtonElement>('[data-a="sound"]');
+      b.textContent = muted ? '🔇' : '🔊';
+      b.title = muted ? 'Звук выключен — включить' : 'Звук включён — выключить';
+    },
+
     showPreparation(p, required, live) {
       q<HTMLInputElement>('[data-prep-req]').checked = required;
       for (const s of PREP_STEPS) {
@@ -579,7 +679,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     lockPlanning(on, keepRoute = false) {
       locked = on;
       keepRouteOpen = keepRoute;
-      taskBody.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>('[data-k], [data-a="error"], [data-a="day"]').forEach((i) => (i.disabled = on));
+      taskBody.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>('[data-k], [data-a="error"], [data-a="day"], [data-a="wsrc"], [data-a="diff"]').forEach((i) => (i.disabled = on));
       taskBody.querySelectorAll<HTMLInputElement | HTMLButtonElement>('[data-rh], [data-rdel], [data-a="route-clear"]').forEach((i) => (i.disabled = on && !keepRoute));
       scen.disabled = on;
       el.classList.toggle('flying', on);
@@ -610,6 +710,16 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       armBtn.title = s.armed ? 'Задизармить: моторы остановятся (в полёте — падение)' : 'Заармить: разрешить моторам работать';
       armBtn.disabled = !s.armed && (s.mode !== 'ground' || tm.notReady);
       q<HTMLButtonElement>('[data-a="unload"]').hidden = !tm.canUnload;
+      // Тревоги перерисовываются только при изменении — таймер «нет связи» идёт по секундам.
+      const key = JSON.stringify(tm.alerts);
+      if (key !== alertsKey) {
+        alertsKey = key;
+        const box = q<HTMLDivElement>('.alerts');
+        box.hidden = tm.alerts.length === 0;
+        box.innerHTML = tm.alerts
+          .map((a) => `<div class="al ${a.level}"><b>${a.text}</b>${a.actions ? `<ol>${a.actions.map((x) => `<li>${x}</li>`).join('')}</ol>` : ''}</div>`)
+          .join('');
+      }
 
       const tmRows: [string, string][] = [
         ['Над рельефом', `${fmt(s.aglM)} м`],

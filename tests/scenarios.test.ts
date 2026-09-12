@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildMission, forecastWeather, SCENARIOS, type DeliveryScenario, type RouteScenario } from '../src/game/scenarios';
+import { buildMission, forecastWeather, SCENARIOS, type DeliveryScenario, type RouteScenario, type TransferScenario } from '../src/game/scenarios';
 import { LiveFlight, type Controls } from '../src/sim/flight';
 import { combineResults, distanceM, fromLocal, simulateMission, toLocal } from '../src/sim/mission';
 import { fillVoids, flatTerrain } from '../src/sim/terrain';
@@ -87,5 +87,23 @@ describe('данные рельефа', () => {
     expect(fillVoids(g, w, w)).toBe(9);
     for (let y = 18; y < 21; y++) for (let x = 18; x < 21; x++) expect(g[y * w + x]).toBeCloseTo(200, 3);
     expect(g[5 * w + 5]).toBe(185);
+  });
+});
+
+describe('перелёт А → Б', () => {
+  const transfer = SCENARIOS.find((s): s is TransferScenario => s.kind === 'transfer')!;
+
+  it('задание по умолчанию: один полёт с посадкой в Б, живой полёт садится в Б', () => {
+    expect(SCENARIOS[0]!.kind).toBe('transfer');
+    const weather = calm(forecastWeather(transfer, transfer.defaults));
+    const m = buildMission(transfer, transfer.defaults, terrain, weather);
+    expect(m.stages).toHaveLength(1);
+    expect(distanceM(m.stages[0]!.landing, transfer.destination)).toBeLessThan(1);
+    expect(distanceM(m.stages[0]!.takeoff, transfer.site)).toBeLessThan(1);
+    const f = new LiveFlight({ plan: m.stages[0]!, terrain, weather, origin: m.site, home: m.site });
+    fly(f);
+    expect(f.state.mode).toBe('landed');
+    const dest = toLocal(m.site, m.stages[0]!.landing);
+    expect(Math.hypot(f.state.east - dest.east, f.state.north - dest.north)).toBeLessThan(5);
   });
 });

@@ -1,31 +1,37 @@
 #!/usr/bin/env node
 /*
- * Дома, леса и взлётные полосы из OpenStreetMap (Overpass API) → двоичный osm.bin профиля.
+ * Дома, леса, взлётные полосы, дороги и вода из OpenStreetMap (Overpass API) → двоичный osm.bin профиля.
  *
- *   node scripts/fetch-osm.mjs --site <lat>,<lon> --bounds <south>,<west>,<north>,<east> --out <file.bin>
+ *   node scripts/fetch-osm.mjs --site <lat>,<lon> --bounds <south>,<west>,<north>,<east> --out <file.bin> [--cache <папка>]
  *
+ * site — площадка профиля (location.site), bounds — область профиля (location.region).
+ * Дома — в радиусе 14 км от площадки, полосы — в области; леса, дороги и вода — в области с
+ * запасом 3 км, как рельеф: expandBounds(region, 3000) из src/ui/terrainData.ts.
  * Координаты — локальные метры относительно площадки (как toLocal в src/sim/mission.ts).
  * Формат файла описан в src/sim/osm.ts. Координаты места в скрипте не хранятся и не печатаются:
- * в выводе только количества и размер файла.
+ * в выводе только количества и размеры. --cache — папка для ответов Overpass (повторный запуск
+ * без сети; имя файла — по тексту запроса); в ней координаты места, поэтому держать её рядом с
+ * приватным профилем и удалять.
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 const ENDPOINTS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
-const USER_AGENT = 'vtol-sim/1.0 (fetch-osm.mjs: buildings, forests and runways for a 3D flight simulator view)';
+const USER_AGENT = 'vtol-sim/1.0 (fetch-osm.mjs: buildings, forests, roads and water for a 3D flight simulator view)';
 const R = 6371000;
 const RAD = Math.PI / 180;
 /** Дома — в этом радиусе от площадки, м. */
 const BUILDINGS_RADIUS_M = 14000;
-/** Леса — в границах, расширенных на столько, м. */
-const FOREST_MARGIN_M = 3000;
+/** Леса, дороги и вода — в области, расширенной на столько, м (как рельеф). */
+const MARGIN_M = 3000;
 
 // --- аргументы ---
 function parseArgs(argv) {
   const out = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--site' || a === '--bounds' || a === '--out' || a === '--min-building-area') out[a.slice(2)] = argv[++i];
+    if (['--site', '--bounds', '--out', '--min-building-area', '--cache'].includes(a)) out[a.slice(2)] = argv[++i];
     else throw new Error(`Неизвестный аргумент: ${a}`);
   }
   return out;
@@ -37,7 +43,7 @@ const nums = (s, n, name) => {
 };
 const args = parseArgs(process.argv.slice(2));
 if (!args.site || !args.bounds || !args.out) {
-  console.error('Использование: node scripts/fetch-osm.mjs --site <lat>,<lon> --bounds <south>,<west>,<north>,<east> --out <file.bin> [--min-building-area м²]');
+  console.error('Использование: node scripts/fetch-osm.mjs --site <lat>,<lon> --bounds <south>,<west>,<north>,<east> --out <file.bin> [--min-building-area м²] [--cache папка]');
   process.exit(2);
 }
 const [lat0, lon0] = nums(args.site, 2, 'site');
@@ -56,10 +62,35 @@ function bboxLocal(e0, n0, e1, n1) {
   const e = lon0 + e1 / (R * cosLat0) / RAD;
   return `${s.toFixed(6)},${w.toFixed(6)},${nn.toFixed(6)},${e.toFixed(6)}`;
 }
+/** Область профиля в локальных метрах — для полос. */
+const [REG_E0, REG_N0] = toLocal(south, west);
+const [REG_E1, REG_N1] = toLocal(north, east);
+/** Область с запасом — та же формула, что у expandBounds для рельефа. */
+const dLat = MARGIN_M / 111_195;
+const dLon = MARGIN_M / (111_195 * Math.cos((((south + north) / 2) * Math.PI) / 180));
+const [AREA_E0, AREA_N0] = toLocal(south - dLat, west - dLon);
+const [AREA_E1, AREA_N1] = toLocal(north + dLat, east + dLon);
+
+/** Прямоугольник, разрезанный на k × k частей, — строки bbox Overpass. */
+function tiles(e0, n0, e1, n1, k) {
+  const out = [];
+  for (let j = 0; j < k; j++) {
+    for (let i = 0; i < k; i++) {
+      out.push(bboxLocal(e0 + ((e1 - e0) * i) / k, n0 + ((n1 - n0) * j) / k, e0 + ((e1 - e0) * (i + 1)) / k, n0 + ((n1 - n0) * (j + 1)) / k));
+    }
+  }
+  return out;
+}
 
 // --- Overpass ---
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let requests = 0;
 async function overpass(query, label) {
+  const key = createHash('sha1').update(query).digest('hex').slice(0, 12);
+  const cacheFile = args.cache ? join(args.cache, `${label.replace(/[^\p{L}\d]+/gu, '_')}_${key}.json`) : null;
+  if (cacheFile && existsSync(cacheFile)) return JSON.parse(readFileSync(cacheFile, 'utf8'));
+  // Между запросами — пауза: у публичного сервера ограничение на частоту.
+  if (requests++ > 0) await sleep(3000);
   const attempts = 7;
   let wait = 8000;
   for (let i = 0; i < attempts; i++) {
@@ -77,7 +108,14 @@ async function overpass(query, label) {
         // Тайм-аут или нехватка памяти на сервере приходят с кодом 200 и пометкой remark.
         if (typeof json.remark === 'string' && /runtime error|timed out|out of memory/i.test(json.remark)) {
           console.warn(`  ${label}: ${host} — ошибка выполнения запроса, повтор`);
-        } else return json.elements ?? [];
+        } else {
+          const els = json.elements ?? [];
+          if (cacheFile) {
+            mkdirSync(args.cache, { recursive: true });
+            writeFileSync(cacheFile, JSON.stringify(els));
+          }
+          return els;
+        }
       } else if (res.status === 429 || res.status >= 500) {
         console.warn(`  ${label}: ${host} — HTTP ${res.status}, повтор`);
         if (res.status === 429) wait = Math.max(wait, 30000);
@@ -159,6 +197,17 @@ function simplifyRing(r, tol) {
   for (let i = 0; i < n; i++) if (keep[i]) out.push(r[2 * i], r[2 * i + 1]);
   return out;
 }
+/** Упрощение открытой ломаной. */
+function simplifyLine(r, tol) {
+  const n = r.length / 2;
+  if (n <= 2) return r;
+  const keep = new Uint8Array(n);
+  keep[0] = keep[n - 1] = 1;
+  dpMark(r, 0, n - 1, tol * tol, keep);
+  const out = [];
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(r[2 * i], r[2 * i + 1]);
+  return out;
+}
 /** Округление до дециметров и удаление подряд идущих совпадений. */
 function quantize(r, closed) {
   const out = [];
@@ -172,6 +221,12 @@ function quantize(r, closed) {
   }
   if (closed) while (out.length >= 4 && out[0] === out[out.length - 2] && out[1] === out[out.length - 1]) out.length -= 2;
   return out;
+}
+/** Длина ломаной в дм-координатах, м. */
+function lineLengthDm(q) {
+  let s = 0;
+  for (let i = 0; i + 3 < q.length; i += 2) s += Math.hypot(q[i + 2] - q[i], q[i + 3] - q[i + 1]);
+  return s / 10;
 }
 /** Отсечение кольца полуплоскостью a·e + b·n ≤ c (Сазерленд — Ходжмен). */
 function clipHalf(r, a, b, c) {
@@ -195,6 +250,39 @@ function clipRect(r, e0, n0, e1, n1) {
   o = clipHalf(o, 1, 0, e1);
   o = clipHalf(o, 0, -1, -n0);
   return clipHalf(o, 0, 1, n1);
+}
+/** Отсечение ломаной прямоугольником (Лян — Барски по отрезкам) → куски внутри. */
+function clipLineRect(r, e0, n0, e1, n1) {
+  const runs = [];
+  let cur = null;
+  const n = r.length / 2;
+  for (let i = 0; i + 1 < n; i++) {
+    const ax = r[2 * i], ay = r[2 * i + 1], bx = r[2 * i + 2], by = r[2 * i + 3];
+    const dx = bx - ax, dy = by - ay;
+    let t0 = 0, t1 = 1;
+    let ok = true;
+    for (const [p, q] of [[-dx, ax - e0], [dx, e1 - ax], [-dy, ay - n0], [dy, n1 - ay]]) {
+      if (p === 0) {
+        if (q < 0) ok = false;
+      } else {
+        const t = q / p;
+        if (p < 0) t0 = Math.max(t0, t);
+        else t1 = Math.min(t1, t);
+      }
+    }
+    if (!ok || t0 > t1) {
+      cur = null;
+      continue;
+    }
+    const sx = ax + dx * t0, sy = ay + dy * t0, ex = ax + dx * t1, ey = ay + dy * t1;
+    if (!cur || t0 > 0) {
+      cur = [sx, sy];
+      runs.push(cur);
+    }
+    cur.push(ex, ey);
+    if (t1 < 1) cur = null;
+  }
+  return runs.filter((c) => c.length >= 4);
 }
 function pointInRing(px, py, r) {
   let inside = false;
@@ -223,7 +311,7 @@ function closedRing(geom) {
 }
 /** Сборка колец мультиполигона из линий-членов: стыкуем концы. */
 function assembleRings(ways) {
-  const pool = ways.filter((g) => g && g.length >= 2).map((g) => g.slice());
+  const pool = ways.filter((g) => g && g.length >= 2 && g.every(Boolean)).map((g) => g.slice());
   const rings = [];
   while (pool.length) {
     let cur = pool.pop();
@@ -264,6 +352,15 @@ function multipolygon(rel) {
   }
   return outers;
 }
+/** Полигоны элемента Overpass: замкнутая линия или мультиполигон. */
+function polygonsOf(el) {
+  if (el.type === 'way') {
+    const ring = closedRing(el.geometry);
+    return ring ? [{ outer: ring, holes: [] }] : [];
+  }
+  if (el.type === 'relation') return multipolygon(el);
+  return [];
+}
 function ccw(r) {
   if (signedArea(r) >= 0) return r;
   const out = [];
@@ -284,20 +381,24 @@ const HOUSE = new Set(['house', 'detached', 'residential', 'semidetached_house',
 const APARTMENTS = new Set(['apartments', 'dormitory']);
 const INDUSTRIAL = new Set(['industrial', 'warehouse', 'commercial', 'retail', 'office', 'hangar', 'farm_auxiliary', 'barn']);
 const SMALL = new Set(['garage', 'garages', 'shed', 'roof', 'hut']);
+/** roof:shape → код формы крыши (src/sim/osm.ts ROOF_SHAPES). */
+const ROOF = { flat: 1, gabled: 2, saltbox: 2, gambrel: 2, mansard: 2, 'half-hipped': 3, hipped: 3, pyramidal: 4, dome: 4, onion: 4, cone: 4, round: 2, skillion: 5, lean_to: 5 };
 function buildingKind(tags, area) {
   const b = tags.building;
   let kind;
   let h;
-  if (HOUSE.has(b)) [kind, h] = ['house', 6];
+  // Высота до карниза без тегов: частный дом — одноэтажный (так чаще всего в посёлках).
+  if (HOUSE.has(b)) [kind, h] = ['house', 4.5];
   else if (APARTMENTS.has(b)) [kind, h] = ['apartments', 15];
   else if (INDUSTRIAL.has(b)) [kind, h] = ['industrial', 8];
   else if (SMALL.has(b)) [kind, h] = ['other', 3];
-  else [kind, h] = area < 250 ? ['house', 6] : ['other', 6];
+  else [kind, h] = area < 250 ? ['house', 4.5] : ['other', 6];
   const height = parseNum(tags.height);
-  const levels = parseNum(tags['building:levels']);
+  const levelsTag = parseNum(tags['building:levels']);
+  const levels = levelsTag > 0 ? Math.min(60, Math.round(levelsTag)) : 0;
   if (height > 0) h = height;
   else if (levels > 0) h = levels * 3 + 1;
-  return { kind, height: Math.min(80, Math.max(2, h)) };
+  return { kind, height: Math.min(80, Math.max(2, h)), levels, roof: ROOF[tags['roof:shape']] ?? 0 };
 }
 
 async function fetchBuildings() {
@@ -317,12 +418,7 @@ async function fetchBuildings() {
       if (seen.has(key)) continue;
       seen.add(key);
       const tags = el.tags ?? {};
-      let rings = [];
-      if (el.type === 'way') {
-        const ring = closedRing(el.geometry);
-        if (ring) rings = [ring];
-      } else if (el.type === 'relation') rings = multipolygon(el).map((o) => o.outer);
-      for (const raw of rings) {
+      for (const { outer: raw } of polygonsOf(el)) {
         let ring = simplifyRing(ccw(raw), 0.5);
         ring = quantize(ring, true);
         const n = ring.length / 2;
@@ -339,12 +435,12 @@ async function fetchBuildings() {
         ce /= n;
         cn /= n;
         if (ce * ce + cn * cn > r * r) continue;
-        const { kind, height } = buildingKind(tags, area);
+        const { kind, height, levels, roof } = buildingKind(tags, area);
         if (kind === 'other' && area < minBuildingArea) {
           dropped++;
           continue;
         }
-        out.push({ kind: KIND[kind], heightDm: Math.round(height * 10), ring });
+        out.push({ kind: KIND[kind], heightDm: Math.round(height * 10), levels, roof, ring });
       }
     }
   }
@@ -353,19 +449,16 @@ async function fetchBuildings() {
 
 // --- леса ---
 async function fetchForests() {
-  const m = FOREST_MARGIN_M;
-  const [e0, n0] = toLocal(south, west);
-  const [e1, n1] = toLocal(north, east);
-  const bb = bboxLocal(e0 - m, n0 - m, e1 + m, n1 + m);
+  const [e0, n0, e1, n1] = [AREA_E0, AREA_N0, AREA_E1, AREA_N1];
+  const bb = bboxLocal(e0, n0, e1, n1);
   const q =
     `[out:json][timeout:180];(` +
     `way["landuse"="forest"](${bb});way["natural"="wood"](${bb});` +
     `relation["landuse"="forest"]["type"="multipolygon"](${bb});relation["natural"="wood"]["type"="multipolygon"](${bb});` +
     `);out geom;`;
   const els = await overpass(q, 'леса');
-  const clip = (r) => clipRect(r, e0 - m, n0 - m, e1 + m, n1 + m);
   const prep = (raw) => {
-    const r = quantize(simplifyRing(clip(raw), 6), true);
+    const r = quantize(simplifyRing(clipRect(raw, e0, n0, e1, n1), 6), true);
     if (r.length / 2 < 3) return null;
     const area = Math.abs(signedArea(r.map((v) => v / 10)));
     return area >= 400 ? r : null;
@@ -375,12 +468,7 @@ async function fetchForests() {
     const tags = el.tags ?? {};
     const lt = tags.leaf_type;
     const leaf = lt === 'needleleaved' ? 0 : lt === 'broadleaved' ? 1 : 2;
-    let polys = [];
-    if (el.type === 'way') {
-      const ring = closedRing(el.geometry);
-      if (ring) polys = [{ outer: ring, holes: [] }];
-    } else if (el.type === 'relation') polys = multipolygon(el);
-    for (const p of polys) {
+    for (const p of polygonsOf(el)) {
       const outer = prep(p.outer);
       if (!outer) continue;
       const rings = [outer];
@@ -388,7 +476,6 @@ async function fetchForests() {
         const hole = prep(h);
         if (hole) rings.push(hole);
       }
-      if (rings.length > 65535) rings.length = 65535;
       out.push({ leaf, rings });
     }
   }
@@ -429,9 +516,7 @@ function axisOfArea(r) {
 }
 
 async function fetchRunways() {
-  const [e0, n0] = toLocal(south, west);
-  const [e1, n1] = toLocal(north, east);
-  const bb = bboxLocal(e0, n0, e1, n1);
+  const bb = bboxLocal(REG_E0, REG_N0, REG_E1, REG_N1);
   const els = await overpass(`[out:json][timeout:180];way["aeroway"="runway"](${bb});out geom;`, 'полосы');
   const out = [];
   for (const el of els) {
@@ -449,72 +534,334 @@ async function fetchRunways() {
     } else line = geomToLocal(el.geometry);
     if (!(width > 0)) width = paved ? 30 : 20;
     const q = quantize(line, false);
-    if (q.length < 4 || q.length / 2 > 65535) continue;
-    out.push({ widthDm: Math.min(65535, Math.round(width * 10)), paved: paved ? 1 : 0, line: q });
+    if (q.length < 4) continue;
+    out.push({ widthDm: Math.round(width * 10), paved: paved ? 1 : 0, line: q });
   }
   return out;
 }
 
-// --- запись ---
-function encode(buildings, forests, runways) {
-  let size = 4 + 12;
-  for (const b of buildings) size += 1 + 2 + 2 + b.ring.length * 4;
-  for (const f of forests) {
-    size += 1 + 2;
-    for (const r of f.rings) size += 4 + r.length * 4;
-  }
-  for (const r of runways) size += 2 + 1 + 2 + r.line.length * 4;
-  const buf = new ArrayBuffer(size);
-  const dv = new DataView(buf);
-  let o = 0;
-  for (const c of 'OSM1') dv.setUint8(o++, c.charCodeAt(0));
-  dv.setUint32(o, buildings.length, true);
-  dv.setUint32(o + 4, forests.length, true);
-  dv.setUint32(o + 8, runways.length, true);
-  o += 12;
-  const pts = (arr) => {
-    for (const v of arr) {
-      dv.setInt32(o, v, true);
-      o += 4;
+// --- дороги ---
+/** Класс (src/sim/osm.ts ROAD_CLASSES) и ширина по умолчанию, м. */
+const HIGHWAY = {
+  motorway: [0, 10], motorway_link: [0, 5],
+  trunk: [1, 9], trunk_link: [1, 5],
+  primary: [2, 8], primary_link: [2, 5],
+  secondary: [3, 7], secondary_link: [3, 5],
+  tertiary: [4, 5], tertiary_link: [4, 5],
+  unclassified: [5, 5], road: [5, 5],
+  residential: [6, 5], living_street: [6, 4],
+  service: [7, 3],
+  track: [8, 3],
+};
+const RAILWAY = { rail: 4, narrow_gauge: 3, light_rail: 3.5, tram: 3 };
+const PAVED = new Set(['asphalt', 'concrete', 'paved', 'concrete:plates', 'concrete:lanes', 'paving_stones', 'sett', 'cobblestone', 'unhewn_cobblestone', 'metal', 'chipseal']);
+const UNPAVED = new Set(['unpaved', 'gravel', 'fine_gravel', 'dirt', 'ground', 'earth', 'grass', 'sand', 'compacted', 'mud', 'pebblestone', 'woodchips', 'rock', 'grass_paver', 'dirt/sand', 'clay']);
+/** Служебные проезды, которых слишком много и которые с высоты не видны. */
+const SERVICE_SKIP = new Set(['driveway', 'parking_aisle', 'drive-through', 'emergency_access']);
+/** Лишние дорожные признаки дают разрывы там, где их нет: мосты — отдельные линии. */
+
+async function fetchRoads() {
+  const parts = tiles(AREA_E0, AREA_N0, AREA_E1, AREA_N1, 3);
+  const hw = Object.keys(HIGHWAY).join('|');
+  const rw = Object.keys(RAILWAY).join('|');
+  const seen = new Set();
+  const out = [];
+  let dropped = 0;
+  for (let p = 0; p < parts.length; p++) {
+    const bb = parts[p];
+    const q = `[out:json][timeout:180];(way["highway"~"^(${hw})$"](${bb});way["railway"~"^(${rw})$"](${bb}););out tags geom;`;
+    const els = await overpass(q, `дороги ${p + 1}/${parts.length}`);
+    for (const el of els) {
+      if (el.type !== 'way' || !el.geometry || el.geometry.length < 2) continue;
+      const key = el.id;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const t = el.tags ?? {};
+      if (t.area === 'yes' || (t.tunnel && t.tunnel !== 'no') || t.disused === 'yes' || t.abandoned === 'yes') continue;
+      if (t.highway === 'service' && SERVICE_SKIP.has(t.service)) {
+        dropped++;
+        continue;
+      }
+      let cls;
+      let width;
+      if (t.highway && HIGHWAY[t.highway]) [cls, width] = HIGHWAY[t.highway];
+      else if (t.railway && RAILWAY[t.railway]) [cls, width] = [9, RAILWAY[t.railway]];
+      else continue;
+      const oneway = t.oneway === 'yes' || t.oneway === '1';
+      if (cls <= 2 && oneway) width -= 2;
+      const wTag = parseNum(t.width);
+      const lanes = parseNum(t.lanes);
+      if (cls < 9 && wTag >= 2 && wTag <= 30) width = wTag;
+      else if (cls < 8 && lanes >= 1 && lanes <= 8) width = Math.max(width, lanes * 3.5);
+      let paved = cls !== 8;
+      if (PAVED.has(t.surface)) paved = true;
+      else if (UNPAVED.has(t.surface)) paved = false;
+      else if (cls === 8 && t.tracktype === 'grade1') paved = true;
+      const bridge = !!t.bridge && t.bridge !== 'no';
+      const lit = t.lit === 'yes';
+      const tol = cls >= 7 ? 1.5 : 1;
+      for (const run of clipLineRect(geomToLocal(el.geometry), AREA_E0, AREA_N0, AREA_E1, AREA_N1)) {
+        const line = quantize(simplifyLine(run, tol), false);
+        if (line.length < 4) continue;
+        if (!bridge && lineLengthDm(line) < (cls >= 7 ? 25 : 10)) {
+          dropped++;
+          continue;
+        }
+        out.push({ cls, flags: (paved ? 1 : 0) | (bridge ? 2 : 0) | (lit ? 4 : 0), widthDm: Math.round(width * 10), line });
+      }
     }
+  }
+  return { roads: out, dropped };
+}
+
+// --- вода ---
+function waterKind(t) {
+  if (t.waterway === 'riverbank' || ['river', 'canal', 'stream', 'oxbow', 'rapids'].includes(t.water)) return 1;
+  if (t.landuse === 'reservoir' || t.water === 'reservoir') return 2;
+  if (t.landuse === 'basin' || ['wastewater', 'basin', 'lagoon'].includes(t.water)) return 3;
+  return 0;
+}
+
+async function fetchWater() {
+  const bb = bboxLocal(AREA_E0, AREA_N0, AREA_E1, AREA_N1);
+  const q =
+    `[out:json][timeout:240];(` +
+    `way["natural"="water"](${bb});relation["natural"="water"]["type"="multipolygon"](${bb});` +
+    `way["waterway"="riverbank"](${bb});relation["waterway"="riverbank"]["type"="multipolygon"](${bb});` +
+    `way["landuse"~"^(reservoir|basin)$"](${bb});relation["landuse"~"^(reservoir|basin)$"]["type"="multipolygon"](${bb});` +
+    `);out tags geom;`;
+  const els = await overpass(q, 'вода');
+  const prep = (raw) => {
+    const r = quantize(simplifyRing(clipRect(raw, AREA_E0, AREA_N0, AREA_E1, AREA_N1), 1.5), true);
+    if (r.length / 2 < 3) return null;
+    return Math.abs(signedArea(r.map((v) => v / 10))) >= 150 ? r : null;
   };
-  for (const b of buildings) {
-    dv.setUint8(o, b.kind);
-    dv.setUint16(o + 1, Math.min(65535, b.heightDm), true);
-    dv.setUint16(o + 3, b.ring.length / 2, true);
-    o += 5;
-    pts(b.ring);
-  }
-  for (const f of forests) {
-    dv.setUint8(o, f.leaf);
-    dv.setUint16(o + 1, f.rings.length, true);
-    o += 3;
-    for (const r of f.rings) {
-      dv.setUint32(o, r.length / 2, true);
-      o += 4;
-      pts(r);
+  const seen = new Set();
+  const out = [];
+  for (const el of els) {
+    const key = `${el.type}${el.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const t = el.tags ?? {};
+    // Пересыхающие пруды и болотца с высоты не вода.
+    if (t.intermittent === 'yes' || t.seasonal === 'yes' || t.natural === 'wetland') continue;
+    const kind = waterKind(t);
+    for (const p of polygonsOf(el)) {
+      const outer = prep(p.outer);
+      if (!outer) continue;
+      const rings = [outer];
+      for (const h of p.holes) {
+        const hole = prep(h);
+        if (hole) rings.push(hole);
+      }
+      out.push({ kind, rings });
     }
   }
-  for (const r of runways) {
-    dv.setUint16(o, r.widthDm, true);
-    dv.setUint8(o + 2, r.paved);
-    dv.setUint16(o + 3, r.line.length / 2, true);
-    o += 5;
-    pts(r.line);
+  return out;
+}
+
+/** Индекс площадей воды по клеткам: точка внутри — true. */
+function waterIndex(water) {
+  const CELL = 500;
+  const grid = new Map();
+  const polys = water.map((w) => {
+    const rings = w.rings.map((r) => r.map((v) => v / 10));
+    let e0 = Infinity, n0 = Infinity, e1 = -Infinity, n1 = -Infinity;
+    const o = rings[0];
+    for (let i = 0; i < o.length; i += 2) {
+      e0 = Math.min(e0, o[i]); e1 = Math.max(e1, o[i]);
+      n0 = Math.min(n0, o[i + 1]); n1 = Math.max(n1, o[i + 1]);
+    }
+    return { rings, e0, n0, e1, n1 };
+  });
+  polys.forEach((p, k) => {
+    for (let j = Math.floor(p.n0 / CELL); j <= Math.floor(p.n1 / CELL); j++) {
+      for (let i = Math.floor(p.e0 / CELL); i <= Math.floor(p.e1 / CELL); i++) {
+        const key = `${i},${j}`;
+        let list = grid.get(key);
+        if (!list) grid.set(key, (list = []));
+        list.push(k);
+      }
+    }
+  });
+  return (e, n) => {
+    for (const k of grid.get(`${Math.floor(e / CELL)},${Math.floor(n / CELL)}`) ?? []) {
+      const p = polys[k];
+      if (e < p.e0 || e > p.e1 || n < p.n0 || n > p.n1) continue;
+      let inside = false;
+      for (const r of p.rings) if (pointInRing(e, n, r)) inside = !inside;
+      if (inside) return true;
+    }
+    return false;
+  };
+}
+
+const WATERWAY = { river: [0, 10], stream: [1, 3], canal: [2, 6] };
+
+async function fetchWaterways(water) {
+  const bb = bboxLocal(AREA_E0, AREA_N0, AREA_E1, AREA_N1);
+  const els = await overpass(`[out:json][timeout:180];way["waterway"~"^(river|stream|canal)$"](${bb});out tags geom;`, 'реки');
+  const inWater = waterIndex(water);
+  const out = [];
+  let inside = 0;
+  for (const el of els) {
+    if (el.type !== 'way' || !el.geometry || el.geometry.length < 2) continue;
+    const t = el.tags ?? {};
+    // Трубы под дорогами и пересыхающие ручьи не рисуем.
+    if ((t.tunnel && t.tunnel !== 'no') || t.intermittent === 'yes' || t.seasonal === 'yes') continue;
+    const [kind, def] = WATERWAY[t.waterway];
+    const wTag = parseNum(t.width);
+    const width = wTag >= 1 && wTag <= 200 ? wTag : def;
+    for (const run of clipLineRect(geomToLocal(el.geometry), AREA_E0, AREA_N0, AREA_E1, AREA_N1)) {
+      const line = simplifyLine(run, 1.5);
+      // Осевые внутри площадей воды не нужны: режем на куски вне воды.
+      const n = line.length / 2;
+      const inPt = [];
+      for (let i = 0; i < n; i++) inPt.push(inWater(line[2 * i], line[2 * i + 1]));
+      let cur = null;
+      const pieces = [];
+      for (let i = 0; i + 1 < n; i++) {
+        const me = (line[2 * i] + line[2 * i + 2]) / 2, mn = (line[2 * i + 1] + line[2 * i + 3]) / 2;
+        const drop = inPt[i] && inPt[i + 1] && inWater(me, mn);
+        if (drop) {
+          inside++;
+          cur = null;
+          continue;
+        }
+        if (!cur) {
+          cur = [line[2 * i], line[2 * i + 1]];
+          pieces.push(cur);
+        }
+        cur.push(line[2 * i + 2], line[2 * i + 3]);
+      }
+      for (const piece of pieces) {
+        const q = quantize(piece, false);
+        if (q.length < 4 || lineLengthDm(q) < 30) continue;
+        out.push({ kind, widthDm: Math.round(width * 10), line: q });
+      }
+    }
   }
-  if (o !== size) throw new Error('Ошибка размера при записи');
-  return new Uint8Array(buf);
+  return { waterways: out, inside };
+}
+
+// --- запись ---
+/** Растущий буфер байтов. */
+class Bytes {
+  buf = new Uint8Array(1 << 20);
+  n = 0;
+  room(k) {
+    if (this.n + k <= this.buf.length) return;
+    const b = new Uint8Array(Math.max(this.buf.length * 2, this.n + k));
+    b.set(this.buf.subarray(0, this.n));
+    this.buf = b;
+  }
+  u8(v) {
+    this.room(1);
+    this.buf[this.n++] = v & 0xff;
+  }
+  u32(v) {
+    for (let i = 0; i < 4; i++) this.u8(Math.floor(v / 256 ** i));
+  }
+  varint(v) {
+    if (!(v >= 0) || !Number.isSafeInteger(v)) throw new Error(`varint: ${v}`);
+    while (v >= 128) {
+      this.u8((v % 128) | 128);
+      v = Math.floor(v / 128);
+    }
+    this.u8(v);
+  }
+  zz(v) {
+    this.varint(v >= 0 ? 2 * v : -2 * v - 1);
+  }
+  /** Точки в дм: число и разности. */
+  points(arr) {
+    this.varint(arr.length / 2);
+    let pe = 0;
+    let pn = 0;
+    for (let i = 0; i < arr.length; i += 2) {
+      this.zz(arr[i] - pe);
+      this.zz(arr[i + 1] - pn);
+      pe = arr[i];
+      pn = arr[i + 1];
+    }
+  }
+  rings(rings) {
+    this.varint(rings.length);
+    for (const r of rings) this.points(r);
+  }
+  bytes() {
+    return this.buf.slice(0, this.n);
+  }
+}
+
+function encode(d) {
+  const w = new Bytes();
+  const sizes = {};
+  let mark = 0;
+  const section = (name) => {
+    sizes[name] = w.n - mark;
+    mark = w.n;
+  };
+  for (const c of 'OSM2') w.u8(c.charCodeAt(0));
+  for (const k of ['buildings', 'forests', 'runways', 'roads', 'water', 'waterways']) w.u32(d[k].length);
+  section('заголовок');
+  for (const b of d.buildings) {
+    w.u8(b.kind);
+    w.u8(b.levels);
+    w.u8(b.roof);
+    w.varint(b.heightDm);
+    w.points(b.ring);
+  }
+  section('дома');
+  for (const f of d.forests) {
+    w.u8(f.leaf);
+    w.rings(f.rings);
+  }
+  section('леса');
+  for (const r of d.runways) {
+    w.u8(r.paved);
+    w.varint(r.widthDm);
+    w.points(r.line);
+  }
+  section('полосы');
+  for (const r of d.roads) {
+    w.u8(r.cls);
+    w.u8(r.flags);
+    w.varint(r.widthDm);
+    w.points(r.line);
+  }
+  section('дороги');
+  for (const r of d.water) {
+    w.u8(r.kind);
+    w.rings(r.rings);
+  }
+  section('вода');
+  for (const r of d.waterways) {
+    w.u8(r.kind);
+    w.varint(r.widthDm);
+    w.points(r.line);
+  }
+  section('реки');
+  return { bytes: w.bytes(), sizes };
 }
 
 const { buildings, dropped } = await fetchBuildings();
 const forests = await fetchForests();
 const runways = await fetchRunways();
-const bytes = encode(buildings, forests, runways);
+const { roads, dropped: roadsDropped } = await fetchRoads();
+const water = await fetchWater();
+const { waterways, inside } = await fetchWaterways(water);
+const { bytes, sizes } = encode({ buildings, forests, runways, roads, water, waterways });
 mkdirSync(dirname(args.out), { recursive: true });
 writeFileSync(args.out, bytes);
-const kinds = ['house', 'apartments', 'industrial', 'other'].map((k, i) => `${k} ${buildings.filter((b) => b.kind === i).length}`).join(', ');
+const count = (arr, names, key) => names.map((k, i) => `${k} ${arr.filter((x) => x[key] === i).length}`).join(', ');
 const holes = forests.reduce((s, f) => s + f.rings.length - 1, 0);
-console.log(`Дома: ${buildings.length} (${kinds})${dropped ? `, отброшено мелких: ${dropped}` : ''}`);
+const km = (arr) => (arr.reduce((s, r) => s + lineLengthDm(r.line), 0) / 1000).toFixed(0);
+console.log(`Дома: ${buildings.length} (${count(buildings, ['house', 'apartments', 'industrial', 'other'], 'kind')})${dropped ? `, отброшено мелких: ${dropped}` : ''}`);
 console.log(`Леса: ${forests.length} (дыр: ${holes})`);
 console.log(`Полосы: ${runways.length} (с твёрдым покрытием: ${runways.filter((r) => r.paved).length})`);
+console.log(`Дороги: ${roads.length}, ${km(roads)} км (${count(roads, ['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'unclassified', 'residential', 'service', 'track', 'rail'], 'cls')}), мостов: ${roads.filter((r) => r.flags & 2).length}, отброшено: ${roadsDropped}`);
+console.log(`Вода: ${water.length} (${count(water, ['lake', 'river', 'reservoir', 'basin'], 'kind')})`);
+console.log(`Реки и ручьи: ${waterways.length}, ${km(waterways)} км (${count(waterways, ['river', 'stream', 'canal'], 'kind')}), отрезков внутри площадей воды: ${inside}`);
+console.log(`Разделы, КБ: ${Object.entries(sizes).map(([k, v]) => `${k} ${(v / 1024).toFixed(0)}`).join(', ')}`);
 console.log(`Файл: ${args.out}, ${(bytes.length / 1024 / 1024).toFixed(2)} МБ`);

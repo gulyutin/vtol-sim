@@ -25,6 +25,8 @@ export interface QualitySettings {
   treeSpacingM: number;
   /** Частиц пыли от роторов. */
   dustParticles: number;
+  /** Капель дождя и снежинок вокруг камеры. */
+  precipParticles: number;
 }
 
 export const QUALITY: Record<Quality, QualitySettings> = {
@@ -42,6 +44,7 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     treeRadiusM: 0,
     treeSpacingM: 14,
     dustParticles: 150,
+    precipParticles: 6000,
   },
   medium: {
     label: 'Среднее',
@@ -57,6 +60,7 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     treeRadiusM: 700,
     treeSpacingM: 11,
     dustParticles: 400,
+    precipParticles: 12000,
   },
   high: {
     label: 'Высокое',
@@ -72,6 +76,7 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     treeRadiusM: 1400,
     treeSpacingM: 8,
     dustParticles: 900,
+    precipParticles: 20000,
   },
 };
 

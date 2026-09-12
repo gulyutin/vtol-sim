@@ -4,10 +4,18 @@ import './ui/style.css';
 import { PROFILE } from '@profile';
 import { parseOsm } from './sim/osm';
 import { loadQuality, QUALITY, saveQuality } from './ui/quality';
-import { Preparation, PREP_STEPS, type PrepStepId } from './game/preparation';
+import { Preparation, PREP_STEPS, type GroundTest, type PrepStepId } from './game/preparation';
 import { buildMission, departure, forecastWeather, REGION, SCENARIOS, type Mission, type Scenario, type Settings } from './game/scenarios';
 import { blocked, preflightChecks, type Check } from './game/preflight';
-import { actualWeather } from './game/weather';
+import { actualWeather, PRECIPITATION_NAME, weatherPreset, type WeatherPresetKind } from './game/weather';
+import { fetchLiveWeather, type LiveWeather } from './game/liveWeather';
+import { Sound, type SoundState } from './ui/audio';
+import { FlightRecorder, poseOf, stateAt, type Recording } from './game/recorder';
+import { assessFlight, FAILURE_TITLES, findDifficulty, planFailures, saveResult, type Assessment, type DifficultyId, type FailureEvent } from './game/scoring';
+import { Debrief } from './ui/debrief';
+import { PilotInput } from './ui/pilotInput';
+import { failureInfo, LINK_TIMEOUT_S, type FailureId } from './sim/failures';
+import type { Alert } from './ui/gcs';
 import { AIRCRAFT } from './sim/aircraft';
 import { LiveFlight, MODE_NAMES, type Controls } from './sim/flight';
 import { combineResults, distanceM, fromLocal, simulateMission, toLocal } from './sim/mission';
@@ -32,10 +40,32 @@ function cloneScenario(sc: Scenario): Scenario {
       return { ...sc, area: sc.area.map((p) => ({ ...p })), defaults: { ...sc.defaults } };
     case 'delivery':
       return { ...sc, destination: { ...sc.destination }, route: sc.route.map((p) => ({ ...p })), defaults: { ...sc.defaults } };
+    case 'transfer':
+      return { ...sc, destination: { ...sc.destination }, route: sc.route.map((p) => ({ ...p })), defaults: { ...sc.defaults } };
     case 'route':
       return { ...sc, route: sc.route.map((p) => ({ ...p })), defaults: { ...sc.defaults } };
   }
 }
+
+/** Пункт Б у доставки и перелёта; у остальных заданий посадка там же, где взлёт. */
+const destinationOf = (sc: Scenario): GeoPoint | null => (sc.kind === 'delivery' || sc.kind === 'transfer' ? sc.destination : null);
+const destinationNameOf = (sc: Scenario): string => (sc.kind === 'delivery' || sc.kind === 'transfer' ? sc.destinationName : sc.siteName);
+
+/** Команды оператора в записи полёта — по ним разбор считает время реакции. */
+const COMMAND_TITLE: Record<string, string> = {
+  arm: 'АРМ',
+  disarm: 'ДИЗАРМ',
+  takeoff: 'ВЗЛЁТ',
+  auto: 'МАРШРУТ',
+  manual: 'РУЧНОЙ',
+  guided: 'ОПЕРАТИВНАЯ ТОЧКА',
+  hold: 'ОЖИДАНИЕ',
+  rtl: 'ВОЗВРАТ',
+  land: 'ПОСАДКА',
+  failsafe: 'ФЭЙЛСЕЙФ',
+  copter: 'КОПТЕР',
+  unload: 'РАЗГРУЗКА',
+};
 
 const inRegion = (p: GeoPoint) => p.lat > REGION.south && p.lat < REGION.north && p.lon > REGION.west && p.lon < REGION.east;
 
@@ -92,6 +122,49 @@ function run(terrain: Terrain, bounds: Bounds) {
     }
   })();
   let prepView = '';
+  let prepDoneCount = 0;
+  /** Проверка подготовки, которая сейчас идёт, — для звука роторов по одному. */
+  let lastTest: GroundTest | null = null;
+
+  // Звук: браузер разрешает его только после щелчка или клавиши. Выключенный звук запоминается.
+  const SOUND_KEY = 'vtol-sim.muted';
+  const sound = new Sound();
+  let mutedPref = (() => {
+    try {
+      return localStorage.getItem(SOUND_KEY) === '1';
+    } catch {
+      return false;
+    }
+  })();
+  const wakeSound = () => void sound.resume().then(() => sound.setMuted(mutedPref));
+  document.addEventListener('pointerdown', wakeSound);
+  document.addEventListener('keydown', wakeSound);
+
+  // Погода: по заданию (ползунки), фактическая сейчас (Open-Meteo) или пресет.
+  let weatherSource = 'scenario';
+  let live: LiveWeather | null = null;
+  let liveFetch: AbortController | null = null;
+
+  // Запись полёта — с начала задания (подготовка и АРМ тоже), для разбора и оценки.
+  const rec = new FlightRecorder();
+  let recStartedAt = new Date().toISOString();
+  // Режим: тренировка, штатный, сложный, зачёт — погода, обязательная подготовка, отказы.
+  let difficultyId: DifficultyId = 'train';
+  let failurePlan: FailureEvent[] = [];
+  let injected: FailureEvent[] = [];
+  let takeoffT = 0;
+  let endT: number | null = null;
+  let assessed = false;
+  let lastAssessment: { rec: Recording; a: Assessment } | null = null;
+  const prepNeeded = () => prepRequired || findDifficulty(difficultyId).prepRequired;
+  // Разбор: пока открыт, живой полёт стоит, а 3D показывает запись в момент replayT.
+  const debrief = new Debrief(app);
+  let replayT = 0;
+  let pausedBeforeDebrief = false;
+  debrief.onSeek = (t) => (replayT = t);
+  debrief.onClose = () => (paused = pausedBeforeDebrief);
+  // Пульт (ПДУ) для «Фэйлсейфа»: геймпад, без него — клавиатура.
+  const pilot = new PilotInput();
 
   const luxAt = (t: number) =>
     illuminanceLux(sunPosition(new Date(departure(scenario, settings).getTime() + t * 1000), siteA).elevationDeg, scenario.cloudCover);
@@ -101,7 +174,7 @@ function run(terrain: Terrain, bounds: Bounds) {
   const extent = (): GeoPoint[] => [
     siteA,
     ...(scenario.kind === 'survey' ? scenario.area : scenario.route),
-    ...(scenario.kind === 'delivery' ? [scenario.destination] : []),
+    ...(destinationOf(scenario) ? [destinationOf(scenario)!] : []),
   ];
 
   const gcs = createGcs(app, SCENARIOS, {
@@ -162,6 +235,47 @@ function run(terrain: Terrain, bounds: Bounds) {
       const err = prep.start(id, performance.now() / 1000);
       if (err) gcs.log(s.t, err, 'warn');
     },
+    onInject(id) {
+      const s = flight.state;
+      flight.inject(id as FailureId);
+      injected.push({ t: s.t, id });
+      rec.event(s.t, `Отказ (инструктор): ${failureInfo(id as FailureId).title}`, 'bad');
+    },
+    onRestore(id) {
+      const s = flight.state;
+      if (!flight.restore(id)) return;
+      const text = id === 'link' ? 'Связь с НСУ восстановлена' : 'Сигнал ГНСС восстановлен';
+      gcs.log(s.t, text);
+      rec.event(s.t, text, 'info');
+    },
+    onDifficulty(id) {
+      const d = findDifficulty(id);
+      difficultyId = d.id;
+      // Тренировка — погода как в задании; остальные режимы задают свою.
+      weatherSource = d.id === 'train' ? 'scenario' : d.weather;
+      gcs.setWeatherSource(weatherSource);
+      replan();
+    },
+    onDebrief() {
+      openDebrief(lastAssessment?.rec ?? currentRecording(), lastAssessment?.a);
+    },
+    onWeatherSource(src) {
+      weatherSource = src;
+      if (src === 'live') return loadLiveWeather();
+      liveFetch?.abort();
+      liveFetch = null;
+      replan();
+    },
+    onSound() {
+      mutedPref = !mutedPref;
+      void sound.resume().then(() => sound.setMuted(mutedPref));
+      try {
+        localStorage.setItem(SOUND_KEY, mutedPref ? '1' : '0');
+      } catch {
+        // Не сохранится — не страшно.
+      }
+      gcs.setSoundMuted(mutedPref);
+    },
     onPrepRequired(on) {
       prepRequired = on;
       try {
@@ -214,8 +328,8 @@ function run(terrain: Terrain, bounds: Bounds) {
     else replan();
   };
   map.onDestinationChange = (p) => {
-    if (started || scenario.kind !== 'delivery') return;
-    if (!inRegion(p)) return gcs.log(0, 'Пункт доставки вне загруженного рельефа', 'warn');
+    if (started || (scenario.kind !== 'delivery' && scenario.kind !== 'transfer')) return;
+    if (!inRegion(p)) return gcs.log(0, 'Пункт Б вне загруженного рельефа', 'warn');
     scenario = { ...scenario, destination: p };
     replan();
   };
@@ -241,7 +355,7 @@ function run(terrain: Terrain, bounds: Bounds) {
   function command(c: GcsCommand) {
     const s = flight.state;
     if (c === 'arm' && prep.running) return gcs.log(s.t, 'Идёт проверка подготовки — дождитесь окончания', 'warn');
-    if (c === 'arm' && prepRequired && !prep.done) return gcs.log(s.t, 'Сначала предполётная подготовка — окно «Подготовка»', 'warn');
+    if (c === 'arm' && prepNeeded() && !prep.done) return gcs.log(s.t, 'Сначала предполётная подготовка — окно «Подготовка»', 'warn');
     if (c === 'target') {
       if (!airborne()) return gcs.log(s.t, 'ЦЕЛЬ — только в полёте', 'warn');
       targetMode = !targetMode;
@@ -272,8 +386,12 @@ function run(terrain: Terrain, bounds: Bounds) {
     }
     const err = flight.command(c);
     if (err) return gcs.log(s.t, err, 'warn');
+    if (c === 'arm') sound.alarm('arm');
+    if (c === 'disarm') sound.alarm('disarm');
+    rec.event(s.t, `Команда: ${COMMAND_TITLE[c] ?? c}`, 'cmd');
     if (c === 'takeoff') {
       started = true;
+      if (stage === 0) takeoffT = s.t;
       // В полёте закрыты все настройки, кроме точек маршрута.
       gcs.lockPlanning(true, scenario.kind !== 'survey');
       map.setEditing({ area: false, route: scenario.kind !== 'survey', destination: false });
@@ -295,7 +413,13 @@ function run(terrain: Terrain, bounds: Bounds) {
   function replan() {
     if (started) return;
     forecast = forecastWeather(scenario, settings);
+    if (weatherSource === 'live' && live) forecast = { ...live.weather };
+    else if (weatherSource !== 'scenario' && weatherSource !== 'live') forecast = weatherPreset(weatherSource as WeatherPresetKind, forecast);
     actual = forecastError ? actualWeather(forecast, daySeed) : forecast;
+    world.setWeather(actual);
+    gcs.setWeatherSummary(
+      weatherSource === 'scenario' ? '' : weatherSource === 'live' ? (live ? `${live.summary} · ${live.attribution}` : 'Загружаю погоду…') : `Факт: ${weatherText(actual)}`,
+    );
     try {
       mission = buildMission(scenario, settings, terrain, forecast);
     } catch (e) {
@@ -391,13 +515,13 @@ function run(terrain: Terrain, bounds: Bounds) {
         leg(a, b);
       }
     } else {
-      const pts: GeoPoint[] = [siteA, ...scenario.route, scenario.kind === 'delivery' ? scenario.destination : siteA];
+      const pts: GeoPoint[] = [siteA, ...scenario.route, destinationOf(scenario) ?? siteA];
       for (let i = 1; i < pts.length; i++) leg(pts[i - 1]!, pts[i]!);
     }
     map.setRoute(path, pins, labels);
     map.setArea(scenario.kind === 'survey' ? scenario.area : null);
     map.setEditableRoute(scenario.kind === 'survey' ? null : scenario.route);
-    map.setDestination(scenario.kind === 'delivery' ? scenario.destination : null);
+    map.setDestination(destinationOf(scenario));
     map.setEditing({ area: !started, route: true, destination: !started });
 
     world.setRoute(
@@ -416,7 +540,7 @@ function run(terrain: Terrain, bounds: Bounds) {
     gcs.setRoute(
       scenario.kind === 'survey' ? null : scenario.route,
       scenario.siteName,
-      scenario.kind === 'delivery' ? scenario.destinationName : scenario.siteName,
+      destinationNameOf(scenario),
       true,
     );
   }
@@ -427,7 +551,18 @@ function run(terrain: Terrain, bounds: Bounds) {
     atDestination = false;
     fallS = 0;
     eventsShown = 0;
-    flight = new LiveFlight({ plan: mission.stages[i]!, terrain, weather: actual, origin: siteA, home: siteA, startT: t0, initialEnergyWh: e0 });
+    flight = new LiveFlight({
+      plan: mission.stages[i]!,
+      terrain,
+      weather: actual,
+      origin: siteA,
+      home: siteA,
+      startT: t0,
+      initialEnergyWh: e0,
+      // Порывы — свои для дня и полёта; термики — от Солнца над склонами.
+      seed: daySeed * 100 + i + 1,
+      sun: (t) => sunPosition(new Date(departure(scenario, settings).getTime() + t * 1000), siteA),
+    });
     trigger = mission.survey && mission.camera && mission.params ? new FrameTrigger(mission.camera, mission.params, captureContext()) : null;
     updateProfile();
   }
@@ -446,6 +581,14 @@ function run(terrain: Terrain, bounds: Bounds) {
   }
 
   function resetFlight() {
+    rec.reset();
+    recStartedAt = new Date().toISOString();
+    assessed = false;
+    endT = null;
+    injected = [];
+    lastAssessment = null;
+    // Отказы разыгрываются заново на каждую попытку — зачёт не выучить наизусть.
+    failurePlan = planFailures(findDifficulty(difficultyId), Math.floor(Math.random() * 2 ** 31), planned.durationS);
     frames = [];
     announced = false;
     pastDistanceM = 0;
@@ -501,6 +644,10 @@ function run(terrain: Terrain, bounds: Bounds) {
     if (s.mode === 'crashed') {
       return gcs.toast(`<b>Авария: ${s.reason}</b>Время ${fmtTime(s.t)}, пройдено ${km} км.${coverageText}${note}`, 'bad');
     }
+    if (scenario.kind === 'transfer') {
+      const title = atLanding ? `Перелёт выполнен: посадка — ${scenario.destinationName}` : 'Посадка не в пункте Б';
+      return gcs.toast(`<b>${title}</b>Остаток ${fmt(s.soc * 100)} %${underReserve}, время ${fmtTime(s.t)}, ${km} км.${note}`, atLanding && !underReserve ? 'good' : 'warn');
+    }
     if (scenario.kind === 'delivery') {
       const delivered = stage >= 1;
       const title = delivered ? (atLanding ? 'Груз доставлен, борт на аэродроме' : 'Груз доставлен, посадка вне аэродрома') : 'Посадка не в пункте доставки — груз не доставлен';
@@ -516,6 +663,108 @@ function run(terrain: Terrain, bounds: Bounds) {
   let pip: { eye: { east: number; north: number; up: number }; look: { east: number; north: number; up: number }; up: THREE.Vector3 } | null = null;
 
   /** Итог шага подготовки: что показала проверка. Миссия, ориентация и опрос зависят от обстановки. */
+  /** Запись текущего полёта как есть — для разбора в любой момент. */
+  function currentRecording(): Recording {
+    return rec.toRecording({
+      title: scenario.title,
+      scenarioId: scenario.id,
+      startedAt: recStartedAt,
+      profileTitle: PROFILE.title,
+      source: 'sim',
+      landing: { east: flight.landing.east, north: flight.landing.north },
+      difficulty: difficultyId,
+    });
+  }
+
+  /** Оценка полёта по окончании задания: сохраняется в итогах и открывается в разборе. */
+  function showAssessment() {
+    const s = flight.state;
+    rec.sample(s);
+    const r = currentRecording();
+    const a = assessFlight({
+      rec: r,
+      scenarioKind: scenario.kind,
+      landing: { east: flight.landing.east, north: flight.landing.north },
+      landingZoneRadiusM: AIRCRAFT.limits.landingZoneRadiusM,
+      usableWh: flight.usableWh,
+      capacityWh: flight.capacityWh,
+      plannedWh: planned.budget.totalWh,
+      plannedS: planned.durationS,
+      prepRequired: prepNeeded(),
+      prepDone: prep.done,
+      failures: injected,
+      surveyCoverage: scenario.kind === 'survey' ? coverageOf(frames, scenario.area, siteA).atLeast5 : undefined,
+      delivered: scenario.kind === 'delivery' ? stage >= 1 : undefined,
+    });
+    lastAssessment = { rec: r, a };
+    saveResult({ at: recStartedAt, scenarioId: scenario.id, scenarioTitle: scenario.title, difficulty: difficultyId, total: a.total, grade: a.grade, durationS: s.t });
+    gcs.log(s.t, `Оценка: ${a.total} из 100 — ${a.grade}`, a.total >= 60 ? 'info' : 'warn');
+    openDebrief(r, a);
+  }
+
+  function openDebrief(r: Recording, a?: Assessment) {
+    if (!debrief.visible) pausedBeforeDebrief = paused;
+    paused = true;
+    debrief.show(r, a);
+  }
+
+  /** Коротко о погоде: ветер, порывы, видимость, осадки, облака, температура. */
+  function weatherText(w: Weather): string {
+    const parts = [`ветер ${fmt(w.wind.speedMs, 1)} м/с с ${Math.round(w.wind.fromDeg)}°`];
+    if (w.gustMs !== undefined) parts.push(`порывы ${fmt(w.gustMs, 1)} м/с`);
+    if (w.visibilityM !== undefined) parts.push(`видимость ${w.visibilityM < 1000 ? `${fmt(w.visibilityM)} м` : `${fmt(w.visibilityM / 1000, 1)} км`}`);
+    if (w.precipitation) parts.push(`${PRECIPITATION_NAME[w.precipitation.kind]} ${fmt(w.precipitation.mmPerH, 1)} мм/ч`);
+    if (w.cloudBaseM !== undefined && (w.cloudCover ?? 0) >= 0.5) parts.push(`облака от ${fmt(w.cloudBaseM)} м`);
+    parts.push(`${fmt(w.groundTemperatureC)} °C`);
+    return parts.join(', ');
+  }
+
+  /** Фактическая погода сейчас на площадке (Open-Meteo); время вылета и Солнце — тоже как сейчас. */
+  function loadLiveWeather() {
+    liveFetch?.abort();
+    const ctrl = new AbortController();
+    liveFetch = ctrl;
+    gcs.setWeatherSummary('Загружаю погоду с Open-Meteo…');
+    fetchLiveWeather(siteA, new Date(), ctrl.signal)
+      .then((lw) => {
+        if (liveFetch !== ctrl || weatherSource !== 'live') return;
+        live = lw;
+        const local = new Date(Date.now() + scenario.utcOffsetH * 3_600_000);
+        scenario = { ...scenario, date: local.toISOString().slice(0, 10) };
+        settings = { ...settings, localHour: Math.round((local.getUTCHours() + local.getUTCMinutes() / 60) * 4) / 4 };
+        gcs.log(0, `Погода сейчас: ${lw.summary}`);
+        replan();
+      })
+      .catch((e: unknown) => {
+        if (liveFetch !== ctrl) return;
+        const text = e instanceof Error ? e.message : String(e);
+        gcs.setWeatherSummary(text);
+        gcs.log(0, text, 'warn');
+      });
+  }
+
+  // Звук каждый кадр: роторы (на проверке — по одному), маршевый, обтекание, где аппарат относительно камеры.
+  const soundState: SoundState = { rotors: [0, 0, 0, 0], pusher: 0, tasMs: 0, gustMs: 0, listenerDistanceM: 10, listenerBearingDeg: 0, armed: false };
+  const toAircraft = new THREE.Vector3();
+  const camForward = new THREE.Vector3();
+  const camRight = new THREE.Vector3();
+  const WORLD_UP = new THREE.Vector3(0, 1, 0);
+  function updateSound(dt: number) {
+    const s = flight.state;
+    for (let i = 0; i < 4; i++) soundState.rotors[i] = paused ? 0 : lastTest ? lastTest.rotors[i]! : s.lift;
+    soundState.pusher = paused ? 0 : lastTest ? lastTest.pusher : s.pusher;
+    soundState.tasMs = paused ? 0 : s.tasMs;
+    soundState.gustMs = (s as { gustMs?: number }).gustMs ?? 0;
+    const cam = world.camera;
+    toAircraft.subVectors(world.aircraft.group.position, cam.position);
+    soundState.listenerDistanceM = toAircraft.length();
+    cam.getWorldDirection(camForward);
+    camRight.crossVectors(camForward, WORLD_UP);
+    soundState.listenerBearingDeg = (Math.atan2(toAircraft.dot(camRight), toAircraft.dot(camForward)) * 180) / Math.PI;
+    soundState.armed = s.armed;
+    sound.update(dt, soundState);
+  }
+
   function evaluatePrep(id: PrepStepId): { ok: boolean; text: string } {
     switch (id) {
       case 'power':
@@ -553,9 +802,26 @@ function run(terrain: Terrain, bounds: Bounds) {
 
   function step(dt: number) {
     const s = flight.state;
+    // Разбор открыт — 3D показывает запись, живой полёт стоит.
+    const replayRec = debrief.visible ? debrief.recording : null;
+    if (replayRec) {
+      const smp = stateAt(replayRec, replayT);
+      const pose = poseOf(smp);
+      world.setSun(sunPosition(new Date(departure(scenario, settings).getTime() + smp.t * 1000), siteA));
+      world.setPose(pose);
+      world.aircraft.animate(dt, smp.lift, smp.pusher, null);
+      world.aircraft.setLandingLight(0);
+      world.updateDust(dt, pose.position, smp.lift * Math.max(0, 1 - smp.aglM / 12));
+      world.updateCamera(dt, pose);
+      return;
+    }
     world.setSun(sunPosition(new Date(departure(scenario, settings).getTime() + s.t * 1000), siteA));
+    // «Фэйлсейф» — ручное управление с ПДУ: стик каждый кадр, время без ускорения.
+    const manual = flight.state.mode === 'failsafe';
+    pilot.enableKeyboard(manual);
+    controls = { ...controls, stick: manual ? pilot.poll() : null };
     if (!paused) {
-      flight.step(dt * rate, controls, (st) => {
+      flight.step(dt * (manual ? 1 : rate), controls, (st) => {
         if (!trigger) return;
         const f = trigger.offer(
           { t: st.t, position: { east: st.east, north: st.north, up: st.up }, groundSpeedMs: st.groundSpeedMs, headingDeg: st.headingDeg, trackDeg: st.trackDeg },
@@ -567,15 +833,40 @@ function run(terrain: Terrain, bounds: Bounds) {
           map.addFrame(f, siteA);
           world.addFrame(f);
           gcs.flash();
+          sound.alarm('shutter');
         }
       });
     }
     for (; eventsShown < flight.events.length; eventsShown++) {
       const e = flight.events[eventsShown]!;
       gcs.log(e.t, e.text, e.text.startsWith('АВАРИЯ') ? 'bad' : 'info');
+      if (e.text.startsWith('АВАРИЯ')) sound.alarm('crash');
+      else if (e.text.startsWith('ОТКАЗ')) sound.alarm('failure');
+      rec.event(e.t, e.text, /^(АВАРИЯ|ОТКАЗ)/.test(e.text) ? 'bad' : 'info');
+    }
+    if (!paused) rec.sample(flight.state);
+
+    // Зачётные отказы — по плану от взлёта, только в воздухе.
+    if (started && injected.length < failurePlan.length && airborne()) {
+      const f = failurePlan[injected.length]!;
+      if (s.t - takeoffT >= f.t) {
+        flight.inject(f.id as FailureId);
+        injected.push({ t: s.t, id: f.id });
+        rec.event(s.t, `Отказ: ${FAILURE_TITLES[f.id] ?? f.id}`, 'bad');
+      }
     }
 
-    const plane = ['transition', 'auto', 'guided', 'manual', 'rtl', 'backtransition', 'falling'].includes(s.mode);
+    // Конец задания: авария — сразу; посадка — после ДИЗАРМ (по РЛЭ) или через минуту.
+    const finished = s.mode === 'crashed' || (s.mode === 'landed' && stage === mission.stages.length - 1);
+    if (started && finished && !assessed) {
+      endT ??= s.t;
+      if (s.mode === 'crashed' || !s.armed || s.t - endT > 60) {
+        assessed = true;
+        showAssessment();
+      }
+    }
+
+    const plane = ['transition', 'auto', 'guided', 'manual', 'rtl', 'backtransition', 'falling'].includes(s.mode) || (s.mode === 'failsafe' && s.failsafePhase === 'plane');
     const pose = {
       position: { east: s.east, north: s.north, up: s.up },
       headingDeg: s.headingDeg,
@@ -598,16 +889,25 @@ function run(terrain: Terrain, bounds: Bounds) {
       if (w.speedMs >= 1) flight.setGroundHeading(s.headingDeg + Math.max(-60 * dt, Math.min(60 * dt, d)));
     }
     world.aircraft.animate(dt, s.lift, s.pusher, prep.running ? test : null);
+    // Посадочная фара — ночью на взлёте, заходе, посадке и низко над землёй.
+    const lowOrVertical = ['spool', 'climb', 'transition', 'backtransition', 'descent', 'final'].includes(s.mode) || s.failsafePhase === 'copter' || (s.armed && s.aglM < 150);
+    world.aircraft.setLandingLight(lowOrVertical ? Math.min(1, world.nightFactor * 1.4) : 0);
     const live =
       test && prep.running === 'airdata'
         ? `ПВД: приборная ${fmt(test.airspeedMs, 1)} м/с`
         : test && prep.running === 'vtol'
           ? `Ротор ${test.rotors.findIndex((v) => v > 0.02) + 1 || '…'}`
           : null;
-    const view = `${prep.running}|${PREP_STEPS.map((x) => prep.status[x.id]).join()}|${live}|${prepRequired}|${s.mode}|${s.armed}`;
+    const view = `${prep.running}|${PREP_STEPS.map((x) => prep.status[x.id]).join()}|${live}|${prepNeeded()}|${s.mode}|${s.armed}`;
+    lastTest = prep.running ? test : null;
+    const prepDone = PREP_STEPS.filter((x) => prep.status[x.id] === 'done').length;
+    if (prepDone > prepDoneCount) sound.alarm('prepStep');
+    prepDoneCount = prepDone;
+    sound.setLoop('lowBattery', airborne() && s.soc < 0.25);
+    sound.setLoop('failure', ((s as { failures?: unknown[] }).failures?.length ?? 0) > 0);
     if (view !== prepView) {
       prepView = view;
-      gcs.showPreparation(prep, prepRequired, live);
+      gcs.showPreparation(prep, prepNeeded(), live);
     }
     world.updateDust(dt, pose.position, s.lift * Math.max(0, 1 - s.aglM / 12));
     world.updateCamera(dt, pose);
@@ -642,18 +942,31 @@ function run(terrain: Terrain, bounds: Bounds) {
     if (hudTimer > 0.1) {
       hudTimer = 0;
       // Вектор путевой скорости на 30 с вперёд: нос по курсу, линия — куда реально летит.
-      const ahead = s.groundSpeedMs * 30;
-      const tr = (s.trackDeg * Math.PI) / 180;
+      // НСУ видит телеметрию: при отказе ГНСС — оценку места, без связи — последний принятый кадр.
+      const tele = flight.telemetry;
+      const ahead = tele.groundSpeedMs * 30;
+      const tr = (tele.trackDeg * Math.PI) / 180;
       map.setAircraft(
-        fromLocal(siteA, s.east, s.north),
-        s.headingDeg,
-        airborne() && s.groundSpeedMs > 3 ? fromLocal(siteA, s.east + Math.sin(tr) * ahead, s.north + Math.cos(tr) * ahead) : undefined,
+        fromLocal(siteA, tele.east, tele.north),
+        tele.headingDeg,
+        airborne() && tele.groundSpeedMs > 3 ? fromLocal(siteA, tele.east + Math.sin(tr) * ahead, tele.north + Math.cos(tr) * ahead) : undefined,
       );
-      const soc = Math.max(0, s.soc);
+      const alerts: Alert[] = [];
+      if (s.linkLost) alerts.push({ level: 'bad', text: `НЕТ СВЯЗИ с бортом ${fmtTime(s.t - tele.t)} — через ${LINK_TIMEOUT_S} с без связи автопилот уходит на ВОЗВРАТ` });
+      for (const id of s.failures) {
+        const f = failureInfo(id);
+        alerts.push({ level: 'bad', text: `ОТКАЗ: ${f.title}`, actions: f.rleActions });
+      }
+      if (s.mode === 'failsafe') {
+        const src = pilot.source === 'gamepad' ? 'геймпад' : pilot.source === 'keyboard' ? 'клавиатура: W/S — газ, A/D — курс, стрелки — тангаж и крен' : 'подключите геймпад или нажмите клавишу';
+        alerts.push({ level: 'warn', text: `ФЭЙЛСЕЙФ · ${s.failsafePhase === 'copter' ? 'коптер' : 'самолёт'} · пульт: ${src}${flight.rcInRange() ? '' : ' · ПДУ НЕ ДОСТАЁТ'}` });
+      }
+      const soc = Math.max(0, tele.soc);
       gcs.update({
-        state: s,
+        state: tele,
+        alerts,
         frames: { total: frames.length, ok: frames.filter((f) => f.ok).length },
-        altitudeMslM: s.up + siteA.elevationM,
+        altitudeMslM: tele.up + siteA.elevationM,
         // Напряжение по заряду (без просадки под нагрузкой): 50,4 В полная, 39,9 В на 10 %.
         voltageV: AIRCRAFT.voltage10PctV + (AIRCRAFT.voltageFullV - AIRCRAFT.voltage10PctV) * Math.min(1, Math.max(0, (soc - 0.1) / 0.9)),
         rate,
@@ -700,6 +1013,7 @@ function run(terrain: Terrain, bounds: Bounds) {
     }
   }
 
+  gcs.setSoundMuted(mutedPref);
   loadScenario(SCENARIOS[0]!);
 
   let last = performance.now();
@@ -707,6 +1021,7 @@ function run(terrain: Terrain, bounds: Bounds) {
     const dt = Math.min(0.1, (now - last) / 1000);
     last = now;
     step(dt);
+    updateSound(dt);
     draw(dt);
     requestAnimationFrame(frame);
   }
@@ -717,6 +1032,8 @@ function run(terrain: Terrain, bounds: Bounds) {
     Object.assign(window, {
       sim: {
         world,
+        debrief,
+        openDebrief,
         map,
         get flight() {
           return flight;

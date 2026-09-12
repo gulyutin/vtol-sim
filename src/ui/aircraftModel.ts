@@ -21,6 +21,8 @@ export interface AircraftModel {
    * test — проверка на земле (предполётная подготовка): роторы по отдельности, элероны, огни.
    */
   animate(dt: number, lift: number, pusher: number, test?: GroundTest | null): void;
+  /** Посадочная фара под носом: 0 — выключена, 1 — полная яркость. */
+  setLandingLight(level: number): void;
 }
 
 interface Rig {
@@ -83,8 +85,25 @@ function rigged(group: THREE.Group, rig: Rig): AircraftModel {
   const rotors = rig.rotors.map((r) => ({ ...r, omega: 0, base: r.node.rotation.y }));
   let pusherOmega = 0;
   let clock = 0;
+
+  // Посадочная фара: под носом, светит вперёд-вниз. Свет есть всегда (меняется только яркость),
+  // чтобы при включении не пересобирались шейдеры.
+  const box = new THREE.Box3().setFromObject(group);
+  const nose = new THREE.Vector3(0, box.min.y + Math.min(0.25, (box.max.y - box.min.y) * 0.3), box.min.z + 0.2);
+  const landing = new THREE.SpotLight(0xfff1dc, 0, 160, 0.42, 0.55, 1.6);
+  landing.position.copy(nose);
+  landing.target.position.copy(nose).add(new THREE.Vector3(0, -12, -14));
+  const landingGlow = glowSprite(0xfff1dc, 0.9);
+  landingGlow.position.copy(nose);
+  landingGlow.visible = false;
+  group.add(landing, landing.target, landingGlow);
+
   return {
     group,
+    setLandingLight(level) {
+      landing.intensity = 4000 * level;
+      landingGlow.visible = level > 0.01;
+    },
     animate(dt, lift, pusherLoad, test) {
       clock += dt;
       rotors.forEach((r, i) => {

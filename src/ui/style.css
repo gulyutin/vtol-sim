@@ -795,6 +795,69 @@ ol.prep li[data-status='running'] em {
   color: #ffc24d;
 }
 
+/* Инструктор: список отказов */
+ul.inject {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  max-height: 52vh;
+  overflow-y: auto;
+}
+ul.inject li {
+  display: grid;
+  grid-template-columns: 70px 1fr;
+  gap: 8px;
+  align-items: start;
+  padding: 5px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+ul.inject li b {
+  display: block;
+  font-size: 12px;
+}
+ul.inject li small {
+  display: block;
+  opacity: 0.65;
+  font-size: 11px;
+}
+
+/* Тревоги поверх 3D-вида: нет связи, отказы с порядком действий, «Фэйлсейф» */
+.view-pane {
+  position: relative;
+}
+.alerts {
+  position: absolute;
+  top: 52px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(460px, calc(100% - 24px));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: none;
+  z-index: 5;
+}
+.alerts .al {
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #fff;
+  background: rgba(20, 22, 26, 0.82);
+  border-left: 4px solid #ffc24d;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+}
+.alerts .al.bad {
+  border-left-color: #ff5d5d;
+}
+.alerts .al.info {
+  border-left-color: #6cc3ff;
+}
+.alerts .al ol {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  opacity: 0.9;
+}
+
 /* Точки маршрута оператора и пункт доставки */
 .wp-pin.edit b {
   background: #ffb35c;

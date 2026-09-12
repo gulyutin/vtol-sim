@@ -1,26 +1,34 @@
 import * as THREE from 'three';
-import type { OsmBuilding, OsmData, OsmRunway } from '../sim/osm';
+import type { OsmData, OsmRunway } from '../sim/osm';
+import { addBuilding, createBuildingMaterial, MeshBuf } from './osmBuildings';
+import { OsmRoads } from './osmRoads';
+import { createOsmUniforms, hash3, LazyChunks, osmRanges, segDist2, type ChunkPart, type GroundAt, type OsmEnv } from './osmShared';
+import { OsmWaterLayer } from './osmWater';
 import type { QualitySettings } from './quality';
 
+export type { OsmEnv } from './osmShared';
+
 /*
- * Слой OpenStreetMap в 3D-виде: дома, деревья в лесах, взлётные полосы.
+ * Слой OpenStreetMap в 3D-виде: дома, деревья в лесах, дороги, вода, взлётные полосы.
  * Сцена: x — восток, y — вверх (над площадкой взлёта), z — юг (−север).
  *
- * Дома собираются в меши по квадратам 1 км и строятся лениво, с бюджетом времени на кадр.
- * Деревья — два InstancedMesh (хвойные и лиственные) вокруг камеры; набор пересобирается
- * по частям, когда камера сдвинулась на четверть радиуса; у края радиуса деревья плавно
- * уменьшаются до нуля в вершинном шейдере. Полосы — лента по рельефу.
+ * Дома, дороги и вода собираются в меши по квадратам сетки и строятся лениво, ближние первыми,
+ * с бюджетом времени на кадр (osmShared.LazyChunks). Деревья — два InstancedMesh (хвойные и
+ * лиственные) вокруг камеры; набор пересобирается по частям, когда камера сдвинулась на
+ * четверть радиуса; у края радиуса деревья плавно уменьшаются до нуля, в ветер качаются —
+ * всё в вершинном шейдере. Полосы — лента по рельефу.
+ *
+ * Порядок отрисовки: рельеф и всё непрозрачное, затем вода (renderOrder 1), затем дороги
+ * без записи глубины (2 — второстепенные, 3 — главные), затем фонари.
  */
-
-type GroundAt = (east: number, north: number) => number;
 
 /** Сторона квадрата домов, м. */
 const CHUNK_M = 1000;
-/** Бюджет сборки домов за один вызов update, мс. */
-const BUILD_BUDGET_MS = 3;
-const MAX_CHUNKS_PER_UPDATE = 2;
-/** Бюджет расстановки деревьев за один вызов update, мс. */
-const TREE_BUDGET_MS = 3;
+/** Бюджеты сборки за один вызов update, мс: вместе не больше 6 мс, пока подгружается новое место. */
+const BUILD_BUDGET_MS = 1.5;
+const WATER_BUDGET_MS = 1;
+const ROAD_BUDGET_MS = 1;
+const TREE_BUDGET_MS = 2.5;
 /** Всего деревьев не больше. */
 const TREE_CAP = 80_000;
 /** Ячейка маски леса, м. */
@@ -29,6 +37,8 @@ const MASK_CELL_M = 10;
 const MASK_MAX_CELLS = 40e6;
 /** Без деревьев вокруг домов и полос, м. */
 const CLEAR_M = 12;
+/** Без деревьев по сторонам дорог и рек сверх половины ширины, м. */
+const ROAD_CLEAR_M = 2;
 /** Поляна вокруг площадки взлёта, м. */
 const SITE_CLEAR_M = 30;
 /** Доля пропусков в решётке — чтобы лес не был как посадка. */
@@ -38,300 +48,6 @@ const TREE_REF_H = 16;
 /** Длина повтора текстуры полосы вдоль оси, м: штрих 30 м, разрыв 20 м. */
 const RUNWAY_TILE_M = 50;
 const RUNWAY_STEP_M = 15;
-
-// --- хеш ---
-
-/** Детерминированное число [0, 1) по трём целым. */
-function hash3(a: number, b: number, c: number): number {
-  let h = Math.imul(a | 0, 0x27d4eb2d) ^ Math.imul((b | 0) + 0x61c88647, 0x165667b1) ^ Math.imul((c | 0) + 0x7f4a7c15, 0x2c1b3c6d);
-  h ^= h >>> 15;
-  h = Math.imul(h, 0x85ebca6b);
-  h ^= h >>> 13;
-  h = Math.imul(h, 0xc2b2ae35);
-  h ^= h >>> 16;
-  return (h >>> 0) / 4294967296;
-}
-
-function pick<T>(arr: readonly T[], r: number): T {
-  return arr[Math.min(arr.length - 1, Math.floor(r * arr.length))]!;
-}
-
-// --- цвета домов (sRGB) ---
-
-const PLASTER = [0xe4dccb, 0xd8cdb6, 0xefe6d2, 0xd6cfc2, 0xe8d9b5, 0xcfd3cf];
-const BRICK = [0xa35a3f, 0x8e4a35, 0xb56d4f, 0xc49a6c];
-const PANEL = [0xb9b8b1, 0xa6a9a8, 0xc9c6bb, 0x9ea3a6];
-const WOOD = [0x8a6a4a, 0x9b7b58, 0x7a5f45];
-const METAL = [0xc0c3c4, 0xa9b0b3, 0xd0cfc8, 0x8f989c];
-const WALLS: Record<OsmBuilding['kind'], number[]> = {
-  house: [...PLASTER, ...BRICK, ...WOOD],
-  apartments: [...PANEL, ...PANEL, ...PLASTER, ...BRICK],
-  industrial: [...METAL, ...PANEL, ...PLASTER],
-  other: [...PLASTER, ...PANEL, ...BRICK, ...METAL],
-};
-/** Скатные крыши: тёмно-красная, коричневая, серая, зелёный металл. */
-const ROOF_PITCHED = [0x7a2e22, 0x6b4630, 0x6f7275, 0x3f6b4c, 0x5a3a2c, 0x8a8d90];
-const ROOF_FLAT = [0x55585b, 0x6a6c6e, 0x7d7f80, 0x4b4d50];
-const ROOF_INDUSTRIAL = [...ROOF_FLAT, 0x9a9ea1, 0xa7aaa8];
-
-// --- геометрия домов ---
-
-/** Растущий буфер меша: позиции, нормали (int8), цвета (uint8), индексы. */
-class MeshBuf {
-  pos = new Float32Array(3 * 4096);
-  nor = new Int8Array(3 * 4096);
-  col = new Uint8Array(3 * 4096);
-  idx = new Uint32Array(6 * 4096);
-  nv = 0;
-  ni = 0;
-
-  vert(x: number, y: number, z: number, nx: number, ny: number, nz: number, c: THREE.Color, k: number): number {
-    const o = this.nv * 3;
-    if (o + 3 > this.pos.length) {
-      const grow = <T extends Float32Array | Int8Array | Uint8Array>(a: T, make: (n: number) => T): T => {
-        const b = make(a.length * 2);
-        b.set(a);
-        return b;
-      };
-      this.pos = grow(this.pos, (n) => new Float32Array(n));
-      this.nor = grow(this.nor, (n) => new Int8Array(n));
-      this.col = grow(this.col, (n) => new Uint8Array(n));
-    }
-    this.pos[o] = x;
-    this.pos[o + 1] = y;
-    this.pos[o + 2] = z;
-    this.nor[o] = Math.round(nx * 127);
-    this.nor[o + 1] = Math.round(ny * 127);
-    this.nor[o + 2] = Math.round(nz * 127);
-    this.col[o] = Math.min(255, Math.round(c.r * k * 255));
-    this.col[o + 1] = Math.min(255, Math.round(c.g * k * 255));
-    this.col[o + 2] = Math.min(255, Math.round(c.b * k * 255));
-    return this.nv++;
-  }
-
-  /** Треугольник; обход выбирается так, чтобы лицевая сторона смотрела по (nx, ny, nz). */
-  tri(a: number, b: number, c: number, nx: number, ny: number, nz: number) {
-    const p = this.pos;
-    const ax = p[a * 3]!, ay = p[a * 3 + 1]!, az = p[a * 3 + 2]!;
-    const ux = p[b * 3]! - ax, uy = p[b * 3 + 1]! - ay, uz = p[b * 3 + 2]! - az;
-    const vx = p[c * 3]! - ax, vy = p[c * 3 + 1]! - ay, vz = p[c * 3 + 2]! - az;
-    const dot = (uy * vz - uz * vy) * nx + (uz * vx - ux * vz) * ny + (ux * vy - uy * vx) * nz;
-    if (this.ni + 3 > this.idx.length) {
-      const idx = new Uint32Array(this.idx.length * 2);
-      idx.set(this.idx);
-      this.idx = idx;
-    }
-    this.idx[this.ni++] = a;
-    this.idx[this.ni++] = dot < 0 ? c : b;
-    this.idx[this.ni++] = dot < 0 ? b : c;
-  }
-
-  geometry(): THREE.BufferGeometry | null {
-    if (!this.ni) return null;
-    const n = this.nv * 3;
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(this.pos.slice(0, n), 3));
-    g.setAttribute('normal', new THREE.BufferAttribute(this.nor.slice(0, n), 3, true));
-    g.setAttribute('color', new THREE.BufferAttribute(this.col.slice(0, n), 3, true));
-    const idx = this.nv < 65536 ? new Uint16Array(this.idx.subarray(0, this.ni)) : this.idx.slice(0, this.ni);
-    g.setIndex(new THREE.BufferAttribute(idx, 1));
-    g.computeBoundingSphere();
-    return g;
-  }
-}
-
-/** Отсечение кольца [e0, n0, …] полуплоскостью a·e + b·n ≤ c. */
-function clipHalf(r: number[], a: number, b: number, c: number): number[] {
-  const out: number[] = [];
-  const n = r.length / 2;
-  for (let i = 0; i < n; i++) {
-    const j = (i + 1) % n;
-    const pe = r[2 * i]!, pn = r[2 * i + 1]!, qe = r[2 * j]!, qn = r[2 * j + 1]!;
-    const fp = a * pe + b * pn - c;
-    const fq = a * qe + b * qn - c;
-    if (fp <= 0) out.push(pe, pn);
-    if ((fp < 0 && fq > 0) || (fp > 0 && fq < 0)) {
-      const t = fp / (fp - fq);
-      out.push(pe + t * (qe - pe), pn + t * (qn - pn));
-    }
-  }
-  return out;
-}
-
-/** Наименьший описанный прямоугольник по направлениям рёбер: центр, длинная ось, полуразмеры. */
-function orientedBox(xs: Float64Array, ys: Float64Array) {
-  const n = xs.length;
-  let best: { area: number; ax: number; ay: number; u0: number; u1: number; v0: number; v1: number } | null = null;
-  for (let i = 0; i < n; i++) {
-    const j = (i + 1) % n;
-    const dx = xs[j]! - xs[i]!;
-    const dy = ys[j]! - ys[i]!;
-    const len = Math.hypot(dx, dy);
-    if (len < 0.3) continue;
-    const ax = dx / len, ay = dy / len;
-    let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
-    for (let k = 0; k < n; k++) {
-      const u = xs[k]! * ax + ys[k]! * ay;
-      const v = -xs[k]! * ay + ys[k]! * ax;
-      if (u < u0) u0 = u;
-      if (u > u1) u1 = u;
-      if (v < v0) v0 = v;
-      if (v > v1) v1 = v;
-    }
-    const area = (u1 - u0) * (v1 - v0);
-    if (!best || area < best.area) best = { area, ax, ay, u0, u1, v0, v1 };
-  }
-  if (!best) return null;
-  const { ax, ay, u0, u1, v0, v1 } = best;
-  const um = (u0 + u1) / 2, vm = (v0 + v1) / 2;
-  const cx = ax * um - ay * vm;
-  const cy = ay * um + ax * vm;
-  // Длинная ось — вдоль u; если длиннее поперёк, поворачиваем на 90°.
-  return u1 - u0 >= v1 - v0
-    ? { cx, cy, ax, ay, hl: (u1 - u0) / 2, hw: (v1 - v0) / 2, area: best.area }
-    : { cx, cy, ax: -ay, ay: ax, hl: (v1 - v0) / 2, hw: (u1 - u0) / 2, area: best.area };
-}
-
-const tmpWall = new THREE.Color();
-const tmpRoof = new THREE.Color();
-/** Точки контура для triangulateShape (ей нужны Vector2), переиспользуются. */
-const vecPool: THREE.Vector2[] = [];
-
-/**
- * Дом: стены по контуру и крыша. Крыша — минимум из плоскостей (одна — плоская; две — двускатная;
- * четыре — вальмовая); стены доходят до крыши, на фронтонах — до конька.
- */
-function addBuilding(b: OsmBuilding, groundAt: GroundAt, out: MeshBuf) {
-  const src = b.ring;
-  const n = src.length >> 1;
-  if (n < 3) return;
-  let a2 = 0;
-  for (let i = 0, j = n - 1; i < n; j = i++) a2 += src[2 * j]! * src[2 * i + 1]! - src[2 * i]! * src[2 * j + 1]!;
-  if (Math.abs(a2) < 2) return;
-  const xs = new Float64Array(n);
-  const ys = new Float64Array(n);
-  for (let i = 0; i < n; i++) {
-    const k = a2 > 0 ? i : n - 1 - i; // против часовой стрелки
-    xs[i] = src[2 * k]!;
-    ys[i] = src[2 * k + 1]!;
-  }
-  const area = Math.abs(a2) / 2;
-
-  let cx = 0, cy = 0;
-  for (let i = 0; i < n; i++) {
-    cx += xs[i]!;
-    cy += ys[i]!;
-  }
-  cx /= n;
-  cy /= n;
-  let gMin = groundAt(cx, cy);
-  let gMax = gMin;
-  for (let i = 0; i < n; i++) {
-    const g = groundAt(xs[i]!, ys[i]!);
-    if (g < gMin) gMin = g;
-    if (g > gMax) gMax = g;
-  }
-  const base = gMin - 0.5;
-  const eave = Math.max(gMin + b.heightM, gMax + Math.min(2, b.heightM * 0.5));
-
-  // Цвета — по хешу контура.
-  const seed = Math.round(src[0]! * 10);
-  const seed2 = Math.round(src[1]! * 10);
-  const h1 = hash3(seed, seed2, n);
-  const h2 = hash3(seed2, seed, n + 17);
-  const h3 = hash3(seed + n, seed2 - n, 5);
-  tmpWall.setHex(pick(WALLS[b.kind], h1)).multiplyScalar(0.94 + 0.12 * h3);
-
-  // Плоскости крыши: y = c0 + ce·восток + cn·север.
-  const planes: number[] = [];
-  if (b.kind === 'house' && n <= 24 && area < 800) {
-    const box = orientedBox(xs, ys);
-    if (box && box.hw >= 1.5 && area / box.area > 0.6) {
-      const rise = Math.min(3, Math.max(2, box.hw * 0.75));
-      const s = rise / box.hw;
-      const bx = -box.ay, by = box.ax;
-      const plane = (dx: number, dy: number, half: number) =>
-        planes.push(eave + s * (half + box.cx * dx + box.cy * dy), -s * dx, -s * dy);
-      plane(bx, by, box.hw);
-      plane(-bx, -by, box.hw);
-      // Вальмовая — у почти квадратных и у части остальных.
-      if (box.hl / box.hw < 1.15 || h2 < 0.3) {
-        plane(box.ax, box.ay, box.hl);
-        plane(-box.ax, -box.ay, box.hl);
-      }
-    }
-  }
-  const pitched = planes.length > 0;
-  if (!pitched) planes.push(eave, 0, 0);
-  const roofColors = b.kind === 'house' ? (pitched ? ROOF_PITCHED : ROOF_FLAT) : b.kind === 'industrial' ? ROOF_INDUSTRIAL : ROOF_FLAT;
-  tmpRoof.setHex(pick(roofColors, h2)).multiplyScalar(0.92 + 0.16 * h3);
-  const np = planes.length / 3;
-  const P = (k: number, e: number, nn: number) => planes[3 * k]! + planes[3 * k + 1]! * e + planes[3 * k + 2]! * nn;
-  const roofAt = (e: number, nn: number) => {
-    let h = Infinity;
-    for (let k = 0; k < np; k++) h = Math.min(h, P(k, e, nn));
-    return Math.max(eave, h);
-  };
-
-  // Стены: ребро делится там, где меняется плоскость крыши над ним.
-  const ts: number[] = [];
-  for (let i = 0; i < n; i++) {
-    const j = (i + 1) % n;
-    const x0 = xs[i]!, y0 = ys[i]!, x1 = xs[j]!, y1 = ys[j]!;
-    const dx = x1 - x0, dy = y1 - y0;
-    const len = Math.hypot(dx, dy);
-    if (len < 0.05) continue;
-    const nx = dy / len, nz = dx / len; // наружу: справа от обхода, z = −север
-    ts.length = 0;
-    ts.push(0, 1);
-    for (let k = 0; k < np; k++) {
-      for (let l = k + 1; l < np; l++) {
-        const f0 = P(k, x0, y0) - P(l, x0, y0);
-        const f1 = P(k, x1, y1) - P(l, x1, y1);
-        if ((f0 < 0 && f1 > 0) || (f0 > 0 && f1 < 0)) ts.push(f0 / (f0 - f1));
-      }
-    }
-    ts.sort((p, q) => p - q);
-    for (let t = 0; t + 1 < ts.length; t++) {
-      const ta = ts[t]!, tb = ts[t + 1]!;
-      if (tb - ta < 1e-4) continue;
-      const ea = x0 + dx * ta, na = y0 + dy * ta;
-      const eb = x0 + dx * tb, nb = y0 + dy * tb;
-      const v0 = out.vert(ea, base, -na, nx, 0, nz, tmpWall, 0.8);
-      const v1 = out.vert(eb, base, -nb, nx, 0, nz, tmpWall, 0.8);
-      const v2 = out.vert(eb, roofAt(eb, nb), -nb, nx, 0, nz, tmpWall, 1);
-      const v3 = out.vert(ea, roofAt(ea, na), -na, nx, 0, nz, tmpWall, 1);
-      out.tri(v0, v1, v2, nx, 0, nz);
-      out.tri(v0, v2, v3, nx, 0, nz);
-    }
-  }
-
-  // Крыша: каждая плоскость — над своей частью контура.
-  const ring: number[] = [];
-  for (let i = 0; i < n; i++) ring.push(xs[i]!, ys[i]!);
-  const contour: THREE.Vector2[] = [];
-  for (let k = 0; k < np; k++) {
-    let poly = ring;
-    const c0 = planes[3 * k]!, ce = planes[3 * k + 1]!, cn = planes[3 * k + 2]!;
-    for (let l = 0; l < np && poly.length >= 6; l++) {
-      if (l !== k) poly = clipHalf(poly, ce - planes[3 * l + 1]!, cn - planes[3 * l + 2]!, planes[3 * l]! - c0);
-    }
-    const m = poly.length / 2;
-    if (m < 3) continue;
-    contour.length = 0;
-    for (let i = 0; i < m; i++) contour.push((vecPool[i] ??= new THREE.Vector2()).set(poly[2 * i]!, poly[2 * i + 1]!));
-    const faces = THREE.ShapeUtils.triangulateShape(contour, []);
-    if (!faces.length) continue;
-    const len = Math.hypot(ce, 1, cn);
-    const nx = -ce / len, ny = 1 / len, nz = cn / len;
-    const first = out.nv;
-    for (let i = 0; i < m; i++) {
-      const e = poly[2 * i]!, nn = poly[2 * i + 1]!;
-      out.vert(e, c0 + ce * e + cn * nn, -nn, nx, ny, nz, tmpRoof, 1);
-    }
-    for (const f of faces) out.tri(first + f[0]!, first + f[1]!, first + f[2]!, nx, ny, nz);
-  }
-}
 
 // --- деревья ---
 
@@ -439,6 +155,31 @@ function broadleafGeometry(): THREE.BufferGeometry {
   return g.build();
 }
 
+/**
+ * Вершинный шейдер деревьев: у края радиуса дерево уменьшается до нуля; в ветер крона
+ * отклоняется по ветру (∝ квадрату высоты над комлем, ∝ размеру дерева) с порывами и
+ * покачиванием; фаза — от положения дерева, соседние качаются не в такт.
+ */
+const TREE_FADE = /* glsl */ `#include <begin_vertex>
+#ifdef USE_INSTANCING
+  transformed *= 1.0 - smoothstep(osmFade.x, osmFade.y, length(instanceMatrix[3].xz - osmCam.xz));
+#endif`;
+
+const TREE_PROJECT = /* glsl */ `vec4 mvPosition = vec4(transformed, 1.0);
+#ifdef USE_INSTANCING
+  mvPosition = instanceMatrix * mvPosition;
+  float hN = clamp(position.y / ${TREE_REF_H.toFixed(1)}, 0.0, 1.0);
+  float ph = dot(instanceMatrix[3].xz, vec2(0.173, 0.291));
+  float ws = length(osmWind);
+  vec2 dir = ws > 0.05 ? osmWind / ws : vec2(0.0);
+  float amp = hN * hN * instanceMatrix[1].y * (0.02 * ws + 0.004 * ws * ws);
+  float gust = 0.55 + 0.45 * sin(osmTime * 0.55 + ph * 0.11);
+  float sway = gust * 0.7 + 0.3 * sin(osmTime * (1.5 + 0.4 * fract(ph)) + ph);
+  mvPosition.xz += dir * amp * sway + vec2(-dir.y, dir.x) * amp * 0.15 * sin(osmTime * 2.3 + ph * 1.7);
+#endif
+mvPosition = modelViewMatrix * mvPosition;
+gl_Position = projectionMatrix * mvPosition;`;
+
 /** Маска леса: 0 — нет, 1 — хвойный, 2 — лиственный, 3 — смешанный. */
 interface ForestMask {
   e0: number;
@@ -449,15 +190,48 @@ interface ForestMask {
   data: Uint8Array;
 }
 
-function segDist2(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
-  const dx = bx - ax, dy = by - ay;
-  const l2 = dx * dx + dy * dy;
-  const t = l2 > 0 ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / l2)) : 0;
-  const ex = ax + t * dx - px, ey = ay + t * dy - py;
-  return ex * ex + ey * ey;
+/** Заливка колец (чёт-нечет — дыры пустые) значением code по центрам ячеек маски. */
+function fillRings(mask: ForestMask, rings: readonly Float32Array[], code: number) {
+  const { e0: minE, n0: minN, cell, w, h, data: d } = mask;
+  let fMin = Infinity, fMax = -Infinity;
+  for (const r of rings) {
+    for (let i = 1; i < r.length; i += 2) {
+      if (r[i]! < fMin) fMin = r[i]!;
+      if (r[i]! > fMax) fMax = r[i]!;
+    }
+  }
+  if (!(fMax > fMin)) return;
+  // Строка r — центр ячейки на n0 + (r + 0.5)·cell.
+  const r0 = Math.max(0, Math.ceil((fMin - minN) / cell - 0.5));
+  const r1 = Math.min(h - 1, Math.ceil((fMax - minN) / cell - 0.5) - 1);
+  if (r1 < r0) return;
+  const rows: number[][] = Array.from({ length: r1 - r0 + 1 }, () => []);
+  for (const r of rings) {
+    const m = r.length >> 1;
+    for (let i = 0, j = m - 1; i < m; j = i++) {
+      const xa = r[2 * j]!, ya = r[2 * j + 1]!, xb = r[2 * i]!, yb = r[2 * i + 1]!;
+      if (ya === yb) continue;
+      const lo = Math.min(ya, yb), hi = Math.max(ya, yb);
+      const ra = Math.max(r0, Math.ceil((lo - minN) / cell - 0.5));
+      const rb = Math.min(r1, Math.ceil((hi - minN) / cell - 0.5) - 1);
+      const k = (xb - xa) / (yb - ya);
+      for (let row = ra; row <= rb; row++) rows[row - r0]!.push(xa + (minN + (row + 0.5) * cell - ya) * k);
+    }
+  }
+  for (let i = 0; i < rows.length; i++) {
+    const xs = rows[i]!;
+    if (xs.length < 2) continue;
+    xs.sort((p, q) => p - q);
+    const off = (r0 + i) * w;
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const c0 = Math.max(0, Math.ceil((xs[k]! - minE) / cell - 0.5));
+      const c1 = Math.min(w - 1, Math.floor((xs[k + 1]! - minE) / cell - 0.5));
+      if (c1 >= c0) d.fill(code, off + c0, off + c1 + 1);
+    }
+  }
 }
 
-/** Растеризация лесов (чёт-нечет по всем кольцам леса — дыры пустые), затем поляны у домов и полос. */
+/** Растеризация лесов, затем вода, поляны у домов и полос, просеки дорог и рек. */
 function buildForestMask(data: OsmData): ForestMask | null {
   let minE = Infinity, minN = Infinity, maxE = -Infinity, maxN = -Infinity;
   for (const f of data.forests) {
@@ -479,45 +253,8 @@ function buildForestMask(data: OsmData): ForestMask | null {
   const mask: ForestMask = { e0: minE, n0: minN, cell, w, h, data: new Uint8Array(w * h) };
   const d = mask.data;
 
-  for (const f of data.forests) {
-    const code = f.leaf === 'needle' ? 1 : f.leaf === 'broad' ? 2 : 3;
-    let fMin = Infinity, fMax = -Infinity;
-    for (const r of f.rings) {
-      for (let i = 1; i < r.length; i += 2) {
-        if (r[i]! < fMin) fMin = r[i]!;
-        if (r[i]! > fMax) fMax = r[i]!;
-      }
-    }
-    if (!(fMax > fMin)) continue;
-    // Строка r — центр ячейки на n0 + (r + 0.5)·cell.
-    const r0 = Math.max(0, Math.ceil((fMin - minN) / cell - 0.5));
-    const r1 = Math.min(h - 1, Math.ceil((fMax - minN) / cell - 0.5) - 1);
-    if (r1 < r0) continue;
-    const rows: number[][] = Array.from({ length: r1 - r0 + 1 }, () => []);
-    for (const r of f.rings) {
-      const m = r.length >> 1;
-      for (let i = 0, j = m - 1; i < m; j = i++) {
-        const xa = r[2 * j]!, ya = r[2 * j + 1]!, xb = r[2 * i]!, yb = r[2 * i + 1]!;
-        if (ya === yb) continue;
-        const lo = Math.min(ya, yb), hi = Math.max(ya, yb);
-        const ra = Math.max(r0, Math.ceil((lo - minN) / cell - 0.5));
-        const rb = Math.min(r1, Math.ceil((hi - minN) / cell - 0.5) - 1);
-        const k = (xb - xa) / (yb - ya);
-        for (let row = ra; row <= rb; row++) rows[row - r0]!.push(xa + (minN + (row + 0.5) * cell - ya) * k);
-      }
-    }
-    for (let i = 0; i < rows.length; i++) {
-      const xs = rows[i]!;
-      if (xs.length < 2) continue;
-      xs.sort((p, q) => p - q);
-      const off = (r0 + i) * w;
-      for (let k = 0; k + 1 < xs.length; k += 2) {
-        const c0 = Math.max(0, Math.ceil((xs[k]! - minE) / cell - 0.5));
-        const c1 = Math.min(w - 1, Math.floor((xs[k + 1]! - minE) / cell - 0.5));
-        if (c1 >= c0) d.fill(code, off + c0, off + c1 + 1);
-      }
-    }
-  }
+  for (const f of data.forests) fillRings(mask, f.rings, f.leaf === 'needle' ? 1 : f.leaf === 'broad' ? 2 : 3);
+  for (const wa of data.water) fillRings(mask, wa.rings, 0);
 
   const clearBox = (e0: number, n0: number, e1: number, n1: number, keep?: (e: number, n: number) => boolean) => {
     const c0 = Math.max(0, Math.floor((e0 - minE) / cell)), c1 = Math.min(w - 1, Math.floor((e1 - minE) / cell));
@@ -548,6 +285,31 @@ function buildForestMask(data: OsmData): ForestMask | null {
       clearBox(Math.min(ax, bx) - reach, Math.min(ay, by) - reach, Math.max(ax, bx) + reach, Math.max(ay, by) + reach, (e, nn) => segDist2(e, nn, ax, ay, bx, by) > reach * reach);
     }
   }
+  // Просеки: шагом в полъячейки вдоль осевой — ячейки ближе половины ширины с запасом.
+  const corridor = (line: Float32Array, half: number) => {
+    const reach = half + ROAD_CLEAR_M;
+    const step = cell / 2;
+    for (let i = 0; i + 3 < line.length; i += 2) {
+      const ax = line[i]!, ay = line[i + 1]!, bx = line[i + 2]!, by = line[i + 3]!;
+      if (Math.max(ax, bx) + reach < minE || Math.min(ax, bx) - reach > maxE || Math.max(ay, by) + reach < minN || Math.min(ay, by) - reach > maxN) continue;
+      const len = Math.hypot(bx - ax, by - ay);
+      const k = Math.max(1, Math.ceil(len / step));
+      for (let s = 0; s <= k; s++) {
+        const e = ax + ((bx - ax) * s) / k, nn = ay + ((by - ay) * s) / k;
+        const c0 = Math.max(0, Math.floor((e - reach - minE) / cell)), c1 = Math.min(w - 1, Math.floor((e + reach - minE) / cell));
+        const q0 = Math.max(0, Math.floor((nn - reach - minN) / cell)), q1 = Math.min(h - 1, Math.floor((nn + reach - minN) / cell));
+        for (let q = q0; q <= q1; q++) {
+          const dn = minN + (q + 0.5) * cell - nn;
+          for (let c = c0; c <= c1; c++) {
+            const de = minE + (c + 0.5) * cell - e;
+            if (de * de + dn * dn <= reach * reach) d[q * w + c] = 0;
+          }
+        }
+      }
+    }
+  };
+  for (const r of data.roads) corridor(r.line, r.widthM / 2);
+  for (const r of data.waterways) corridor(r.line, r.widthM / 2);
   clearBox(-SITE_CLEAR_M, -SITE_CLEAR_M, SITE_CLEAR_M, SITE_CLEAR_M, (e, nn) => e * e + nn * nn > SITE_CLEAR_M * SITE_CLEAR_M);
   return mask;
 }
@@ -643,20 +405,6 @@ function runwayGeometry(runways: OsmRunway[], groundAt: GroundAt): THREE.BufferG
 
 // --- слой ---
 
-interface Chunk {
-  ce: number;
-  cn: number;
-  items: number[];
-  mesh: THREE.Mesh | null;
-  built: boolean;
-}
-
-interface ChunkBuild {
-  chunk: Chunk;
-  next: number;
-  buf: MeshBuf;
-}
-
 interface TreePopulation {
   ce: number;
   cn: number;
@@ -674,21 +422,25 @@ interface TreePopulation {
 
 export class OsmLayer {
   readonly group = new THREE.Group();
+  /** Время последнего update, мс, — для отладки производительности. */
+  lastUpdateMs = 0;
   private quality: QualitySettings;
   private readonly data: OsmData;
   private readonly groundAt: GroundAt;
   private disposed = false;
+  private readonly uniforms = createOsmUniforms();
 
-  private readonly buildings = new THREE.Group();
-  private readonly buildingMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, metalness: 0 });
-  private readonly chunks: Chunk[] = [];
-  private build: ChunkBuild | null = null;
+  private readonly buildings: LazyChunks<number>;
+  private readonly buildingMat: THREE.MeshStandardMaterial;
+  private readonly facadeAtlas: THREE.Texture;
+  private readonly roads: OsmRoads;
+  private readonly water: OsmWaterLayer;
 
   private mask: ForestMask | null | undefined = undefined;
   private readonly conifers: THREE.InstancedMesh;
   private readonly broadleaves: THREE.InstancedMesh;
   private readonly treeMats: THREE.MeshLambertMaterial[] = [];
-  private readonly fade = { osmCam: { value: new THREE.Vector3() }, osmFade: { value: new THREE.Vector2(1e9, 1e9) } };
+  private readonly osmFade = { value: new THREE.Vector2(1e9, 1e9) };
   /** Промежуточный набор: хвойные с начала, лиственные с конца. */
   private stageM: Float32Array | null = null;
   private stageC: Float32Array | null = null;
@@ -703,11 +455,13 @@ export class OsmLayer {
     this.groundAt = groundAt;
     this.quality = quality;
     this.group.name = 'osm';
-    this.buildings.name = 'osm-buildings';
-    this.group.add(this.buildings);
 
     // Дома — по квадратам сетки по среднему вершин.
-    const byKey = new Map<string, Chunk>();
+    const bm = createBuildingMaterial(this.uniforms);
+    this.buildingMat = bm.material;
+    this.facadeAtlas = bm.atlas;
+    this.buildings = new LazyChunks<number>(CHUNK_M, (items) => this.buildBuildings(items));
+    this.buildings.group.name = 'osm-buildings';
     data.buildings.forEach((b, i) => {
       const n = b.ring.length >> 1;
       if (n < 3) return;
@@ -716,34 +470,28 @@ export class OsmLayer {
         e += b.ring[2 * k]!;
         nn += b.ring[2 * k + 1]!;
       }
-      const ix = Math.floor(e / n / CHUNK_M), iy = Math.floor(nn / n / CHUNK_M);
-      const key = `${ix},${iy}`;
-      let c = byKey.get(key);
-      if (!c) {
-        c = { ce: (ix + 0.5) * CHUNK_M, cn: (iy + 0.5) * CHUNK_M, items: [], mesh: null, built: false };
-        byKey.set(key, c);
-        this.chunks.push(c);
-      }
-      c.items.push(i);
+      this.buildings.add(e / n, nn / n, i);
     });
+    this.group.add(this.buildings.group);
+
+    this.water = new OsmWaterLayer(data, groundAt, this.uniforms);
+    this.group.add(this.water.group);
+    this.roads = new OsmRoads(data.roads, data.buildings, groundAt, this.uniforms);
+    this.group.add(this.roads.group);
 
     // Деревья.
     const makeTrees = (geo: THREE.BufferGeometry, name: string) => {
       const mat = new THREE.MeshLambertMaterial({ vertexColors: true });
       mat.onBeforeCompile = (shader) => {
-        shader.uniforms.osmCam = this.fade.osmCam;
-        shader.uniforms.osmFade = this.fade.osmFade;
+        shader.uniforms.osmCam = this.uniforms.osmCam;
+        shader.uniforms.osmFade = this.osmFade;
+        shader.uniforms.osmTime = this.uniforms.osmTime;
+        shader.uniforms.osmWind = this.uniforms.osmWind;
         shader.vertexShader =
-          'uniform vec3 osmCam;\nuniform vec2 osmFade;\n' +
-          shader.vertexShader.replace(
-            '#include <begin_vertex>',
-            `#include <begin_vertex>
-#ifdef USE_INSTANCING
-  transformed *= 1.0 - smoothstep(osmFade.x, osmFade.y, length(instanceMatrix[3].xz - osmCam.xz));
-#endif`,
-          );
+          'uniform vec3 osmCam;\nuniform vec2 osmFade;\nuniform float osmTime;\nuniform vec2 osmWind;\n' +
+          shader.vertexShader.replace('#include <begin_vertex>', TREE_FADE).replace('#include <project_vertex>', TREE_PROJECT);
       };
-      mat.customProgramCacheKey = () => 'osm-tree-fade';
+      mat.customProgramCacheKey = () => 'osm-tree';
       this.treeMats.push(mat);
       const mesh = new THREE.InstancedMesh(geo, mat, TREE_CAP);
       mesh.name = name;
@@ -773,23 +521,37 @@ export class OsmLayer {
     }
   }
 
-  /** Каждый кадр, позиция камеры в координатах сцены. */
-  update(camera: THREE.Vector3): void {
+  /**
+   * Каждый кадр: позиция камеры в координатах сцены; env — время, ночь и ветер (без него
+   * время идёт по часам, ночь и ветер — прежние).
+   */
+  update(camera: THREE.Vector3, env?: OsmEnv): void {
     if (this.disposed) return;
+    const t0 = performance.now();
+    const u = this.uniforms;
+    if (env) {
+      u.osmTime.value = env.time;
+      u.osmNight.value = THREE.MathUtils.clamp(env.nightFactor, 0, 1);
+      u.osmWind.value.copy(env.wind);
+    } else u.osmTime.value = t0 / 1000;
+    u.osmCam.value.copy(camera);
     const ce = camera.x, cn = -camera.z;
-    this.updateBuildings(ce, cn);
-    this.updateTrees(camera, ce, cn);
+    const r = osmRanges(this.quality);
+    this.buildings.update(ce, cn, r.buildingsM, performance.now() + BUILD_BUDGET_MS);
+    this.water.update(ce, cn, r.waterM, performance.now() + WATER_BUDGET_MS);
+    this.roads.update(ce, cn, r.roadsM, u.osmNight.value, r.streetLights, performance.now() + ROAD_BUDGET_MS);
+    this.updateTrees(ce, cn);
+    this.lastUpdateMs = performance.now() - t0;
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    for (const c of this.chunks) {
-      if (c.mesh) c.mesh.geometry.dispose();
-      c.mesh = null;
-    }
-    this.build = null;
+    this.buildings.dispose();
     this.buildingMat.dispose();
+    this.facadeAtlas.dispose();
+    this.water.dispose();
+    this.roads.dispose();
     for (const m of [this.conifers, this.broadleaves]) {
       m.geometry.dispose();
       m.dispose();
@@ -807,69 +569,23 @@ export class OsmLayer {
 
   // --- дома ---
 
-  private updateBuildings(ce: number, cn: number) {
-    const R = this.quality.buildingsRadiusM;
-    const show = R > 0 ? R + CHUNK_M : -1;
-    const keep = R > 0 ? R + 3 * CHUNK_M : -1;
-    const dist = (c: Chunk) => Math.hypot(c.ce - ce, c.cn - cn);
-    for (const c of this.chunks) {
-      if (!c.built) continue;
-      const d = dist(c);
-      if (d > keep) {
-        if (c.mesh) {
-          this.buildings.remove(c.mesh);
-          c.mesh.geometry.dispose();
-          c.mesh = null;
-        }
-        c.built = false;
-      } else if (c.mesh) c.mesh.visible = d < show;
+  private *buildBuildings(items: readonly number[]): Generator<unknown, ChunkPart[], unknown> {
+    const buf = new MeshBuf();
+    for (const i of items) {
+      addBuilding(this.data.buildings[i]!, this.groundAt, buf);
+      yield;
     }
-    if (this.build && dist(this.build.chunk) > keep) this.build = null;
-
-    const deadline = performance.now() + BUILD_BUDGET_MS;
-    for (let done = 0; done < MAX_CHUNKS_PER_UPDATE; ) {
-      if (!this.build) {
-        let best: Chunk | null = null;
-        let bestD = show;
-        for (const c of this.chunks) {
-          if (c.built) continue;
-          const d = dist(c);
-          if (d < bestD) {
-            bestD = d;
-            best = c;
-          }
-        }
-        if (!best) break;
-        this.build = { chunk: best, next: 0, buf: new MeshBuf() };
-      }
-      const b = this.build;
-      const items = b.chunk.items;
-      do addBuilding(this.data.buildings[items[b.next++]!]!, this.groundAt, b.buf);
-      while (b.next < items.length && performance.now() < deadline);
-      if (b.next < items.length) break;
-      this.finishChunk(b, dist(b.chunk) < show);
-      this.build = null;
-      done++;
-      if (performance.now() >= deadline) break;
-    }
-  }
-
-  private finishChunk(b: ChunkBuild, visible: boolean) {
-    const geo = b.buf.geometry();
-    b.chunk.built = true;
-    if (!geo) return;
+    const geo = buf.geometry();
+    if (!geo) return [];
     const mesh = new THREE.Mesh(geo, this.buildingMat);
     mesh.receiveShadow = true;
     mesh.castShadow = false;
-    mesh.matrixAutoUpdate = false;
-    mesh.visible = visible;
-    b.chunk.mesh = mesh;
-    this.buildings.add(mesh);
+    return [{ object: mesh, range: 1 }];
   }
 
   // --- деревья ---
 
-  private updateTrees(camera: THREE.Vector3, ce: number, cn: number) {
+  private updateTrees(ce: number, cn: number) {
     const R = this.quality.treeRadiusM;
     if (!(R > 0) || !this.data.forests.length) {
       this.conifers.visible = this.broadleaves.visible = false;
@@ -878,8 +594,7 @@ export class OsmLayer {
       this.treesDirty = true;
       return;
     }
-    this.fade.osmCam.value.copy(camera);
-    this.fade.osmFade.value.set(R * 0.72, R);
+    this.osmFade.value.set(R * 0.72, R);
     if (this.mask === undefined) this.mask = buildForestMask(this.data);
     if (!this.mask) return;
     if (!this.pop) {

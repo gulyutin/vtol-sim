@@ -1,3 +1,5 @@
+// Только тип: записи живут в src/game, но во время выполнения профиль от них не зависит.
+import type { Recording } from '../game/recorder';
 import type { SurveyCamera } from './survey';
 import type { AirState, GeoPoint } from './types';
 
@@ -150,6 +152,8 @@ export interface LocationSpec {
   survey: { title: string; briefing: string; area: GeoPoint[] };
   delivery: { title: string; briefing: string; destination: GeoPoint; destinationName: string; route: RoutePoint[] };
   route: { briefing: string; route: RoutePoint[] };
+  /** Перелёт из А в Б: взлёт на площадке, посадка в другой точке. */
+  transfer: { title: string; briefing: string; destination: GeoPoint; destinationName: string; route: RoutePoint[] };
 }
 
 export interface Profile {
@@ -165,4 +169,9 @@ export interface Profile {
   /** Штатная камера — первая в списке. */
   camera: SurveyCamera;
   location: LocationSpec;
+  /**
+   * Бортовой журнал аппарата → запись для разбора (src/game/recorder.ts). Формат журнала —
+   * дело профиля; без этого поля разбор открывает только записи симулятора.
+   */
+  importLog?: (buf: ArrayBuffer, fileName: string) => Promise<Recording>;
 }

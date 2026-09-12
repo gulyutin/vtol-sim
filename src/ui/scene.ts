@@ -10,17 +10,18 @@ import type { OsmData } from '../sim/osm';
 import type { SunPosition } from '../sim/sun';
 import type { Coverage, Frame } from '../sim/survey';
 import type { LocalPoint } from '../sim/timeline';
-import type { GeoPoint, Site, Terrain } from '../sim/types';
+import type { GeoPoint, Site, Terrain, Weather } from '../sim/types';
 import { createAircraft, type AircraftModel } from './aircraftModel';
 import { OsmLayer } from './osmLayer';
 import { createGroundStation, createLandingPad, createLandingZone, createVehicle, createWaypointMarker, RotorDust } from './props';
 import { QUALITY, type QualitySettings } from './quality';
 import { SkyDome } from './skyDome';
+import { fogFor, overcastFactor, Precipitation } from './precipitation';
 import type { Bounds } from './terrainData';
 import { TerrainLod } from './terrainLod';
 
 /** follow — облёт мышью; chase — за хвостом (тоже можно вращать); pad — с площадки; cinema — смена ракурсов. */
-export type CameraMode = 'follow' | 'chase' | 'pad' | 'cinema';
+export type CameraMode = 'follow' | 'chase' | 'tail' | 'pad' | 'cinema';
 
 export interface Pose {
   position: LocalPoint;
@@ -101,6 +102,8 @@ export class World {
   readonly camera = new THREE.PerspectiveCamera(50, 1, 0.5, 60000);
   readonly controls: OrbitControls;
   aircraft: AircraftModel = createAircraft();
+  /** 0 — день, 1 — ночь (по высоте Солнца). */
+  nightFactor = 0;
   private cameraMode: CameraMode = 'follow';
   private q: QualitySettings;
   private readonly composer: EffectComposer;
@@ -118,6 +121,10 @@ export class World {
   private readonly hemi = new THREE.HemisphereLight(0xdcecff, 0x6a6a55, 0.7);
   private readonly sunDir = new THREE.Vector3(0, 1, 0);
   private readonly clouds: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
+  /** Дождь и снег вокруг камеры. */
+  private readonly precip: Precipitation;
+  /** 0 — ясно, 1 — сплошная облачность: гасит Солнце и серит небо. */
+  private overcast = 0;
   private readonly routeGroup = new THREE.Group();
   private readonly markerGroup = new THREE.Group();
   private areaLine: THREE.LineLoop | null = null;
@@ -144,6 +151,9 @@ export class World {
   private orbitYaw = 0;
   private orbitPitch = 0;
   private chaseDist = 13.5;
+  // Камера на хвосте: точка крепления в системе модели и небольшой наклон вниз.
+  private tailMount: THREE.Vector3 | null = null;
+  private readonly tailTilt = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -6 * DEG);
   private speed = 0;
   // Режим «кино».
   private shot = -1;
@@ -232,6 +242,8 @@ export class World {
     );
     this.clouds.rotation.x = -Math.PI / 2;
     this.clouds.position.y = env.cloudBaseM;
+    this.precip = new Precipitation(this.q.precipParticles);
+    this.scene.add(this.precip.object);
     this.scene.add(this.clouds);
 
     this.dust = new RotorDust(this.q.dustParticles);
@@ -295,7 +307,27 @@ export class World {
     this.lod.setQuality(q.lodSplit, q.maxImageryZoom, q.detailTexture, q.cloudShadows);
     this.osm?.setQuality(q);
     this.dust.setMax(q.dustParticles);
+    this.precip.setMax(q.precipParticles);
     this.resize();
+  }
+
+  /** Погода в картинке: дождь или снег, дымка по видимости, пасмурность, облака. */
+  setWeather(w: Weather) {
+    const to = (w.wind.fromDeg + 180) * DEG;
+    const s = w.wind.speedMs;
+    this.precip.setWeather(w.precipitation ?? null, new THREE.Vector2(Math.sin(to) * s, -Math.cos(to) * s));
+    const f = fogFor(w.visibilityM);
+    const fog = this.scene.fog as THREE.Fog;
+    fog.near = f.near;
+    fog.far = f.far;
+    this.overcast = overcastFactor(w);
+    const cu = this.clouds.material.uniforms;
+    if (w.cloudCover !== undefined) cu['cover']!.value = w.cloudCover;
+    if (w.cloudBaseM !== undefined) this.clouds.position.y = w.cloudBaseM;
+    // В тумане облака дальше видимости не видны.
+    cu['fadeFar']!.value = Math.min(40000, Math.max(3000, f.far * 1.2));
+    // Небо и свет пересчитаются с новой пасмурностью на следующем setSun.
+    this.lastSun = null;
   }
 
   /** Дома, леса и полосы из OpenStreetMap. */
@@ -313,6 +345,7 @@ export class World {
     model.group.rotation.copy(this.aircraft.group.rotation);
     this.scene.remove(this.aircraft.group);
     this.aircraft = model;
+    this.tailMount = null;
     this.scene.add(model.group);
   }
 
@@ -320,6 +353,9 @@ export class World {
     this.cameraMode = mode;
     this.controls.enabled = mode === 'follow';
     this.shot = -1;
+    // С хвоста планер виден в полуметре — ближняя плоскость отсечения ближе.
+    this.camera.near = mode === 'tail' ? 0.2 : 0.5;
+    this.camera.updateProjectionMatrix();
     if (mode === 'follow') {
       this.camera.fov = 50;
       this.camera.position.copy(this.target).add(new THREE.Vector3(9, 4, 12));
@@ -352,14 +388,18 @@ export class World {
 
     const day = THREE.MathUtils.smoothstep(sun.elevationDeg, -4, 12);
     const warm = 1 - THREE.MathUtils.smoothstep(sun.elevationDeg, 2, 30);
+    // Ночь: окна домов, огни, посадочная фара и звёзды берут этот коэффициент.
+    this.nightFactor = 1 - day;
     this.sun.color.setRGB(1, 0.96 - 0.25 * warm, 0.9 - 0.45 * warm);
-    this.sun.intensity = 3.2 * day;
-    this.hemi.intensity = 0.35 + 0.9 * day;
+    // Под сплошной облачностью прямого Солнца почти нет — свет рассеянный, тени бледные.
+    const oc = this.overcast;
+    this.sun.intensity = 3.2 * day * (1 - 0.75 * oc);
+    this.hemi.intensity = (0.35 + 0.9 * day) * (1 - 0.2 * oc);
     // Дымка — цвет неба у горизонта: вдали рельеф уходит в небо без шва.
-    (this.scene.fog as THREE.Fog).color.copy(this.sky.setSun(this.sunDir, day, warm));
+    (this.scene.fog as THREE.Fog).color.copy(this.sky.setSun(this.sunDir, day, warm, oc));
     const clouds = this.clouds.material.uniforms;
-    (clouds['lit']!.value as THREE.Color).setRGB(1, 1 - 0.15 * warm, 1 - 0.3 * warm).multiplyScalar(0.4 + 0.6 * day);
-    (clouds['shade']!.value as THREE.Color).setRGB(0.55, 0.6, 0.68).multiplyScalar(0.4 + 0.6 * day);
+    (clouds['lit']!.value as THREE.Color).setRGB(1, 1 - 0.15 * warm, 1 - 0.3 * warm).multiplyScalar((0.4 + 0.6 * day) * (1 - 0.35 * oc));
+    (clouds['shade']!.value as THREE.Color).setRGB(0.55, 0.6, 0.68).multiplyScalar((0.4 + 0.6 * day) * (1 - 0.3 * oc));
 
     this.envTarget?.dispose();
     this.envTarget = this.pmrem.fromScene(this.skyEnv);
@@ -540,13 +580,22 @@ export class World {
       this.camera.lookAt(this.target);
       // На скорости поле зрения чуть шире — ощущение движения.
       this.setFov(50 + THREE.MathUtils.clamp((this.speed - 12) * 0.3, 0, 7));
+    } else if (this.cameraMode === 'tail') {
+      // Камера закреплена на оперении и смотрит вперёд по оси аппарата: крен и тангаж — по горизонту.
+      const g = this.aircraft.group;
+      g.updateMatrixWorld();
+      this.camera.position.copy(this.tailMountPoint()).applyMatrix4(g.matrixWorld);
+      this.camera.quaternion.copy(g.quaternion).multiply(this.tailTilt);
+      this.setFov(72);
     } else if (this.cameraMode === 'cinema') {
       this.cinema(dt, forward);
     } else {
       this.telephoto(this.padCamera);
     }
-    const floor = this.groundAt(this.camera.position.x, -this.camera.position.z) + 1.5;
-    if (this.camera.position.y < floor) this.camera.position.y = floor;
+    if (this.cameraMode !== 'tail') {
+      const floor = this.groundAt(this.camera.position.x, -this.camera.position.z) + 1.5;
+      if (this.camera.position.y < floor) this.camera.position.y = floor;
+    }
     this.lastTarget.copy(this.target);
 
     this.sun.position.copy(this.target).addScaledVector(this.sunDir, 1200);
@@ -567,7 +616,9 @@ export class World {
       cloudBaseY: this.clouds.position.y,
       sunDir: this.sunDir,
     });
-    this.osm?.update(this.camera.position);
+    // Мир из OpenStreetMap: деревья качает ветер, ночью горят окна и фонари.
+    this.osm?.update(this.camera.position, { time: this.clock, nightFactor: this.nightFactor, wind: this.groundWind });
+    this.precip.update(dt, this.camera);
     if (this.q.postprocess) this.composer.render(dt);
     else this.renderer.render(this.scene, this.camera);
   }
@@ -598,6 +649,38 @@ export class World {
     if (Math.abs(this.camera.fov - fov) < 0.05) return;
     this.camera.fov = fov;
     this.camera.updateProjectionMatrix();
+  }
+
+  /** Точка крепления камеры на хвосте в системе модели: над верхом оперения, по оси аппарата (нос — к −Z). */
+  private tailMountPoint(): THREE.Vector3 {
+    if (this.tailMount) return this.tailMount;
+    const g = this.aircraft.group;
+    g.updateMatrixWorld(true);
+    const toModel = g.matrixWorld.clone().invert();
+    const m = new THREE.Matrix4();
+    const v = new THREE.Vector3();
+    const eachVertex = (fn: (p: THREE.Vector3) => void) =>
+      g.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        const pos = mesh.isMesh ? mesh.geometry.getAttribute('position') : undefined;
+        if (!pos) return;
+        m.multiplyMatrices(toModel, mesh.matrixWorld);
+        for (let i = 0; i < pos.count; i++) fn(v.fromBufferAttribute(pos, i).applyMatrix4(m));
+      });
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    eachVertex((p) => {
+      minZ = Math.min(minZ, p.z);
+      maxZ = Math.max(maxZ, p.z);
+    });
+    // Верх оперения — самая высокая точка в задней пятой части аппарата.
+    const rear = maxZ - 0.2 * (maxZ - minZ);
+    const top = new THREE.Vector3(0, -Infinity, 0);
+    eachVertex((p) => {
+      if (p.z >= rear && p.y > top.y) top.copy(p);
+    });
+    this.tailMount = Number.isFinite(top.y) ? new THREE.Vector3(0, top.y + 0.08, top.z) : new THREE.Vector3(0, 0.6, 1.2);
+    return this.tailMount;
   }
 
   /** Наблюдатель с телевиком из точки eye: аппарат держится в кадре примерно одного размера. */

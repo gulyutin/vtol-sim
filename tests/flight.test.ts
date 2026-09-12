@@ -101,6 +101,51 @@ describe('живой полёт', () => {
   });
 });
 
+describe('турбулентность в живом полёте', () => {
+  const rough = { ...weather, turbulenceMs: 1.5 };
+  const fly = (w: typeof weather, seed?: number) => {
+    const f = new LiveFlight({ plan, terrain, weather: w, seed });
+    f.command('arm');
+    f.command('takeoff');
+    let gust = 0;
+    let bank = 0;
+    let vz = 0;
+    let reading = 0;
+    while (f.state.mode !== 'landed' && f.state.mode !== 'crashed' && f.state.t < 4 * 3600) {
+      f.step(0.5, controls);
+      gust = Math.max(gust, f.state.gustMs);
+      if (f.state.mode === 'auto') {
+        bank = Math.max(bank, Math.abs(f.state.bankDeg));
+        vz = Math.max(vz, Math.abs(f.state.vzMs));
+        reading = Math.max(reading, Math.abs(f.state.iasReadingMs - f.state.iasMs));
+      }
+    }
+    return { f, gust, bank, vz, reading };
+  };
+
+  it('в болтанку задание выполняется: посадка в районе, но не так точно; энергии чуть больше; тот же seed — тот же полёт', () => {
+    const calm = fly(weather);
+    const a = fly(rough, 3);
+    const b = fly(rough, 3);
+    expect(a.f.state.mode).toBe('landed');
+    expect(b.f.state.east).toBe(a.f.state.east);
+    expect(b.f.state.energyWh).toBe(a.f.state.energyWh);
+    const miss = Math.hypot(a.f.state.east - a.f.home.east, a.f.state.north - a.f.home.north);
+    const calmMiss = Math.hypot(calm.f.state.east - calm.f.home.east, calm.f.state.north - calm.f.home.north);
+    expect(miss).toBeLessThan(AIRCRAFT.limits.landingZoneRadiusM);
+    expect(miss).toBeGreaterThan(calmMiss);
+    expect(a.f.state.energyWh / calm.f.state.energyWh).toBeGreaterThan(1);
+    expect(a.f.state.energyWh / calm.f.state.energyWh).toBeLessThan(1.1);
+    // Порывы видны: сила порыва, крен и вертикальная пляшут, стрелка ПВД дёргается.
+    expect(calm.gust).toBe(0);
+    expect(a.gust).toBeGreaterThan(1);
+    expect(a.bank).toBeGreaterThan(calm.bank);
+    expect(a.vz).toBeGreaterThan(calm.vz);
+    expect(a.reading).toBeGreaterThan(0.3);
+    expect(a.bank).toBeLessThan(AIRCRAFT.limits.failsafeBankDeg);
+  });
+});
+
 describe('АРМ и ДИЗАРМ', () => {
   it('без АРМ взлёт не начинается; заармленный на земле — роторы на холостых и расход', () => {
     const f = new LiveFlight({ plan, terrain, weather });
