@@ -556,6 +556,8 @@ export class Sound {
   private graph: SoundGraph | null = null;
   private volume = 0.7;
   private isMuted = false;
+  /** Приглушение на время речи НСУ (duck), множитель громкости. */
+  private duckLevel = 1;
   private hidden = false;
   private disposed = false;
   private suspendTimer: ReturnType<typeof setTimeout> | undefined;
@@ -609,6 +611,12 @@ export class Sound {
     return this.isMuted;
   }
 
+  /** Приглушить на время речи НСУ: 1 — как есть, меньше — тише, чтобы голос был слышен поверх гула. */
+  duck(level: number): void {
+    this.duckLevel = clamp01(level);
+    this.applyMaster();
+  }
+
   /** Раз в кадр, с реальным (не ускоренным) dt. До resume() — ничего не делает. */
   update(dt: number, s: SoundState): void {
     if (this.graph && !this.hidden) this.graph.update(dt, s);
@@ -636,6 +644,6 @@ export class Sound {
   }
 
   private applyMaster(): void {
-    this.graph?.setMaster(this.isMuted || this.hidden ? 0 : this.volume * this.volume);
+    this.graph?.setMaster(this.isMuted || this.hidden ? 0 : this.volume * this.volume * this.duckLevel);
   }
 }

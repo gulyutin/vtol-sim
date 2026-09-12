@@ -1,4 +1,5 @@
 import { fromLocal } from './mission';
+import type { LocalWind, TerrainWind } from './terrainWind';
 import type { Site, Terrain, Weather } from './types';
 import { windAt } from './wind';
 
@@ -13,6 +14,8 @@ import { windAt } from './wind';
  *
  * Рельеф: в подветренной тени гряды (до ~12 её высот по ветру и не выше ~её высоты над гребнем)
  * пульсации сильнее и есть нисходящий поток; над склонами, повёрнутыми к Солнцу, — термики.
+ * С полем ветра рельефа (terrainWind.ts) тень и термики берутся из него: СКО — по его множителю
+ * и добавке роторов, а нисходящий поток и термики — в среднем ветре поля, не в пульсациях.
  */
 
 const RAD = Math.PI / 180;
@@ -23,9 +26,9 @@ const MODES = 40;
 const WAVE_MIN_M = 6;
 const WAVE_MAX_M = 4000;
 /** Во сколько раз может вырасти СКО в подветренной тени. */
-const LEE_GAIN = 1.5;
+export const LEE_GAIN = 1.5;
 /** Нисходящий поток за грядой — доля скорости ветра. */
-const LEE_SINK = 0.15;
+export const LEE_SINK = 0.15;
 /** Расстояния против ветра, на которых ищем гряду, м. */
 const LEE_PROBE_M = [40, 80, 130, 200, 300, 450, 650, 900];
 /** Клетка кэша рельефа, м: выборки высот дорогие, а тень рельефа меняется плавно. */
@@ -107,6 +110,8 @@ export class Turbulence {
     private readonly site?: Site,
     /** Солнце для термиков: постоянное или по времени полёта; без него термиков нет. */
     private readonly sun?: SunDirection | ((t: number) => SunDirection),
+    /** Поле ветра рельефа: с ним terrain, site и sun здесь не нужны — тень и термики из поля. */
+    private readonly field?: TerrainWind,
   ) {
     this.rmsMs = Math.max(0, weather.turbulenceMs ?? 0);
     const r = rng(seed ^ 0x5eed);
@@ -133,36 +138,49 @@ export class Turbulence {
     this.cloud = Math.min(1, Math.max(0, weather.cloudCover ?? 0));
   }
 
-  /** Есть ли пульсации вообще (turbulenceMs > 0). */
+  /** Есть ли пульсации вообще: turbulenceMs > 0 или роторы за грядами из поля рельефа. */
   get active(): boolean {
-    return this.rmsMs > 0;
+    return this.rmsMs > 0 || (this.field?.active ?? false);
   }
 
   /**
    * Пульсация ветра в момент t (с) в точке east/north (м от начала координат) на высоте aglM над
-   * землёй, м/с. Прибавляется к среднему ветру windAt(). Без турбулентности — нули.
+   * землёй, м/с. Прибавляется к среднему ветру windAt() — или к local, ветру поля рельефа в этой
+   * точке (если он уже посчитан на этом шаге, поле второй раз не спрашиваем). Без турбулентности — нули.
    */
-  sample(t: number, east: number, north: number, aglM: number): Gust {
-    if (this.rmsMs <= 0) return { e: 0, n: 0, u: 0 };
+  sample(t: number, east: number, north: number, aglM: number, local?: LocalWind): Gust {
     const agl = Math.max(0, aglM);
-    const sc = drydenScales(agl);
+    if (this.field) {
+      const lw = local ?? this.field.localWind(east, north, agl, t);
+      const gain = this.rmsMs * lw.turbulenceScale + lw.turbulenceAddMs;
+      if (gain <= 0) return { e: 0, n: 0, u: 0 };
+      return this.pulse(t, east, north, agl, gain);
+    }
+    if (this.rmsMs <= 0) return { e: 0, n: 0, u: 0 };
     const lee = this.leeFactor(east, north, agl);
     const thermal = this.thermal(t, east, north, agl);
-    const gain = this.rmsMs * (1 + LEE_GAIN * lee) * (1 + thermal.gain);
+    const g = this.pulse(t, east, north, agl, this.rmsMs * (1 + LEE_GAIN * lee) * (1 + thermal.gain));
+    return { e: g.e, n: g.n, u: g.u - LEE_SINK * this.wind10Ms * lee + thermal.updraftMs };
+  }
+
+  /** Пульсации с СКО gain на 10 м — без поправок рельефа. */
+  private pulse(t: number, east: number, north: number, agl: number, gain: number): Gust {
+    const sc = drydenScales(agl);
     // Точка в «замороженном» поле, которое сносит ветер.
     const x = east - this.advE * t;
     const y = north - this.advN * t;
-    const e = gain * sc.horizontal * this.field(this.modes[0]!, x, y, t, sc.lengthHM, false);
-    const n = gain * sc.horizontal * this.field(this.modes[1]!, x, y, t, sc.lengthHM, false);
-    const u = gain * sc.vertical * this.field(this.modes[2]!, x, y, t, sc.lengthVM, true) - LEE_SINK * this.wind10Ms * lee + thermal.updraftMs;
-    return { e, n, u };
+    return {
+      e: gain * sc.horizontal * this.modeSum(this.modes[0]!, x, y, t, sc.lengthHM, false),
+      n: gain * sc.horizontal * this.modeSum(this.modes[1]!, x, y, t, sc.lengthHM, false),
+      u: gain * sc.vertical * this.modeSum(this.modes[2]!, x, y, t, sc.lengthVM, true),
+    };
   }
 
   /**
    * Сумма мод с весами по спектру Драйдена для масштаба L: продольный для горизонтальных,
    * поперечный для вертикальной. Веса нормированы — СКО суммы ровно 1.
    */
-  private field(modes: Mode[], x: number, y: number, t: number, L: number, vertical: boolean): number {
+  private modeSum(modes: Mode[], x: number, y: number, t: number, L: number, vertical: boolean): number {
     let sumW = 0;
     let sum = 0;
     for (const m of modes) {

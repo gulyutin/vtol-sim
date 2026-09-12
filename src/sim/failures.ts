@@ -5,6 +5,9 @@
  * сами последствия считает LiveFlight (flight.ts): inject(id).
  */
 
+import type { EwState } from './flight';
+import { EW_EFFECT_THRESHOLD, ZONE_TITLE, zoneLabel, type Zone, type ZoneKind } from './zones';
+
 export type FailureId =
   | 'link'
   | 'gnss'
@@ -160,4 +163,117 @@ export const FAILURES: readonly FailureInfo[] = [
 
 export function failureInfo(id: FailureId): FailureInfo {
   return FAILURES.find((f) => f.id === id)!;
+}
+
+/* ----------------------------- Зоны РЭБ и запретные зоны ----------------------------- */
+
+/*
+ * Не отказы, а обстановка (zones.ts): действуют, пока борт в зоне. Тревоги строятся по
+ * LiveState.ew — по телеметрии для НСУ (подмену борт не видит — только её признаки) или по
+ * истинному состоянию для окна инструктора.
+ */
+
+/** Тревога по обстановке — как у отказов: текст и порядок действий оператора. */
+export interface EnvAlert {
+  level: 'bad' | 'warn';
+  text: string;
+  actions?: string[];
+}
+
+export interface ZoneInfo {
+  kind: ZoneKind;
+  title: string;
+  /** Что происходит с аппаратом в симуляторе. */
+  effect: string;
+  /** Порядок действий оператора. */
+  rleActions: string[];
+}
+
+/** Расхождение навигации больше этого, м/с, — подозрение на подмену ГНСС. */
+export const NAV_MISMATCH_WARN_MS = 4;
+/** Индикатор помех выше этого (но решение ещё есть) — предупреждение. */
+const JAM_NOTICE = 0.05;
+
+export const ZONE_INFO: Record<ZoneKind, ZoneInfo> = {
+  nofly: {
+    kind: 'nofly',
+    title: ZONE_TITLE.nofly,
+    effect: 'Полёты запрещены. На аппарат зона не действует, но вход — грубое нарушение: штраф в оценке. Маршрут через зону не пройдёт предполётную проверку.',
+    rleActions: [
+      'Немедленно покинуть зону кратчайшим путём: РУЧНОЙ курсом из зоны или ОПЕРАТИВНАЯ ТОЧКА за её границей',
+      'Доложить руководителю полётов о нарушении',
+      'Перестроить маршрут в обход зоны',
+    ],
+  },
+  'gnss-jam': {
+    kind: 'gnss-jam',
+    title: ZONE_TITLE['gnss-jam'],
+    effect:
+      'Решения ГНСС нет: автопилот считает место по ПВД, курсу и ветру, измеренному до помех, — оценка на НСУ уходит от истинной, маршрут выполняется со сносом, точку на висении не держит. После выхода из зоны — повторный захват за 5–35 с.',
+    rleActions: [
+      'Доложить руководителю полётов о потере сигнала ГНСС (помехи)',
+      'Контролировать место по счислению: приборная скорость, курс, ветер, время полёта',
+      'Выйти из зоны помех: ВОЗВРАТ или РУЧНОЙ курсом из зоны',
+      'Не садиться и не зависать без ГНСС — дождаться повторного захвата вне зоны',
+      'Если выйти нельзя, а БВС в зоне действия ПДУ — «Фэйлсейф» и посадка вручную',
+    ],
+  },
+  'gnss-spoof': {
+    kind: 'gnss-spoof',
+    title: ZONE_TITLE['gnss-spoof'],
+    effect:
+      'Ложный сигнал захватывает приёмник и медленно уводит место — до километра и больше за несколько минут. Автопилот летит по уведённому месту и на самом деле уходит с трассы, а на карте НСУ всё ровно. Признаки: «ветер» по оценке автопилота вырос или развернулся без причины, путевая скорость и путевой угол не сходятся с приборной скоростью, курсом и ветром, кадры камеры не совпадают с картой. После выхода — срыв слежения, повторный захват и скачок места.',
+    rleActions: [
+      'Сверить путевую скорость и путевой угол с приборной скоростью, курсом и известным ветром',
+      'Сверить место с ориентирами по камере нагрузки',
+      'Доложить руководителю полётов о подозрении на подмену ГНСС',
+      'Прекратить задание: РУЧНОЙ курсом из района помех — курс держится по компасу, не по ГНСС',
+      'После повторного захвата и скачка места — проверить место и выполнить ВОЗВРАТ',
+    ],
+  },
+  'link-jam': {
+    kind: 'link-jam',
+    title: ZONE_TITLE['link-jam'],
+    effect: `Помехи в радиоканале: пока борт в зоне, связи с НСУ нет — команды не доходят, телеметрия замирает; пульт в зоне тоже не работает. Через ${LINK_TIMEOUT_S} с без связи автопилот уходит на ВОЗВРАТ и обычно сам выходит из зоны; связь возвращается через несколько секунд после выхода.`,
+    rleActions: [
+      'Доложить руководителю полётов о потере связи (помехи в радиоканале)',
+      `Ждать: через ${LINK_TIMEOUT_S} с без связи автопилот уходит на ВОЗВРАТ`,
+      'После восстановления связи — проверить режим и место, маршрут перестроить в обход зоны',
+    ],
+  },
+};
+
+const pct = (x: number) => `${Math.round(Math.min(1, x) * 100)} %`;
+
+/**
+ * Тревоги по зонам — для НСУ так же, как у отказов (текст и порядок действий). tele —
+ * flight.telemetry (что знает борт) или flight.state (для инструктора: видна и подмена).
+ * zones — чтобы назвать запретную зону по имени.
+ */
+export function environmentAlerts(tele: { ew: EwState; linkLost: boolean; failures: readonly FailureId[] }, zones: readonly Zone[] = []): EnvAlert[] {
+  const ew = tele.ew;
+  const out: EnvAlert[] = [];
+  const name = (id: string) => {
+    const z = zones.find((x) => x.id === id);
+    return z ? zoneLabel(z) : ZONE_TITLE.nofly;
+  };
+  for (const id of ew.noflyIds) out.push({ level: 'bad', text: `ЗАПРЕТНАЯ ЗОНА «${name(id)}» — немедленно покинуть`, actions: ZONE_INFO.nofly.rleActions });
+  if (ew.noflyNear) {
+    const d = Math.round(ew.noflyNear.distanceM / 10) * 10;
+    out.push({ level: 'warn', text: `До запретной зоны «${name(ew.noflyNear.id)}» ${d} м`, actions: ['Проверить, что маршрут и разворот не заходят в зону', 'Сносит к зоне — РУЧНОЙ курсом от неё'] });
+  }
+  if (ew.gnss === 'lost' && !tele.failures.includes('gnss'))
+    out.push({ level: 'bad', text: `ГНСС: НЕТ РЕШЕНИЯ — помехи ${pct(ew.gnssJam)}, место по счислению`, actions: ZONE_INFO['gnss-jam'].rleActions });
+  else if (ew.gnss === 'acquiring') out.push({ level: 'warn', text: 'ГНСС: повторный захват — место пока по счислению' });
+  else if (ew.gnss === 'ok' && ew.gnssJam > JAM_NOTICE) out.push({ level: 'warn', text: `ГНСС: помехи ${pct(ew.gnssJam)} — рядом зона подавления` });
+  if (ew.navMismatchMs >= NAV_MISMATCH_WARN_MS)
+    out.push({
+      level: 'warn',
+      text: `НАВИГАЦИЯ НЕ СХОДИТСЯ: путевая по ГНСС расходится с приборной, курсом и ветром на ${Math.round(ew.navMismatchMs)} м/с — возможна подмена ГНСС`,
+      actions: ZONE_INFO['gnss-spoof'].rleActions,
+    });
+  if (ew.spoofed) out.push({ level: 'warn', text: `РЭБ: подмена ГНСС — место уведено на ${Math.round(ew.spoofOffsetM)} м (видно только инструктору)` });
+  if (tele.linkLost && ew.linkJam >= EW_EFFECT_THRESHOLD) out.push({ level: 'bad', text: 'ПОМЕХИ В РАДИОКАНАЛЕ: связь подавлена', actions: ZONE_INFO['link-jam'].rleActions });
+  else if (!tele.linkLost && ew.linkJam > JAM_NOTICE) out.push({ level: 'warn', text: `Помехи в радиоканале ${pct(ew.linkJam)} — связь может пропасть` });
+  return out;
 }

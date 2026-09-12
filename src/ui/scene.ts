@@ -11,6 +11,7 @@ import type { SunPosition } from '../sim/sun';
 import type { Coverage, Frame } from '../sim/survey';
 import type { LocalPoint } from '../sim/timeline';
 import type { GeoPoint, Site, Terrain, Weather } from '../sim/types';
+import type { Zone } from '../sim/zones';
 import { createAircraft, type AircraftModel } from './aircraftModel';
 import { OsmLayer } from './osmLayer';
 import { createGroundStation, createLandingPad, createLandingZone, createVehicle, createWaypointMarker, RotorDust } from './props';
@@ -19,6 +20,7 @@ import { SkyDome } from './skyDome';
 import { fogFor, overcastFactor, Precipitation } from './precipitation';
 import type { Bounds } from './terrainData';
 import { TerrainLod } from './terrainLod';
+import { ZoneWalls } from './zones3d';
 
 /** follow — облёт мышью; chase — за хвостом (тоже можно вращать); pad — с площадки; cinema — смена ракурсов. */
 export type CameraMode = 'follow' | 'chase' | 'tail' | 'pad' | 'cinema';
@@ -127,6 +129,8 @@ export class World {
   private overcast = 0;
   private readonly routeGroup = new THREE.Group();
   private readonly markerGroup = new THREE.Group();
+  /** Стены запретных зон и зон РЭБ. */
+  private readonly zoneWalls = new ZoneWalls((e, n) => this.groundAt(e, n));
   private areaLine: THREE.LineLoop | null = null;
   private pads: THREE.Group[] = [];
   private readonly trail: THREE.Line;
@@ -219,7 +223,7 @@ export class World {
     this.frameLines.frustumCulled = false;
 
     this.scene.add(this.lod.group, this.createGroundFill(env.bounds), this.routeGroup, this.markerGroup, this.trail, this.frameLines, this.createPad(0, 0));
-    this.scene.add(this.createWindsock({ east: 8, north: 6 }), this.createCamp());
+    this.scene.add(this.createWindsock({ east: 8, north: 6 }), this.createCamp(), this.zoneWalls.group);
     this.setArea(env.area);
 
     this.clouds = new THREE.Mesh(
@@ -429,6 +433,11 @@ export class World {
     }
     this.areaLine = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0xffffff }));
     this.scene.add(this.areaLine);
+  }
+
+  /** Запретные зоны и зоны РЭБ: полупрозрачные стены по границе (zones3d.ts). */
+  setZones(zones: readonly Zone[]) {
+    this.zoneWalls.set(zones, this.site);
   }
 
   /** Маршрут: пунктир на высоте полёта и след на земле. */

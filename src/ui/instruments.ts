@@ -1,3 +1,5 @@
+import { LINK_GOOD_DB, LINK_LOST_DB } from '../sim/radio';
+
 /** Авиагоризонт: небо и земля по тангажу и крену, шкала крена, силуэт аппарата. */
 export function drawAttitude(ctx: CanvasRenderingContext2D, size: number, pitchDeg: number, bankDeg: number, headingDeg: number) {
   const r = size / 2;
@@ -96,7 +98,14 @@ export interface ProfileData {
   terrain: number[];
   /** Плановая высота, м над морем. */
   plan: number[];
+  /** Запас связи с НСУ на плановой высоте, дБ (radio.ts linkProfile) — плановая линия в цвете связи. */
+  link?: number[];
+  /** Наименьшая высота связи с НСУ, м над морем; null — не набирается. */
+  minLinkAlt?: (number | null)[];
 }
+
+/** Цвет плановой высоты по запасу связи: хорошая, плохая, нет. */
+const linkColor = (m: number | undefined) => (m === undefined || m >= LINK_GOOD_DB ? '#ff8a1a' : m >= LINK_LOST_DB ? '#d9a400' : '#e02020');
 
 /** Профиль маршрута: рельеф, плановая высота и положение аппарата. */
 export function drawProfile(ctx: CanvasRenderingContext2D, w: number, h: number, d: ProfileData, aircraft: { dist: number; alt: number } | null) {
@@ -105,7 +114,10 @@ export function drawProfile(ctx: CanvasRenderingContext2D, w: number, h: number,
   const pad = { l: 44, r: 8, t: 8, b: 20 };
   const total = d.dist[d.dist.length - 1]!;
   const lo = Math.min(...d.terrain) - 20;
-  const hi = Math.max(...d.plan, ...d.terrain, aircraft?.alt ?? -Infinity) + 30;
+  const base = Math.max(...d.plan, ...d.terrain, aircraft?.alt ?? -Infinity) + 30;
+  // Высота связи тянет шкалу вверх не больше чем на 60 % — выше линия уходит за край.
+  const linkTop = Math.max(-Infinity, ...(d.minLinkAlt ?? []).filter((a): a is number => a !== null)) + 30;
+  const hi = Math.max(base, Math.min(linkTop, base + 0.6 * (base - lo)));
   const x = (m: number) => pad.l + ((w - pad.l - pad.r) * m) / total;
   const y = (a: number) => h - pad.b - ((h - pad.t - pad.b) * (a - lo)) / (hi - lo);
 
@@ -132,11 +144,39 @@ export function drawProfile(ctx: CanvasRenderingContext2D, w: number, h: number,
   ctx.closePath();
   ctx.fill();
 
-  ctx.strokeStyle = '#ff8a1a';
+  // Наименьшая высота связи с НСУ — пунктир; ниже него связи нет.
+  if (d.minLinkAlt?.some((a) => a !== null)) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(pad.l, pad.t, w - pad.l - pad.r, h - pad.t - pad.b);
+    ctx.clip();
+    ctx.strokeStyle = '#2f7de1';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    let open = false;
+    d.dist.forEach((m, i) => {
+      const a = d.minLinkAlt![i];
+      if (a === null || a === undefined) return void (open = false);
+      if (open) ctx.lineTo(x(m), y(a));
+      else ctx.moveTo(x(m), y(a));
+      open = true;
+    });
+    ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = '#2f7de1';
+    ctx.fillText('┄ связь с НСУ выше', pad.l + 4, pad.t + 10);
+  }
+
+  // Плановая высота в цвете связи: оранжевая — хорошая, жёлтая — плохая, красная — нет.
   ctx.lineWidth = 2;
-  ctx.beginPath();
-  d.dist.forEach((m, i) => (i ? ctx.lineTo(x(m), y(d.plan[i]!)) : ctx.moveTo(x(m), y(d.plan[i]!))));
-  ctx.stroke();
+  for (let i = 1; i < d.dist.length; i++) {
+    ctx.strokeStyle = linkColor(d.link?.[i - 1]);
+    ctx.beginPath();
+    ctx.moveTo(x(d.dist[i - 1]!), y(d.plan[i - 1]!));
+    ctx.lineTo(x(d.dist[i]!), y(d.plan[i]!));
+    ctx.stroke();
+  }
 
   if (aircraft) {
     ctx.fillStyle = '#e02020';

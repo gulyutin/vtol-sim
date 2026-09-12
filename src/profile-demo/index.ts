@@ -122,6 +122,7 @@ export const PROFILE: Profile = {
   },
 
   location: {
+    regionName: 'Подмосковье — долина Оки',
     site: { lat: 54.7878, lon: 37.6458 },
     siteName: 'аэродром Большое Грызлово',
     region: { south: 54.64, west: 37.4, north: 54.96, east: 37.9 },
@@ -130,6 +131,11 @@ export const PROFILE: Profile = {
     windSpeedMs: 4,
     windFromDeg: 250,
     temperatureC: 20,
+    // Пункты Б за перегибами склонов: на земле без мачт их от аэродрома не слышно.
+    relays: [
+      { kind: 'ground', lat: 54.8801, lon: 37.751, antennaM: 10, name: 'на холме у Игумнова' },
+      { kind: 'ground', lat: 54.8828, lon: 37.5732, antennaM: 10, name: 'на холме у деревни Сушки' },
+    ],
     survey: {
       title: 'Аэрофотосъёмка склона',
       briefing: 'Ортофотоплан участка 1,6 × 1,1 км на склоне долины Оки штатной камерой. Нужно GSD не хуже 4 см и не меньше 5 годных кадров на 95 % участка.',

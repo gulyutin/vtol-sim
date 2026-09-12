@@ -3,6 +3,126 @@ import type { RoutePoint } from '../game/scenarios';
 import { fromLocal } from '../sim/mission';
 import type { Coverage, Frame } from '../sim/survey';
 import type { GeoPoint, Site } from '../sim/types';
+import { makeZoneId, prepareZones, ZONE_TITLE, zoneContour, zoneLabel, type Zone, type ZoneKind } from '../sim/zones';
+import { LINK_GOOD_DB, LINK_LOST_DB, RADIO, type LinkStatus, type RadioCoverage, type Relay } from '../sim/radio';
+import type { WindFieldGrid, WindHazard } from '../sim/terrainWind';
+
+/** Площадка с оценкой ветра у рельефа (terrainWind.ts windHazardAt) — кружок по уровню опасности. */
+export interface WindSiteMark {
+  position: GeoPoint;
+  label: string;
+  hazard: WindHazard;
+}
+/** Уровень опасности у площадки: спокойно, внимание, опасно. */
+const HAZARD_COLOR = (level: number) => (level < 0.3 ? '#4fd08a' : level < 0.6 ? '#ffc24d' : '#ff5d5d');
+
+/** Ретранслятор без места: наземный на мачте или на аппарате-ретрансляторе на высоте над морем. */
+export type RelayTemplate = { kind: 'ground'; antennaM?: number } | { kind: 'air'; altitudeM: number };
+/** Линия НСУ → борт по состоянию связи. */
+export const LINK_COLOR: Record<LinkStatus, string> = { good: '#4fd08a', poor: '#ffc24d', lost: '#ff5d5d' };
+const RELAY_COLOR = '#35d0ff';
+
+const relayText = (r: Relay | RelayTemplate) => (r.kind === 'air' ? `на аппарате, ${Math.round(r.altitudeM)} м над морем` : `мачта ${Math.round(r.antennaM ?? RADIO.groundAntennaM)} м`);
+
+/** Значок ретранслятора: вышка и номер. */
+const relayIcon = (label: string) =>
+  L.divIcon({
+    className: 'relay-pin',
+    html: `<div style="transform:translate(-50%,-100%);display:flex;flex-direction:column;align-items:center;pointer-events:auto"><span style="padding:0 4px;border-radius:3px;background:rgba(0,0,0,.65);border:1px solid ${RELAY_COLOR};color:${RELAY_COLOR};font:700 11px/1.4 system-ui,sans-serif">${esc(label)}</span><svg width="18" height="20" viewBox="0 0 18 20"><path d="M9 3 4 19M9 3l5 16M6 13h6M9 3v0" stroke="${RELAY_COLOR}" stroke-width="2" fill="none"/><circle cx="9" cy="3" r="2.5" fill="${RELAY_COLOR}"/></svg></div>`,
+    iconSize: [0, 0],
+    iconAnchor: [0, 0],
+  });
+
+/** Идёт установка ретранслятора. */
+interface RelayPlace {
+  template: RelayTemplate;
+  onDone: (relay: Relay) => void;
+  onCancel?: () => void;
+  hint: L.Marker | null;
+}
+
+/** Цвета зон: запретная — красная, РЭБ — фиолетовая, пурпурная, жёлтая. */
+export const ZONE_COLOR: Record<ZoneKind, string> = {
+  nofly: '#ff3b3b',
+  'gnss-jam': '#a45cff',
+  'gnss-spoof': '#ff5fd2',
+  'link-jam': '#ffc933',
+};
+/** Круг меньше — второй щелчок не принимается (случайный двойной щелчок). */
+const MIN_ZONE_RADIUS_M = 30;
+
+const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+const fmtM = (m: number) => (m < 1000 ? `${Math.round(m)} м` : `${(m / 1000).toFixed(m < 10_000 ? 2 : 1).replace('.', ',')} км`);
+const geo = (p: L.LatLng): GeoPoint => ({ lat: p.lat, lon: p.lng });
+
+/** Подпись поверх карты без стилей из style.css: всё внутри. */
+const labelIcon = (text: string, color: string) =>
+  L.divIcon({
+    className: 'zone-label',
+    html: `<span style="display:inline-block;transform:translate(-50%,-50%);white-space:nowrap;padding:1px 6px;border-radius:3px;background:rgba(0,0,0,.6);border:1px solid ${color};color:${color};font:600 11px/1.35 system-ui,sans-serif;pointer-events:none">${esc(text)}</span>`,
+    iconSize: [0, 0],
+    iconAnchor: [0, 0],
+  });
+
+function zoneTooltip(z: Zone): string {
+  const h = z.floorM !== undefined || z.ceilingM !== undefined ? `<br>${z.floorM !== undefined ? `от ${Math.round(z.floorM)} м` : 'от земли'} ${z.ceilingM !== undefined ? `до ${Math.round(z.ceilingM)} м` : 'без потолка'} над уровнем моря` : '';
+  const size = z.center && z.radiusM ? `<br>радиус ${fmtM(z.radiusM)}` : '';
+  return `<b>${esc(zoneLabel(z))}</b>${z.name ? `<br>${ZONE_TITLE[z.kind]}` : ''}${size}${h}<br><i>правый щелчок — действия</i>`;
+}
+
+function centroid(pts: GeoPoint[]): GeoPoint {
+  return { lat: pts.reduce((s, p) => s + p.lat, 0) / pts.length, lon: pts.reduce((s, p) => s + p.lon, 0) / pts.length };
+}
+
+/** Штриховка запретной зоны — узор в defs того же SVG, что рисует зоны. */
+function hatch(path: L.Path, color: string) {
+  const el = path.getElement() as SVGPathElement | undefined;
+  const svg = el?.ownerSVGElement;
+  if (!el || !svg) return;
+  const id = `zone-hatch-${color.replace(/[^0-9a-z]/gi, '')}`;
+  if (!svg.querySelector(`#${id}`)) {
+    const NS = 'http://www.w3.org/2000/svg';
+    let defs = svg.querySelector('defs');
+    if (!defs) {
+      defs = document.createElementNS(NS, 'defs');
+      svg.insertBefore(defs, svg.firstChild);
+    }
+    const pat = document.createElementNS(NS, 'pattern');
+    pat.setAttribute('id', id);
+    pat.setAttribute('patternUnits', 'userSpaceOnUse');
+    pat.setAttribute('width', '10');
+    pat.setAttribute('height', '10');
+    pat.setAttribute('patternTransform', 'rotate(45)');
+    const bg = document.createElementNS(NS, 'rect');
+    bg.setAttribute('width', '10');
+    bg.setAttribute('height', '10');
+    bg.setAttribute('fill', color);
+    bg.setAttribute('fill-opacity', '0.1');
+    const line = document.createElementNS(NS, 'line');
+    line.setAttribute('x1', '0');
+    line.setAttribute('y1', '0');
+    line.setAttribute('x2', '0');
+    line.setAttribute('y2', '10');
+    line.setAttribute('stroke', color);
+    line.setAttribute('stroke-width', '3');
+    line.setAttribute('stroke-opacity', '0.5');
+    pat.append(bg, line);
+    defs.appendChild(pat);
+  }
+  el.setAttribute('fill', `url(#${id})`);
+  el.setAttribute('fill-opacity', '1');
+}
+
+/** Идёт рисование зоны. */
+interface ZoneDraw {
+  kind: ZoneKind;
+  shape: 'circle' | 'polygon';
+  onDone: (zone: Zone) => void;
+  onCancel?: () => void;
+  pts: L.LatLng[];
+  preview: L.LayerGroup;
+  dblZoom: boolean;
+}
 
 const IMAGERY = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
 const LABELS = 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
@@ -40,7 +160,25 @@ export class Map2D {
   onClick: ((p: GeoPoint) => void) | null = null;
   onRouteChange: ((points: RoutePoint[]) => void) | null = null;
   onDestinationChange: ((p: GeoPoint) => void) | null = null;
+  /** Правый щелчок по зоне (не во время рисования): id зоны — удалить или изменить. */
+  onZoneContext: ((id: string) => void) | null = null;
+  /** Правый щелчок по ретранслятору: его номер в списке setRelays — удалить. */
+  onRelayContext: ((index: number) => void) | null = null;
+  private readonly relayLayer = L.layerGroup();
+  private relayPlace: RelayPlace | null = null;
+  private radioShadow: L.ImageOverlay | null = null;
+  /** Ветер у рельефа: заливка, стрелки (своя панель) и площадки. */
+  private windImage: L.ImageOverlay | null = null;
+  private readonly windLayer = L.layerGroup();
+  private readonly windRenderer: L.Renderer;
+  private readonly linkLine: L.Polyline;
+  private linkBlock: L.CircleMarker | null = null;
   private readonly renderer = L.canvas({ padding: 0.5 });
+  /** Зоны — в своей панели под маршрутом, в SVG (для штриховки). */
+  private readonly zoneRenderer: L.Renderer;
+  private readonly zoneLayer = L.layerGroup();
+  private zonesShown: Zone[] = [];
+  private draw: ZoneDraw | null = null;
   private area: L.Polygon | null = null;
   private vertices: L.Marker[] = [];
   private readonly route = L.layerGroup();
@@ -62,6 +200,19 @@ export class Map2D {
     L.tileLayer(IMAGERY, { maxZoom: 19, maxNativeZoom: 19, attribution: 'Снимки © Esri, Maxar, Earthstar Geographics' }).addTo(this.map);
     L.tileLayer(LABELS, { maxZoom: 19, maxNativeZoom: 19 }).addTo(this.map);
     L.control.scale({ imperial: false, position: 'bottomright' }).addTo(this.map);
+    this.map.createPane('zones').style.zIndex = '350';
+    this.zoneRenderer = L.svg({ pane: 'zones', padding: 0.5 });
+    this.zoneLayer.addTo(this.map);
+    // Радиотень — под зонами, над подложкой.
+    this.map.createPane('radioShadow').style.zIndex = '320';
+    // Ветер у рельефа — над радиотенью, под зонами; щелчков не ловит.
+    const windPane = this.map.createPane('wind');
+    windPane.style.zIndex = '330';
+    windPane.style.pointerEvents = 'none';
+    this.windRenderer = L.canvas({ pane: 'wind', padding: 0.5 });
+    this.windLayer.addTo(this.map);
+    this.linkLine = L.polyline([], { renderer: this.renderer, weight: 2, opacity: 0.9, interactive: false }).addTo(this.map);
+    this.relayLayer.addTo(this.map);
     this.frames.addTo(this.map);
     this.route.addTo(this.map);
     this.editLayer.addTo(this.map);
@@ -81,7 +232,10 @@ export class Map2D {
       interactive: false,
       zIndexOffset: 1000,
     }).addTo(this.map);
-    this.map.on('click', (e: L.LeafletMouseEvent) => this.onClick?.({ lat: e.latlng.lat, lon: e.latlng.lng }));
+    // Пока рисуется зона или ставится ретранслятор, щелчки идут им, а не маршруту.
+    this.map.on('click', (e: L.LeafletMouseEvent) =>
+      this.draw ? this.drawClick(e.latlng) : this.relayPlace ? this.relayClick(e.latlng) : this.onClick?.({ lat: e.latlng.lat, lon: e.latlng.lng }),
+    );
     this.map.on('zoomend', () => this.updateMarks());
   }
 
@@ -261,5 +415,352 @@ export class Map2D {
 
   zoom(delta: number) {
     this.map.setZoom(this.map.getZoom() + delta);
+  }
+
+  /* --------------------------------- Связь --------------------------------- */
+
+  /**
+   * Радиотень (radio.ts coverageSteps): где на высоте сетки связи с НСУ нет — тёмная заливка,
+   * где плохая — жёлтая, где хорошая — ничего. null — убрать. origin — начало локальных координат сетки.
+   */
+  setRadioShadow(cov: RadioCoverage | null, origin?: GeoPoint) {
+    this.radioShadow?.remove();
+    this.radioShadow = null;
+    if (!cov || !origin) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = cov.cols;
+    canvas.height = cov.rows;
+    const g = canvas.getContext('2d')!;
+    const img = g.createImageData(cov.cols, cov.rows);
+    for (let j = 0; j < cov.rows; j++) {
+      for (let i = 0; i < cov.cols; i++) {
+        const m = cov.marginDb[j * cov.cols + i]!;
+        if (m >= LINK_GOOD_DB) continue;
+        const rgba = m < LINK_LOST_DB ? [20, 16, 40, 150] : [255, 190, 60, 70];
+        img.data.set(rgba, ((cov.rows - 1 - j) * cov.cols + i) * 4);
+      }
+    }
+    g.putImageData(img, 0, 0);
+    const sw = fromLocal(origin, cov.e0, cov.n0);
+    const ne = fromLocal(origin, cov.e0 + cov.cols * cov.cellM, cov.n0 + cov.rows * cov.cellM);
+    this.radioShadow = L.imageOverlay(canvas.toDataURL(), L.latLngBounds(ll(sw), ll(ne)), { pane: 'radioShadow', interactive: false, className: 'radio-shadow' }).addTo(this.map);
+  }
+
+  /* ------------------------------ Ветер у рельефа ------------------------------ */
+
+  /**
+   * Поле ветра у рельефа на высоте полёта (TerrainWind.fieldGrid): заливка по вертикальному потоку —
+   * опускание синим, подъём красным, болтанка сильнее — фиолетовым; стрелки — куда дует; кружки —
+   * площадки по уровню опасности, в подсказке — что ждать. null — убрать. origin — начало координат сетки.
+   */
+  setWindField(grid: WindFieldGrid | null, origin?: GeoPoint, sites: readonly WindSiteMark[] = []) {
+    this.windImage?.remove();
+    this.windImage = null;
+    this.windLayer.clearLayers();
+    if (!grid || !origin) return;
+    const { nx, ny, stepM } = grid;
+    const canvas = document.createElement('canvas');
+    canvas.width = nx;
+    canvas.height = ny;
+    const g = canvas.getContext('2d')!;
+    const img = g.createImageData(nx, ny);
+    for (let j = 0; j < ny; j++) {
+      for (let i = 0; i < nx; i++) {
+        const k = j * nx + i;
+        const w = grid.upMs[k]!;
+        const turb = Math.min(1, Math.max(0, (grid.turbulenceScale[k]! - 1) / 1.5));
+        // Поток сильнее 3 м/с — полная заливка; слабее 0,3 м/с и без болтанки — ничего.
+        const a = Math.min(1, Math.abs(w) / 3);
+        if (a < 0.1 && turb < 0.2) continue;
+        const base = w < 0 ? [60, 120, 255] : [255, 90, 60];
+        const rgb = base.map((c, q) => Math.round(c * (1 - 0.6 * turb) + [190, 80, 255][q]! * 0.6 * turb));
+        img.data.set([rgb[0]!, rgb[1]!, rgb[2]!, Math.round(150 * Math.max(a, 0.8 * turb))], ((ny - 1 - j) * nx + i) * 4);
+      }
+    }
+    g.putImageData(img, 0, 0);
+    // Узел — центр пикселя: картинка шире сетки на полшага с каждой стороны.
+    const sw = fromLocal(origin, grid.east0 - stepM / 2, grid.north0 - stepM / 2);
+    const ne = fromLocal(origin, grid.east0 + (nx - 0.5) * stepM, grid.north0 + (ny - 0.5) * stepM);
+    this.windImage = L.imageOverlay(canvas.toDataURL(), L.latLngBounds(ll(sw), ll(ne)), { pane: 'wind', opacity: 0.8, interactive: false, className: 'wind-field' }).addTo(this.map);
+
+    // Стрелки: ~14 по ширине, длина — по скорости (самая сильная — 0,7 шага стрелок).
+    const stride = Math.max(1, Math.round(nx / 14));
+    let top = 0;
+    for (let k = 0; k < nx * ny; k++) top = Math.max(top, Math.hypot(grid.eastMs[k]!, grid.northMs[k]!));
+    const scale = top > 0 ? (0.7 * stride * stepM) / top : 0;
+    const style = { renderer: this.windRenderer, pane: 'wind', color: '#ffffff', weight: 1.5, opacity: 0.75, interactive: false };
+    for (let j = Math.floor(stride / 2); j < ny; j += stride) {
+      for (let i = Math.floor(stride / 2); i < nx; i += stride) {
+        const k = j * nx + i;
+        const ve = grid.eastMs[k]! * scale;
+        const vn = grid.northMs[k]! * scale;
+        const len = Math.hypot(ve, vn);
+        if (len < stepM / 4) continue;
+        const e0 = grid.east0 + i * stepM - ve / 2;
+        const n0 = grid.north0 + j * stepM - vn / 2;
+        const e1 = e0 + ve;
+        const n1 = n0 + vn;
+        // Оперение — две черты под 25° назад, треть длины.
+        const head = (sgn: number) => {
+          const c = Math.cos(Math.PI - sgn * 0.44);
+          const s = Math.sin(Math.PI - sgn * 0.44);
+          return ll(fromLocal(origin, e1 + ((ve * c - vn * s) / 3), n1 + ((ve * s + vn * c) / 3)));
+        };
+        L.polyline([head(1), ll(fromLocal(origin, e1, n1)), head(-1)], style).addTo(this.windLayer);
+        L.polyline([ll(fromLocal(origin, e0, n0)), ll(fromLocal(origin, e1, n1))], style).addTo(this.windLayer);
+      }
+    }
+
+    for (const p of sites) {
+      const color = HAZARD_COLOR(p.hazard.level);
+      L.circleMarker(ll(p.position), { renderer: this.renderer, radius: 11, color, weight: 3, fill: false })
+        .bindTooltip(`<b>${esc(p.label)}</b><br>${esc(p.hazard.text)}`, { direction: 'top', offset: [0, -10] })
+        .addTo(this.windLayer);
+    }
+  }
+
+  /** Ретрансляторы: значок с номером (Р1, Р2…), подсказка, правый щелчок — onRelayContext. */
+  setRelays(relays: readonly Relay[]) {
+    this.relayLayer.clearLayers();
+    relays.forEach((r, i) => {
+      const m = L.marker(ll(r), { icon: relayIcon(`Р${i + 1}`), zIndexOffset: 600, keyboard: false }).addTo(this.relayLayer);
+      m.bindTooltip(`<b>Ретранслятор ${i + 1}</b><br>${relayText(r)}<br><i>правый щелчок — удалить</i>`, { direction: 'top', offset: [0, -24] });
+      m.on('contextmenu', (e: L.LeafletMouseEvent) => {
+        L.DomEvent.preventDefault(e.originalEvent);
+        L.DomEvent.stopPropagation(e);
+        if (!this.draw && !this.relayPlace) this.onRelayContext?.(i);
+      });
+    });
+  }
+
+  /** Идёт установка ретранслятора: щелчки по карте не добавляют точки маршрута. */
+  get placingRelay(): boolean {
+    return this.relayPlace !== null;
+  }
+
+  /** Поставить ретранслятор щелчком по карте; Esc — отмена. Готовый — в onDone, на карту его кладёт setRelays. */
+  startRelayPlace(template: RelayTemplate, onDone: (relay: Relay) => void, opts: { onCancel?: () => void } = {}) {
+    this.cancelZoneDraw();
+    this.cancelRelayPlace();
+    this.relayPlace = { template, onDone, onCancel: opts.onCancel, hint: null };
+    this.map.getContainer().style.cursor = 'crosshair';
+    this.map.on('mousemove', this.relayMove);
+    document.addEventListener('keydown', this.relayKey);
+  }
+
+  cancelRelayPlace() {
+    const p = this.relayPlace;
+    if (!p) return;
+    this.relayPlace = null;
+    p.hint?.remove();
+    this.map.getContainer().style.cursor = '';
+    this.map.off('mousemove', this.relayMove);
+    document.removeEventListener('keydown', this.relayKey);
+  }
+
+  private readonly relayMove = (e: L.LeafletMouseEvent) => {
+    const p = this.relayPlace;
+    if (!p) return;
+    const at = this.map.containerPointToLatLng(this.map.latLngToContainerPoint(e.latlng).add([0, -22]));
+    const icon = labelIcon(`Ретранслятор, ${relayText(p.template)} · щелчок — поставить, Esc — отмена`, RELAY_COLOR);
+    if (p.hint) p.hint.setLatLng(at);
+    else p.hint = L.marker(at, { interactive: false, keyboard: false, icon }).addTo(this.map);
+  };
+
+  private readonly relayKey = (e: KeyboardEvent) => {
+    if (e.key !== 'Escape' || !this.relayPlace) return;
+    const cancel = this.relayPlace.onCancel;
+    this.cancelRelayPlace();
+    cancel?.();
+  };
+
+  private relayClick(p: L.LatLng) {
+    const place = this.relayPlace!;
+    this.cancelRelayPlace();
+    place.onDone({ ...place.template, lat: p.lat, lon: p.lng });
+  }
+
+  /**
+   * Линия связи: НСУ → ретрансляторы (state.link.via) → борт, в цвете состояния (пунктир — связи
+   * нет); obstruction — главное препятствие (state.link.obstruction.at). null — убрать.
+   */
+  setLinkLine(path: readonly GeoPoint[] | null, status: LinkStatus | null, obstruction?: GeoPoint | null) {
+    this.linkBlock?.remove();
+    this.linkBlock = null;
+    if (!path || !status) {
+      this.linkLine.setLatLngs([]);
+      return;
+    }
+    this.linkLine.setLatLngs(path.map(ll));
+    this.linkLine.setStyle({ color: LINK_COLOR[status], dashArray: status === 'lost' ? '6 6' : status === 'poor' ? '10 4' : undefined });
+    if (obstruction && status !== 'good') {
+      this.linkBlock = L.circleMarker(ll(obstruction), { renderer: this.renderer, radius: 6, color: LINK_COLOR.lost, weight: 2, fillColor: '#000', fillOpacity: 0.5, interactive: false }).addTo(this.map);
+    }
+  }
+
+  /* --------------------------------- Зоны --------------------------------- */
+
+  /**
+   * Запретные зоны и зоны РЭБ: контур (запретная — пунктир со штриховкой), у РЭБ — кольцо, где
+   * помехи кончаются, подпись вида. Правый щелчок по зоне — onZoneContext.
+   */
+  setZones(zones: readonly Zone[]) {
+    this.zoneLayer.clearLayers();
+    this.zonesShown = zones.slice();
+    for (const z of zones) {
+      const color = ZONE_COLOR[z.kind];
+      const nofly = z.kind === 'nofly';
+      const style: L.PathOptions = {
+        renderer: this.zoneRenderer,
+        pane: 'zones',
+        color,
+        weight: 2,
+        opacity: 0.95,
+        dashArray: nofly ? '8 5' : undefined,
+        fillColor: color,
+        fillOpacity: nofly ? 0.2 : 0.14,
+      };
+      let shape: L.Path;
+      if (z.center && z.radiusM && z.radiusM > 0) shape = L.circle(ll(z.center), { ...style, radius: z.radiusM });
+      else if (z.polygon && z.polygon.length >= 3) shape = L.polygon(z.polygon.map(ll), style);
+      else continue;
+      if (nofly) shape.on('add', () => hatch(shape, color));
+      shape.bindTooltip(zoneTooltip(z), { sticky: true, direction: 'top' });
+      shape.on('contextmenu', (e: L.LeafletMouseEvent) => {
+        L.DomEvent.preventDefault(e.originalEvent);
+        L.DomEvent.stopPropagation(e);
+        if (!this.draw) this.onZoneContext?.(z.id);
+      });
+      shape.addTo(this.zoneLayer);
+      if (!nofly) {
+        const origin = z.center ?? z.polygon![0]!;
+        const falloff = prepareZones([z], origin)[0]?.falloffM ?? 0;
+        for (const line of zoneContour(z, falloff)) {
+          L.polyline(line.map(ll), { renderer: this.zoneRenderer, pane: 'zones', color, weight: 1, opacity: 0.75, dashArray: '2 6', interactive: false }).addTo(this.zoneLayer);
+        }
+      }
+      L.marker(ll(z.center ?? centroid(z.polygon!)), { pane: 'zones', interactive: false, keyboard: false, icon: labelIcon(zoneLabel(z), color) }).addTo(this.zoneLayer);
+    }
+  }
+
+  /** Идёт рисование зоны: щелчки по карте не добавляют точки маршрута. */
+  get drawingZone(): boolean {
+    return this.draw !== null;
+  }
+
+  /**
+   * Рисование зоны инструктором. Круг: щелчок — центр, второй щелчок — граница (радиус тянется
+   * за мышью). Многоугольник: щелчки по вершинам, конец — двойной щелчок или щелчок по первой
+   * вершине. Esc — отмена (onCancel). Готовая зона — в onDone, с новым id; на карту её кладёт
+   * setZones.
+   */
+  startZoneDraw(kind: ZoneKind, onDone: (zone: Zone) => void, opts: { shape?: 'circle' | 'polygon'; onCancel?: () => void } = {}) {
+    this.cancelZoneDraw();
+    this.cancelRelayPlace();
+    this.draw = {
+      kind,
+      shape: opts.shape ?? 'circle',
+      onDone,
+      onCancel: opts.onCancel,
+      pts: [],
+      preview: L.layerGroup().addTo(this.map),
+      dblZoom: this.map.doubleClickZoom.enabled(),
+    };
+    this.map.doubleClickZoom.disable();
+    this.map.getContainer().style.cursor = 'crosshair';
+    this.map.on('mousemove', this.drawMove);
+    this.map.on('dblclick', this.drawDouble);
+    document.addEventListener('keydown', this.drawKey);
+  }
+
+  cancelZoneDraw() {
+    const d = this.draw;
+    if (!d) return;
+    this.draw = null;
+    d.preview.remove();
+    if (d.dblZoom) this.map.doubleClickZoom.enable();
+    this.map.getContainer().style.cursor = '';
+    this.map.off('mousemove', this.drawMove);
+    this.map.off('dblclick', this.drawDouble);
+    document.removeEventListener('keydown', this.drawKey);
+  }
+
+  private readonly drawMove = (e: L.LeafletMouseEvent) => this.drawPreview(e.latlng);
+
+  private readonly drawDouble = () => {
+    if (this.draw?.shape === 'polygon') this.finishPolygon();
+  };
+
+  private readonly drawKey = (e: KeyboardEvent) => {
+    if (e.key !== 'Escape' || !this.draw) return;
+    const cancel = this.draw.onCancel;
+    this.cancelZoneDraw();
+    cancel?.();
+  };
+
+  private drawClick(p: L.LatLng) {
+    const d = this.draw!;
+    if (d.shape === 'circle') {
+      if (!d.pts.length) {
+        d.pts.push(p);
+        this.drawPreview(p);
+        return;
+      }
+      const r = this.map.distance(d.pts[0]!, p);
+      if (r >= MIN_ZONE_RADIUS_M) this.finishZone({ center: geo(d.pts[0]!), radiusM: Math.round(r) });
+      return;
+    }
+    if (d.pts.length >= 3 && this.nearPx(p, d.pts[0]!, 10)) return this.finishPolygon();
+    // Второй щелчок двойного — та же точка.
+    if (d.pts.length && this.nearPx(p, d.pts[d.pts.length - 1]!, 4)) return;
+    d.pts.push(p);
+    this.drawPreview(p);
+  }
+
+  private nearPx(a: L.LatLng, b: L.LatLng, px: number): boolean {
+    return this.map.latLngToContainerPoint(a).distanceTo(this.map.latLngToContainerPoint(b)) <= px;
+  }
+
+  private finishPolygon() {
+    const d = this.draw;
+    if (d && d.pts.length >= 3) this.finishZone({ polygon: d.pts.map(geo) });
+  }
+
+  private finishZone(shape: Pick<Zone, 'center' | 'radiusM' | 'polygon'>) {
+    const d = this.draw!;
+    const zone: Zone = { id: makeZoneId(this.zonesShown.map((z) => z.id)), kind: d.kind, ...shape };
+    this.cancelZoneDraw();
+    d.onDone(zone);
+  }
+
+  /** Предпросмотр: круг с радиусом до мыши или многоугольник с ребром к мыши, и подсказка. */
+  private drawPreview(mouse: L.LatLng) {
+    const d = this.draw;
+    if (!d) return;
+    const g = d.preview;
+    g.clearLayers();
+    const color = ZONE_COLOR[d.kind];
+    const opts: L.PathOptions = { renderer: this.zoneRenderer, pane: 'zones', color, weight: 2, dashArray: '4 4', fillColor: color, fillOpacity: 0.1, interactive: false };
+    let hint: string;
+    if (d.shape === 'circle') {
+      const c = d.pts[0];
+      if (c) {
+        const r = this.map.distance(c, mouse);
+        L.circle(c, { ...opts, radius: r }).addTo(g);
+        L.polyline([c, mouse], { ...opts, weight: 1 }).addTo(g);
+        hint = `${ZONE_TITLE[d.kind]} · радиус ${fmtM(r)} · щелчок — граница, Esc — отмена`;
+      } else hint = `${ZONE_TITLE[d.kind]} · щелчок — центр, Esc — отмена`;
+    } else {
+      if (d.pts.length) {
+        L.polygon([...d.pts, mouse], opts).addTo(g);
+        L.circleMarker(d.pts[0]!, { renderer: this.zoneRenderer, pane: 'zones', radius: 6, color, weight: 2, fillColor: '#000', fillOpacity: 0.5, interactive: false }).addTo(g);
+      }
+      hint =
+        d.pts.length < 3
+          ? `${ZONE_TITLE[d.kind]} · щелчки — вершины, Esc — отмена`
+          : `${ZONE_TITLE[d.kind]} · двойной щелчок или первая вершина — готово, Esc — отмена`;
+    }
+    const at = this.map.containerPointToLatLng(this.map.latLngToContainerPoint(mouse).add([0, -22]));
+    L.marker(at, { pane: 'zones', interactive: false, keyboard: false, icon: labelIcon(hint, color) }).addTo(g);
   }
 }

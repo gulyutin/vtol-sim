@@ -1,15 +1,29 @@
 import { takeoffMassKg } from '../sim/aero';
 import { AIRCRAFT } from '../sim/aircraft';
-import { distanceM } from '../sim/mission';
+import { LINK_TIMEOUT_S } from '../sim/failures';
+import { backTransitionAltitudeM, distanceM, transitionAltitudeM } from '../sim/mission';
 import { windComponents, type WindProcedures } from '../sim/procedures';
-import { lineOfSight } from '../sim/radio';
+import { BOARD_ANTENNA_M, LINK_LOST_DB, LinkNetwork, linkAlongNetwork, linkJamDb, minLinkAltitudeM, RADIO, type Relay, type Station } from '../sim/radio';
+import type { TerrainWind } from '../sim/terrainWind';
 import type { MissionPlan, Site, Terrain, Weather } from '../sim/types';
 import { windAt } from '../sim/wind';
+import {
+  EW_EFFECT_THRESHOLD,
+  isEwZone,
+  routeZoneCrossings,
+  routeZoneExposure,
+  zoneEffectsAt,
+  zoneKindPhrase,
+  zoneLabel,
+  type RoutePoint3D,
+  type Zone,
+  type ZoneKind,
+} from '../sim/zones';
 import { PRECIPITATION_NAME } from './weather';
 
 /*
  * Предполётные проверки по РЛЭ: метеоусловия, лётные ограничения, взлётный маршрут,
- * прямая видимость с НСУ. Пороги — из профиля аппарата.
+ * связь с НСУ вдоль маршрута. Пороги — из профиля аппарата.
  */
 
 export interface Check {
@@ -26,8 +40,14 @@ export interface PreflightInput {
   /** Нижняя граница облаков по заданию, м; если она есть в погоде (weather.cloudBaseM) — берётся оттуда. */
   cloudBaseM: number;
   terrain: Terrain;
-  /** Площадка НСУ; антенна — на 3 м над ней. */
+  /** Площадка НСУ; антенна — на RADIO.groundAntennaM над ней. */
   gcs: Site;
+  /** Запретные зоны и зоны РЭБ (zones.ts) — см. zoneChecks. */
+  zones?: readonly Zone[];
+  /** Ретрансляторы (radio.ts) — для проверки связи вдоль маршрута. */
+  relays?: readonly Relay[];
+  /** Ветер у рельефа по прогнозной погоде (terrainWind.ts) — см. terrainWindChecks. */
+  terrainWind?: TerrainWind;
 }
 
 /** Меньше — полёт запрещён (туман); меньше SURVEY_VISIBILITY_M — не видно, что снимать. */
@@ -104,27 +124,159 @@ export function preflightChecks(o: PreflightInput): Check[] {
     `Взлётный маршрут: первая точка в ${fmt(Math.min(...dep))} м, зависание на ${AIRCRAFT.vtol.transitionHeightM} м — не ближе ${AIRCRAFT.procedures.departureDistanceM} м и не ниже ${AIRCRAFT.procedures.minHoverHeightM} м`,
   );
 
-  // Прямая видимость от антенны НСУ до всех точек маршрута (прореживаем до ~200 проверок).
-  const antenna = { lat: o.gcs.lat, lon: o.gcs.lon, altitudeM: o.gcs.elevationM + 3 };
-  const pts = o.stages.flatMap((s) => s.waypoints);
-  const step = Math.max(1, Math.floor(pts.length / 200));
-  let lost = 0;
-  let checked = 0;
-  let far = 0;
-  for (let i = 0; i < pts.length; i += step) {
-    const los = lineOfSight(o.terrain, antenna, pts[i]!);
-    checked++;
-    far = Math.max(far, los.distanceM);
-    if (!los.clear) lost++;
-  }
-  add(
-    lost === 0 && far <= L.radioRangeM,
-    'warn',
-    lost === 0
-      ? `Прямая видимость с НСУ по всему маршруту, до ${fmt(far / 1000, 1)} км`
-      : `Рельеф закрывает связь с НСУ на ${fmt((100 * lost) / checked)} % маршрута — борт пройдёт его автономно`,
-  );
+  checks.push(linkCheck(o));
+  if (o.zones?.length) checks.push(...zoneChecks(o.stages, o.zones, o.gcs));
+  if (o.terrainWind) checks.push(...terrainWindChecks(o.stages, o.terrainWind));
   return checks;
+}
+
+/**
+ * Связь с НСУ на самолётной части всех полётов задания (radio.ts): рельеф, дальность,
+ * ретрансляторы, помеха у НСУ. Где связи не будет — самый длинный участок, хватит ли на нём
+ * таймаута до ВОЗВРАТА и с какой высоты там связь есть.
+ */
+export function linkCheck(o: Pick<PreflightInput, 'stages' | 'terrain' | 'gcs' | 'zones' | 'relays'>): Check {
+  const antenna: Station = { lat: o.gcs.lat, lon: o.gcs.lon, altitudeM: o.gcs.elevationM + RADIO.groundAntennaM };
+  const ew = (o.zones ?? []).filter(isEwZone);
+  const gcsJamDb = ew.length ? linkJamDb(zoneEffectsAt(ew, o.gcs, antenna.altitudeM).linkJam) : 0;
+  const net = new LinkNetwork(o.terrain, antenna, o.relays ?? [], undefined, gcsJamDb);
+  const v = AIRCRAFT.vtol;
+  let lost = 0;
+  let poor = 0;
+  let far = 0;
+  let min = Infinity;
+  // Самый длинный участок без связи; присваивается в замыкании — тип задан явно.
+  let worst = null as { stage: number; fromM: number; lengthM: number; s: number; point: Station; los: boolean } | null;
+  o.stages.forEach((st, i) => {
+    const path: Station[] = [
+      { lat: st.takeoff.lat, lon: st.takeoff.lon, altitudeM: transitionAltitudeM(st) },
+      ...st.waypoints,
+      { lat: st.landing.lat, lon: st.landing.lon, altitudeM: backTransitionAltitudeM(st) },
+    ];
+    const r = linkAlongNetwork(net, path, { maxPoints: 300 });
+    lost += r.lostM;
+    poor += r.poorM;
+    far = Math.max(far, r.farthestM);
+    min = Math.min(min, r.minMarginDb);
+    for (const x of r.lostStretches) {
+      const len = x.toM - x.fromM;
+      if (worst && len <= worst.lengthM) continue;
+      const inside = r.points.filter((p) => p.alongM >= x.fromM && p.alongM <= x.toM);
+      const w = inside.reduce((a, b) => (b.marginDb < a.marginDb ? b : a), inside[0] ?? r.points[0]!);
+      worst = { stage: i, fromM: x.fromM, lengthM: len, s: len / Math.max(1, st.iasMs), point: w.point, los: w.los };
+    }
+  });
+  // Борт на земле в пункте посадки вдали от НСУ (у доставки — разгрузка и взлёт обратно).
+  const deaf = o.stages.some(
+    (st) => distanceM(st.landing, antenna) > 500 && net.link({ lat: st.landing.lat, lon: st.landing.lon, altitudeM: st.landing.elevationM + BOARD_ANTENNA_M }).marginDb < LINK_LOST_DB,
+  );
+  const onGround = 'на земле в пункте посадки связи с НСУ нет — телеметрии не будет, команды только с ПДУ расчёта; нужен ретранслятор';
+  if (!worst) {
+    if (deaf) return { ok: false, level: 'warn', text: `Связь с НСУ в полёте по всему маршруту, до ${fmtDistance(far)}, но ${onGround}` };
+    return poor > 0
+      ? { ok: true, level: 'warn', text: `Связь с НСУ по всему маршруту, до ${fmtDistance(far)}; слабая на ${fmtDistance(poor)} (запас до ${fmt(min)} дБ) — телеметрия с пропусками` }
+      : { ok: true, level: 'warn', text: `Связь с НСУ по всему маршруту, до ${fmtDistance(far)}, запас не меньше ${fmt(min)} дБ` };
+  }
+  const w = worst;
+  const where = o.stages.length > 1 ? ` (полёт ${w.stage + 1})` : '';
+  const why = gcsJamDb > 0 ? 'помеха у НСУ' : w.los ? 'далеко от НСУ' : 'рельеф закрывает НСУ';
+  const alt = minLinkAltitudeM(net, w.point, { maxAglM: AIRCRAFT.limits.maxAltitudeM });
+  const fix = alt !== null && alt <= AIRCRAFT.limits.maxAltitudeM ? `связь там — с высоты ${fmt(Math.ceil(alt / 10) * 10)} м над морем или через ретранслятор` : 'нужен ретранслятор';
+  const then = w.s > LINK_TIMEOUT_S ? `это ~${fmt(w.s)} с без связи: через ${LINK_TIMEOUT_S} с автопилот уйдёт на ВОЗВРАТ, задание прервётся` : 'борт пройдёт его без телеметрии';
+  return {
+    ok: false,
+    level: 'warn',
+    text: `Нет связи с НСУ на ${fmtDistance(lost)} маршрута; самый длинный участок${where} — ${fmtDistance(w.lengthM)} с ${fmtDistance(w.fromM)} от взлёта (${why}): ${then}; ${fix}${deaf ? `; ${onGround}` : ''}`,
+  };
+}
+
+/** Маршрут ближе этого к запретной зоне — предупреждение, м. */
+const NOFLY_MARGIN_M = 200;
+
+const EW_CONSEQUENCE: Record<Exclude<ZoneKind, 'nofly'>, string> = {
+  'gnss-jam': 'ГНСС будет подавлен — автопилот пойдёт по счислению, место на карте уйдёт от истинного; после выхода повторный захват до 35 с',
+  'gnss-spoof': 'возможна подмена ГНСС — место уведут незаметно для карты; сверять путевую скорость и угол с приборной, курсом и ветром',
+  'link-jam': `связь с НСУ пропадёт — команды не дойдут, через ${LINK_TIMEOUT_S} с автопилот уйдёт на ВОЗВРАТ, задание прервётся`,
+};
+
+/** Путь полёта с высотами над уровнем моря: вертикальный взлёт, точки маршрута, посадка. */
+function stageRoute(p: MissionPlan): RoutePoint3D[] {
+  return [
+    { lat: p.takeoff.lat, lon: p.takeoff.lon, altitudeM: p.takeoff.elevationM },
+    { lat: p.takeoff.lat, lon: p.takeoff.lon, altitudeM: transitionAltitudeM(p) },
+    ...p.waypoints.map((w) => ({ lat: w.lat, lon: w.lon, altitudeM: w.altitudeM })),
+    { lat: p.landing.lat, lon: p.landing.lon, altitudeM: backTransitionAltitudeM(p) },
+    { lat: p.landing.lat, lon: p.landing.lon, altitudeM: p.landing.elevationM },
+  ];
+}
+
+/**
+ * Проверки по зонам для всех этапов задания: заход в запретную зону — взлёт запрещён;
+ * проход рядом с ней и через зоны РЭБ — предупреждения с тем, что будет. gcs — площадка НСУ.
+ */
+export function zoneChecks(stages: readonly MissionPlan[], zones: readonly Zone[], gcs?: Site): Check[] {
+  const checks: Check[] = [];
+  if (!zones.length) return checks;
+  const nofly = zones.filter((z) => z.kind === 'nofly');
+  const ew = zones.filter(isEwZone);
+  let crossed = false;
+  let exposed = false;
+  stages.forEach((st, i) => {
+    const where = stages.length > 1 ? ` (полёт ${i + 1})` : '';
+    const route = stageRoute(st);
+    const hits = routeZoneCrossings(nofly, route);
+    for (const c of hits) {
+      crossed = true;
+      checks.push({ ok: false, level: 'block', text: `Маршрут${where} заходит в запретную зону «${zoneLabel(c.zone)}» в ${fmtDistance(c.atM)} от взлёта — перестроить в обход` });
+    }
+    for (const c of routeZoneCrossings(nofly, route, NOFLY_MARGIN_M)) {
+      if (hits.some((h) => h.zone === c.zone)) continue;
+      checks.push({ ok: false, level: 'warn', text: `Маршрут${where} проходит ближе ${NOFLY_MARGIN_M} м от запретной зоны «${zoneLabel(c.zone)}» — снос или разворот могут завести в неё` });
+    }
+    for (const x of routeZoneExposure(ew, route)) {
+      exposed = true;
+      const kind = x.zone.kind as Exclude<ZoneKind, 'nofly'>;
+      checks.push({
+        ok: false,
+        level: 'warn',
+        text: `Маршрут${where} проходит через зону ${zoneKindPhrase(x.zone)}: ${fmtDistance(x.lengthM)} с ${fmtDistance(x.atM)} от взлёта — ${EW_CONSEQUENCE[kind]}`,
+      });
+    }
+  });
+  if (gcs && zoneEffectsAt(ew, gcs, gcs.elevationM + 3).linkJam >= EW_EFFECT_THRESHOLD)
+    checks.push({ ok: false, level: 'warn', text: 'НСУ в зоне подавления связи — связи с бортом не будет' });
+  const takeoff = stages[0]?.takeoff;
+  if (takeoff && zoneEffectsAt(ew, takeoff, takeoff.elevationM + 2).gnssJam >= EW_EFFECT_THRESHOLD)
+    checks.push({ ok: false, level: 'warn', text: 'Площадка взлёта в зоне подавления ГНСС — решения ГНСС на земле не будет' });
+  if (nofly.length && !crossed) checks.push({ ok: true, level: 'block', text: `Запретные зоны (${nofly.length}): маршрут в них не заходит` });
+  if (ew.length && !exposed) checks.push({ ok: true, level: 'warn', text: `Зоны РЭБ (${ew.length}): маршрут вне их действия` });
+  return checks;
+}
+
+/** Опасность у площадки от этого уровня — предупреждение (terrainWind.ts windHazardAt). */
+const WIND_HAZARD_WARN = 0.3;
+
+/**
+ * Ветер у рельефа на площадках взлёта и посадки при прогнозном ветре: подветренная сторона хребта,
+ * гребень или седловина, долина, термики, ночной сток. Планировщик считает по ровному ветру —
+ * здесь то, чего он не видит. Площадка, общая для нескольких полётов, — одной строкой.
+ */
+export function terrainWindChecks(stages: readonly MissionPlan[], tw: TerrainWind): Check[] {
+  if (!tw.active) return [];
+  const sites: { p: Site; names: string[] }[] = [];
+  const put = (p: Site, name: string) => {
+    const s = sites.find((x) => distanceM(x.p, p) < 50);
+    if (!s) sites.push({ p, names: [name] });
+    else if (!s.names.includes(name)) s.names.push(name);
+  };
+  for (const st of stages) {
+    put(st.takeoff, 'взлёта');
+    put(st.landing, 'посадки');
+  }
+  return sites.map(({ p, names }) => {
+    const hz = tw.windHazardAtPoint(p);
+    return { ok: hz.level < WIND_HAZARD_WARN, level: 'warn', text: `Ветер у площадки ${names.join(' и ')}: ${hz.text[0]!.toLowerCase()}${hz.text.slice(1)}` };
+  });
 }
 
 export const blocked = (checks: Check[]) => checks.some((c) => !c.ok && c.level === 'block');

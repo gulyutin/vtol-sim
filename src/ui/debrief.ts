@@ -1,6 +1,7 @@
 import { PROFILE } from '@profile';
 import { parseRecording, serialize, stateAt, summarize, type Recording, type Sample } from '../game/recorder';
 import type { Assessment } from '../game/scoring';
+import { flightConclusion, type ConclusionContext } from '../game/flightSummary';
 import { MODE_NAMES } from '../sim/flight';
 import './debrief.css';
 
@@ -176,6 +177,7 @@ export class Debrief {
       <div class="win-title"><span class="db-title">Разбор полёта</span><button class="x" data-db="close" title="Закрыть">✕</button></div>
       <div class="win-body">
         <div class="db-meta"></div>
+        <p class="db-conclusion"></p>
         <div class="db-player">
           <button class="db-btn db-play" data-db="play" title="Пуск / пауза (пробел)">▶</button>
           <span class="db-time">T+0:00 / 0:00</span>
@@ -305,8 +307,8 @@ export class Debrief {
     return this.rec;
   }
 
-  /** Показать запись (и оценку). Время — в начало записи, onSeek сообщает его хозяину. */
-  show(rec: Recording, assessment?: Assessment): void {
+  /** Показать запись (и оценку). Время — в начало записи, onSeek сообщает его хозяину. ctx — план и ёмкость для вывода. */
+  show(rec: Recording, assessment?: Assessment, ctx?: ConclusionContext): void {
     if (!rec.samples.length) throw new Error('Запись пуста');
     this.pause();
     this.rec = rec;
@@ -317,7 +319,7 @@ export class Debrief {
     this.layer = null;
     this.nowEvent = -1;
     this.error(null);
-    this.renderText(rec, assessment);
+    this.renderText(rec, assessment, ctx);
     this.el.hidden = false;
     this.seek(this.t0);
   }
@@ -388,8 +390,8 @@ export class Debrief {
     e.textContent = text ?? '';
   }
 
-  /** Текстовые части окна: заголовок, итоги, оценка, события, легенда. */
-  private renderText(rec: Recording, a?: Assessment) {
+  /** Текстовые части окна: заголовок, вывод, итоги, оценка, события, легенда. */
+  private renderText(rec: Recording, a?: Assessment, ctx?: ConclusionContext) {
     const m = rec.meta;
     this.q<HTMLElement>('.db-title').textContent = `Разбор полёта — ${m.title}`;
     const d = new Date(m.startedAt);
@@ -397,6 +399,7 @@ export class Debrief {
     this.q<HTMLElement>('.db-meta').textContent = [m.source === 'log' ? 'бортовой журнал' : 'симулятор', m.profileTitle, when]
       .filter(Boolean)
       .join(' · ');
+    this.q<HTMLElement>('.db-conclusion').textContent = flightConclusion({ rec, assessment: a, ...ctx });
 
     const s = summarize(rec);
     const dist = s.distanceM >= 1000 ? `${fmt(s.distanceM / 1000, 1)} км` : `${fmt(s.distanceM)} м`;

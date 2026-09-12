@@ -1,4 +1,5 @@
 import type { LiveState } from '../sim/flight';
+import { isZone, type Zone } from '../sim/zones';
 
 /*
  * Запись полёта для разбора: компактные отсчёты состояния с постоянной частотой плюс
@@ -8,6 +9,16 @@ import type { LiveState } from '../sim/flight';
  */
 
 export type EventKind = 'info' | 'warn' | 'bad' | 'cmd';
+
+/**
+ * Вид события по тексту — для событий LiveFlight.events и envEvents: авария, отказ и вход в
+ * запретную зону — bad; помехи РЭБ и прочие события зон — warn (в оценке их считают отдельно).
+ */
+export function eventKindOf(text: string): EventKind {
+  if (/^(АВАРИЯ|ОТКАЗ|ЗАПРЕТНАЯ ЗОНА: вход)/u.test(text)) return 'bad';
+  if (/^(РЭБ:|ЗАПРЕТНАЯ ЗОНА:|ГНСС: (нет решения|срыв)|Нет связи с НСУ: помехи)/u.test(text)) return 'warn';
+  return 'info';
+}
 
 /** Отсчёт состояния. Локальные метры — восток, север, вверх от площадки взлёта. */
 export interface Sample {
@@ -51,6 +62,8 @@ export interface RecordingMeta {
   /** Точка посадки задания в локальных метрах — для промаха в разборе. */
   landing?: { east: number; north: number };
   difficulty?: string;
+  /** Запретные зоны и зоны РЭБ на конец полёта — чтобы нарисовать их в разборе. */
+  zones?: Zone[];
 }
 
 export interface Recording {
@@ -356,6 +369,7 @@ export function parseRecording(text: string): Recording {
   if (typeof m.scenarioId === 'string') meta.scenarioId = m.scenarioId;
   if (typeof m.difficulty === 'string') meta.difficulty = m.difficulty;
   if (isObj(m.landing) && num(m.landing.east) && num(m.landing.north)) meta.landing = { east: m.landing.east, north: m.landing.north };
+  if (Array.isArray(m.zones)) meta.zones = m.zones.filter(isZone);
 
   let objects: Record<string, unknown>[];
   if (Array.isArray(raw.rows)) {

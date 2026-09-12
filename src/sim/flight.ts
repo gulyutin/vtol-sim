@@ -2,11 +2,24 @@ import { AIRCRAFT } from './aircraft';
 import { brakeDecel, climbPowerW, HOVER_TRANSLATE_MS, hoverPowerW, polar, takeoffMassKg } from './aero';
 import { airDensity, batteryCapacityWh, G, RHO0, tasFromIas, temperatureAt } from './atmosphere';
 import { failureInfo, FIRE_TO_POWER_S, LINK_TIMEOUT_S, RC_RANGE_M, type FailureId } from './failures';
-import { fromLocal, toLocal } from './mission';
+import { backTransitionAltitudeM, fromLocal, toLocal, transitionAltitudeM } from './mission';
 import { windProcedures } from './procedures';
+import { BOARD_ANTENNA_M, linkJamDb, RADIO, RadioLink, TELEMETRY_HZ, type LinkNetwork, type LinkState, type RadioParams, type Relay, type Station } from './radio';
+import type { LocalWind, TerrainWind } from './terrainWind';
 import { Turbulence, type Gust, type SunDirection } from './turbulence';
 import type { MissionPlan, Site, Terrain, Weather, Wind } from './types';
 import { windAt, windTriangle } from './wind';
+import {
+  EW_EFFECT_THRESHOLD,
+  EW_RELEASE_THRESHOLD,
+  localEffects,
+  localSignedDistance,
+  prepareZones,
+  zoneKindPhrase,
+  type LocalEffects,
+  type LocalZone,
+  type Zone,
+} from './zones';
 
 /*
  * Живой полёт: шаг за шагом, с командами оператора, как в НСУ. Физика та же, что
@@ -94,6 +107,40 @@ const RC_LOSS_S = 5;
 /** Пожар: лишний разряд батареи, Вт. */
 const FIRE_DRAIN_W = 400;
 
+/*
+ * Зоны РЭБ (zones.ts) — условие среды, а не отказ: вышел из зоны — прошло. Механизмы те же, что
+ * у отказов ГНСС и связи: счисление по ПВД и ветру, замершая телеметрия, ВОЗВРАТ по таймауту.
+ */
+/** Повторный захват ГНСС после помех: от 5 с после короткого перерыва до ~35 с после долгого, с. */
+const GNSS_REACQ_MIN_S = 5;
+const GNSS_REACQ_LONG_S = 25;
+const GNSS_REACQ_LONG_OUTAGE_S = 600;
+const GNSS_REACQ_JITTER_S = 5;
+/** Подмена захватывает приёмник, если ложный сигнал сильнее настоящего столько секунд. */
+const SPOOF_CAPTURE_S = 4;
+/** Увод места подменой: ускорение и предельная скорость — медленно, чтобы автопилот не счёл скачком. */
+const SPOOF_ACCEL = 0.04;
+const SPOOF_MAX_MS = 10;
+/** Достоверное решение вернулось — оценка места сходится к истинному с такой постоянной времени, с. */
+const NAV_CONVERGE_S = 8;
+/** Ветер, известный автопилоту, сглаживается за столько; расхождение с ним — за столько, с. */
+const WIND_REF_TAU_S = 180;
+const MISMATCH_TAU_S = 3;
+/** Запретная зона ближе — предупреждение на НСУ, м. */
+const NOFLY_NEAR_M = 1000;
+
+/*
+ * ВОЗВРАТ по РЛЭ — не ниже безопасной высоты над рельефом по всему пути домой: запас RTL_CLEARANCE_M,
+ * набор закладывается не круче RTL_CLIMB_SHARE предельного (нисходящие потоки, запас). Ниже нужной
+ * высоты больше чем на RTL_ORBIT_SLACK_M — сначала набор по кругу над местом; снижение — только когда путь чист.
+ */
+const RTL_CLEARANCE_M = Math.max(60, 2 * AIRCRAFT.minClearanceM);
+const RTL_CLIMB_SHARE = 0.7;
+const RTL_ORBIT_SLACK_M = 25;
+/** Шаг выборки рельефа по пути домой, м; пересчёт нужной высоты — раз в столько секунд. */
+const RTL_STEP_M = 100;
+const RTL_NEED_PERIOD_S = 1;
+
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 const wrap180 = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
 const norm360 = (d: number) => ((d % 360) + 360) % 360;
@@ -157,6 +204,58 @@ const RC_COMMANDS: Command[] = ['failsafe', 'copter', 'disarm', 'auto', 'rtl'];
 /** Отказы, после которых аппарат неуправляем. */
 const FATAL: FailureId[] = ['power', 'autopilot', 'boom', 'wing'];
 const ZERO_STICK: Stick = { roll: 0, pitch: 0, yaw: 0, throttle: 0 };
+/** Режимы на земле: запретная зона под площадкой — ещё не нарушение. */
+const ON_GROUND: LiveMode[] = ['ground', 'spool', 'landed', 'crashed'];
+
+/**
+ * Обстановка по зонам (zones.ts). В state — как на самом деле (для инструктора); в telemetry —
+ * что знает борт: подмены он не видит (gnssSpoof, spoofed, spoofOffsetM — нули), запретные
+ * зоны — по месту, где себя считает.
+ */
+export interface EwState {
+  /** Уровень помех ГНСС и радиоканалу 0…1 — на борту его показывают индикаторы помех приёмника и модема. */
+  gnssJam: number;
+  gnssSpoof: number;
+  linkJam: number;
+  /** Запретные зоны, в которых борт (в воздухе). */
+  noflyIds: string[];
+  /** Ближайшая запретная зона ближе 1 км, если борт не в ней. */
+  noflyNear: { id: string; distanceM: number } | null;
+  /** Решение ГНСС: есть; нет (помехи или отказ); повторный захват после помех. */
+  gnss: 'ok' | 'lost' | 'acquiring';
+  /** Приёмник захвачен подменой; на сколько уведено место, м. */
+  spoofed: boolean;
+  spoofOffsetM: number;
+  /**
+   * Расхождение навигации, м/с: ветер «путевая по ГНСС − воздушная по курсу» против того же
+   * ветра, сглаженного за 3 мин. В ровном полёте — около нуля, в болтанку — 1–2 м/с, при
+   * подмене растёт со скоростью увода: по нему (и по «ветру», которого нет) её и замечают.
+   */
+  navMismatchMs: number;
+}
+
+const emptyEw = (): EwState => ({
+  gnssJam: 0,
+  gnssSpoof: 0,
+  linkJam: 0,
+  noflyIds: [],
+  noflyNear: null,
+  gnss: 'ok',
+  spoofed: false,
+  spoofOffsetM: 0,
+  navMismatchMs: 0,
+});
+
+/** Событие среды: вход, выход, зона появилась вокруг борта. */
+function zoneEvent(z: Zone, what: 'in' | 'out' | 'new'): string {
+  if (z.kind === 'nofly') {
+    const name = z.name?.trim();
+    const verb = what === 'in' ? 'вход' : what === 'out' ? 'выход' : 'борт внутри новой зоны';
+    return `ЗАПРЕТНАЯ ЗОНА: ${verb}${name ? `${what === 'in' ? ' в' : what === 'out' ? ' из' : ''} «${name}»` : ''}`;
+  }
+  const verb = what === 'in' ? 'вход в зону' : what === 'out' ? 'выход из зоны' : 'борт внутри новой зоны';
+  return `РЭБ: ${verb} ${zoneKindPhrase(z)}`;
+}
 
 export interface PathPoint {
   east: number;
@@ -236,6 +335,10 @@ export interface LiveState {
   failures: FailureId[];
   /** Нет связи с НСУ: команды не доходят, телеметрия замерла (см. telemetry). */
   linkLost: boolean;
+  /** Радиолиния (radio.ts): запас, сила сигнала, потери, частота телеметрии, через что, почему плохо. */
+  link: LinkState;
+  /** Сила сигнала 0…1 для индикатора и голоса; 0 — связи нет (и по отказу). */
+  linkQuality: number;
   /** Место по навигации автопилота — его и показывает НСУ; без ГНСС уходит от истинного. */
   estimate: { east: number; north: number };
   /** Показания ПВД, м/с: с порывами и при отказе ПВД — не то, что на самом деле. */
@@ -244,6 +347,8 @@ export interface LiveState {
   gustMs: number;
   /** В «Фэйлсейфе»: самолётом или коптером ведёт пилот; вне его — null. */
   failsafePhase: 'plane' | 'copter' | null;
+  /** Помехи и запретные зоны (zones.ts): для тревог на НСУ и окна инструктора. */
+  ew: EwState;
 }
 
 export interface FlightSetup {
@@ -263,6 +368,19 @@ export interface FlightSetup {
   seed?: number;
   /** Солнце — для термиков над склонами (turbulence.ts). */
   sun?: SunDirection | ((t: number) => SunDirection);
+  /**
+   * Ветер у рельефа (terrainWind.ts) для этой погоды, от того же начала координат (origin): местный
+   * ветер, нисходящие и восходящие потоки, роторы за грядами, термики. Без него — ветер погоды.
+   */
+  terrainWind?: TerrainWind;
+  /** Запретные зоны и зоны РЭБ; менять в полёте — setZones(). */
+  zones?: readonly Zone[];
+  /** Площадка НСУ (антенна — RADIO.groundAntennaM над ней); по умолчанию — origin. */
+  gcs?: Site;
+  /** Ретрансляторы; менять в полёте — setRelays(). */
+  relays?: readonly Relay[];
+  /** Параметры радиолинии вместо RADIO (для тестов). */
+  radio?: Partial<RadioParams>;
 }
 
 export class LiveFlight {
@@ -293,10 +411,18 @@ export class LiveFlight {
   /** Посадочный маршрут для ВОЗВРАТА: две точки захода и этап. */
   private rtlApproach: PathPoint[] = [];
   private rtlStage = 0;
+  /** ВОЗВРАТ: высота, нужная в каждой точке захода до дома; наклон набора; набор по кругу над местом. */
+  private rtlRest: number[] = [];
+  private rtlGrad = 0.1;
+  private rtlClimb: { east: number; north: number } | null = null;
+  private rtlNeedCache = { t: -Infinity, stage: -1, up: 0 };
   private finalLeg: number | undefined;
 
   private readonly rand: () => number;
   private readonly turb: Turbulence | null;
+  /** Поле ветра у рельефа и ветер у борта на этом шаге (null — ветер погоды). */
+  private readonly tw: TerrainWind | null;
+  private lw: LocalWind | null = null;
   /** Порыв сейчас и он же, сглаженный инерцией аппарата. */
   private gust: Gust = { e: 0, n: 0, u: 0 };
   private gustLp: Gust = { e: 0, n: 0, u: 0 };
@@ -335,6 +461,32 @@ export class LiveFlight {
   private iasHold = 0;
   private rcLostS = 0;
 
+  /** События среды для инструктора и разбора — по истинному месту: вход и выход из зон, подмена. */
+  readonly envEvents: { t: number; text: string }[] = [];
+  private zones: LocalZone[] = [];
+  /** Зоны, в которых борт сейчас (запретные — только в воздухе), по id. */
+  private inside = new Map<string, Zone>();
+  /** Своя случайность у среды: полёт без зон идёт ровно так же, как без этой модели. */
+  private readonly ewRand: () => number;
+  private ewGnss: 'ok' | 'lost' | 'acquiring' = 'ok';
+  private gnssLostT = 0;
+  private acquireLeft = 0;
+  private spoofHold = 0;
+  private spoofT = 0;
+  private spoofDir = { e: 0, n: 0 };
+  /** Увод места подменой и его скорость, м и м/с. */
+  private spoof = { e: 0, n: 0 };
+  private spoofVel = { e: 0, n: 0 };
+  /** Оценка места сходится к истинной после помех. */
+  private converging = false;
+  /** Радиолиния НСУ ↔ борт; кадр телеметрии, дошедший последним при больших потерях, и фаза приёма. */
+  private readonly radio: RadioLink;
+  private rxFrame: LiveState | null = null;
+  private rxPhase = 0;
+  private linkLostT = 0;
+  private windRef: { e: number; n: number } | null = null;
+  private mismatch = 0;
+
   constructor(setup: FlightSetup) {
     const { plan } = setup;
     this.site = setup.origin ?? plan.takeoff;
@@ -354,7 +506,16 @@ export class LiveFlight {
     const energy = setup.initialEnergyWh ?? 0;
     const seed = setup.seed ?? 1;
     this.rand = rng(seed);
-    this.turb = (setup.weather.turbulenceMs ?? 0) > 0 ? new Turbulence(seed, setup.weather, setup.terrain, this.site, setup.sun) : null;
+    this.ewRand = rng(seed ^ 0x2f6b1d3);
+    this.tw = setup.terrainWind?.active ? setup.terrainWind : null;
+    const o = this.tw?.relief.origin;
+    if (o && (Math.abs(o.lat - this.site.lat) > 1e-9 || Math.abs(o.lon - this.site.lon) > 1e-9)) throw new Error('Поле ветра рельефа построено от другого начала координат');
+    // С полем рельефа пульсации есть и без турбулентности в погоде — роторы за грядами.
+    this.turb =
+      (setup.weather.turbulenceMs ?? 0) > 0 || this.tw ? new Turbulence(seed, setup.weather, setup.terrain, this.site, setup.sun, this.tw ?? undefined) : null;
+    const gcs = setup.gcs ?? this.site;
+    const mast = setup.radio?.groundAntennaM ?? RADIO.groundAntennaM;
+    this.radio = new RadioLink(setup.terrain, { lat: gcs.lat, lon: gcs.lon, altitudeM: gcs.elevationM + mast }, setup.relays ?? [], setup.radio);
     this.state = {
       t: setup.startT ?? 0,
       mode: 'ground',
@@ -384,11 +545,16 @@ export class LiveFlight {
       reason: null,
       failures: [],
       linkLost: false,
+      link: this.radio.state,
+      linkQuality: 1,
       estimate: { east: takeoff.east, north: takeoff.north },
       iasReadingMs: 0,
       gustMs: 0,
       failsafePhase: null,
+      ew: emptyEw(),
     };
+    if (setup.zones) this.setZones(setup.zones, true);
+    this.linkTick(0, this.state.ew.linkJam);
   }
 
   private local(p: { lat: number; lon: number }, up: number, routeLeg?: number): PathPoint {
@@ -400,10 +566,11 @@ export class LiveFlight {
     this.finalLeg = plan.waypoints[plan.waypoints.length - 1]?.routeLeg;
     const takeoff = this.local(plan.takeoff, plan.takeoff.elevationM - this.site.elevationM);
     const landing = this.local(plan.landing, plan.landing.elevationM - this.site.elevationM);
+    // Высоты перехода — по плану: у крутого рельефа вертикальный набор и снижение длиннее.
     return [
-      { ...takeoff, up: takeoff.up + VT.transitionHeightM },
+      { ...takeoff, up: transitionAltitudeM(plan) - this.site.elevationM },
       ...plan.waypoints.map((w) => this.local(w, w.altitudeM - this.site.elevationM, w.routeLeg)),
-      { ...landing, up: landing.up + VT.backTransitionHeightM },
+      { ...landing, up: backTransitionAltitudeM(plan) - this.site.elevationM },
     ];
   }
 
@@ -460,19 +627,44 @@ export class LiveFlight {
    * дошедший кадр (время в нём — время потери связи).
    */
   get telemetry(): LiveState {
-    return this.state.linkLost && this.frozen ? this.frozen : this.snapshot();
+    const s = this.state;
+    // При больших потерях — последний дошедший кадр; качество связи НСУ знает сама — оно текущее.
+    const frame = s.linkLost && this.frozen ? this.frozen : this.rxFrame;
+    return frame ? { ...frame, linkLost: s.linkLost, link: s.link, linkQuality: s.linkQuality } : this.snapshot();
   }
 
   /** Борт в зоне действия ПДУ: пилот стоит у площадки взлёта, посадки или дома. */
   rcInRange(): boolean {
     const s = this.state;
     const d = Math.min(...[this.takeoffPt, this.landing, this.home].map((p) => Math.hypot(s.east - p.east, s.north - p.north)));
+    // Пульт — своя линия малой дальности: помеха у борта сокращает её, как и линию НСУ.
+    const jamDb = linkJamDb(s.ew.linkJam);
+    if (jamDb > 0 && d > Math.min(this.rcRangeM, RC_RANGE_M) * 10 ** (-jamDb / 20)) return false;
     return d <= this.rcRangeM;
+  }
+
+  /** Ретрансляторы: поставить или убрать, в полёте тоже — линия пересчитается на следующем шаге. */
+  setRelays(relays: readonly Relay[]): void {
+    this.radio.setRelays(relays);
+  }
+
+  get relays(): readonly Relay[] {
+    return this.radio.relays;
+  }
+
+  /** Антенна НСУ. */
+  get gcsAntenna(): Station {
+    return this.radio.gcs;
+  }
+
+  /** НСУ, ретрансляторы и помеха у НСУ — для графика связи и радиотени теми же звеньями. */
+  get radioNetwork(): LinkNetwork {
+    return this.radio.network;
   }
 
   private snapshot(): LiveState {
     const s = this.state;
-    return {
+    const tele: LiveState = {
       ...s,
       east: s.estimate.east,
       north: s.estimate.north,
@@ -480,13 +672,54 @@ export class LiveFlight {
       wind: { ...s.wind },
       estimate: { ...s.estimate },
       failures: [...s.failures],
+      ew: this.boardEw(),
     };
+    const v = this.spoofVel;
+    if (v.e !== 0 || v.n !== 0) {
+      // Подмена: путевая по ГНСС — вместе с уводом; ветер у автопилота — путевая минус воздушная.
+      // Курс (компас) и приборная (ПВД) — настоящие: снос и путевая с ними не сходятся.
+      const ge = this.lastVel.e + v.e;
+      const gn = this.lastVel.n + v.n;
+      tele.groundSpeedMs = Math.hypot(ge, gn);
+      if (tele.groundSpeedMs > 0.5) tele.trackDeg = norm360(Math.atan2(ge, gn) / RAD);
+      tele.driftDeg = wrap180(s.headingDeg - tele.trackDeg);
+      const w = windVec(s.wind);
+      const we = w.e + v.e;
+      const wn = w.n + v.n;
+      tele.wind = { speedMs: Math.hypot(we, wn), fromDeg: norm360(Math.atan2(we, wn) / RAD + 180) };
+    }
+    return tele;
+  }
+
+  /** Обстановка, какой её знает борт: без подмены, запретные зоны — по оценке места. */
+  private boardEw(): EwState {
+    const s = this.state;
+    const near = this.noflyAround(s.estimate.east, s.estimate.north);
+    return { ...s.ew, gnssSpoof: 0, spoofed: false, spoofOffsetM: 0, noflyIds: near.ids, noflyNear: near.near };
+  }
+
+  /** Запретные зоны в точке и ближайшая из тех, что ближе NOFLY_NEAR_M. */
+  private noflyAround(e: number, n: number): { ids: string[]; near: EwState['noflyNear'] } {
+    const s = this.state;
+    const ids: string[] = [];
+    let near: EwState['noflyNear'] = null;
+    if (ON_GROUND.includes(s.mode)) return { ids, near };
+    const alt = this.site.elevationM + s.up;
+    for (const z of this.zones) {
+      if (z.zone.kind !== 'nofly') continue;
+      const d = localSignedDistance(z, e, n, alt);
+      if (d <= 0) ids.push(z.zone.id);
+      else if (d <= NOFLY_NEAR_M && (!near || d < near.distanceM)) near = { id: z.zone.id, distanceM: d };
+    }
+    return { ids, near: ids.length ? null : near };
   }
 
   /** Команда оператора. Возвращает причину отказа или null. */
   command(c: Command): string | null {
     const s = this.state;
-    if (s.linkLost && !(RC_COMMANDS.includes(c) && this.rcInRange())) return 'Нет связи с НСУ — команда не доставлена';
+    // На земле АРМ, ДИЗАРМ и взлёт даёт расчёт на площадке с ПДУ — и без связи с НСУ.
+    const padCommand = (s.mode === 'ground' || s.mode === 'landed') && (c === 'arm' || c === 'disarm' || c === 'takeoff');
+    if (s.linkLost && !padCommand && !(RC_COMMANDS.includes(c) && this.rcInRange())) return 'Нет связи с НСУ — команда не доставлена';
     const fs = s.mode === 'failsafe';
     const airborne = AIRBORNE.includes(s.mode) || (fs && s.failsafePhase === 'plane');
     switch (c) {
@@ -581,17 +814,12 @@ export class LiveFlight {
     const side = () => (this.rand() < 0.5 ? -1 : 1);
     switch (id) {
       case 'link':
-        s.linkLost = true;
-        this.frozen = this.snapshot();
+        this.updateLink();
         break;
-      case 'gnss': {
+      case 'gnss':
         // Автопилот продолжает по ПВД и ветру, измеренному до отказа (автономная навигация).
-        const w = windVec(windAt(this.weather, Math.max(0, s.aglM)));
-        const a = 2 * Math.PI * this.rand();
-        const err = WIND_EST_ERR_MS * (0.5 + this.rand());
-        this.windEst = { e: w.e + err * Math.sin(a), n: w.n + err * Math.cos(a) };
+        this.updateGnss(this.rand);
         break;
-      }
       case 'airspeed':
         this.airspeedGoal = (variant ?? (this.rand() < 0.5 ? 'low' : 'high')) === 'low' ? AIRSPEED_LOW : AIRSPEED_HIGH;
         break;
@@ -642,23 +870,248 @@ export class LiveFlight {
     }
   }
 
-  /** Связь или ГНСС вернулись. Остальные отказы в полёте не проходят — возвращает false. */
+  /**
+   * Связь или ГНСС вернулись. Остальные отказы в полёте не проходят — возвращает false. Отказ
+   * снимается и в зоне помех, но связь или решение ГНСС вернутся только после выхода из неё.
+   */
   restore(id: 'link' | 'gnss'): boolean {
     const s = this.state;
     if (!this.failed.delete(id)) return false;
     s.failures = s.failures.filter((x) => x !== id);
-    if (id === 'link') {
-      s.linkLost = false;
-      this.frozen = null;
-      this.events.push({ t: s.t, text: 'Связь с НСУ восстановлена' });
-    } else {
-      this.windEst = null;
-      this.navErr = { e: 0, n: 0 };
-      s.estimate.east = s.east;
-      s.estimate.north = s.north;
-      this.events.push({ t: s.t, text: 'Сигнал ГНСС восстановлен' });
+    if (id === 'link') this.updateLink();
+    else {
+      this.updateGnss();
+      if (this.windEst) this.events.push({ t: s.t, text: 'Приёмник ГНСС исправен, но решения нет — помехи' });
+      else {
+        this.navErr = { e: 0, n: 0 };
+        this.converging = false;
+        s.estimate.east = s.east;
+        s.estimate.north = s.north;
+        this.events.push({ t: s.t, text: 'Сигнал ГНСС восстановлен' });
+      }
     }
     return true;
+  }
+
+  /**
+   * Зоны на лету (инструктор рисует их и в полёте). Зона, появившаяся вокруг борта, входом не
+   * считается — в событиях среды «борт внутри новой зоны». quiet — без событий (начало полёта).
+   */
+  setZones(zones: readonly Zone[], quiet = false) {
+    const s = this.state;
+    this.zones = prepareZones(zones, this.site);
+    const fx = this.sampleZones();
+    const now = this.insideMap(fx);
+    if (!quiet) for (const [id, z] of now) if (!this.inside.has(id)) this.envEvents.push({ t: s.t, text: zoneEvent(z, 'new') });
+    this.inside = now;
+    this.applyZones(fx);
+    // Помеха у НСУ глушит приём телеметрии.
+    const g = this.radio.gcs;
+    const l = toLocal(this.site, g);
+    this.radio.setGcsJamDb(this.zones.length ? linkJamDb(localEffects(this.zones, l.east, l.north, g.altitudeM).linkJam) : 0);
+  }
+
+  private sampleZones(): LocalEffects {
+    const s = this.state;
+    if (!this.zones.length) return { nofly: [], gnssJam: 0, gnssSpoof: 0, linkJam: 0, inside: [] };
+    return localEffects(this.zones, s.east, s.north, this.site.elevationM + s.up);
+  }
+
+  /** Зоны вокруг борта по id; запретные — только в воздухе. */
+  private insideMap(fx: LocalEffects): Map<string, Zone> {
+    const ground = ON_GROUND.includes(this.state.mode);
+    return new Map(fx.inside.filter((z) => !(ground && z.kind === 'nofly')).map((z) => [z.id, z]));
+  }
+
+  private applyZones(fx: LocalEffects) {
+    const s = this.state;
+    const ew = s.ew;
+    ew.gnssJam = fx.gnssJam;
+    ew.gnssSpoof = fx.gnssSpoof;
+    ew.linkJam = fx.linkJam;
+    const nf = this.noflyAround(s.east, s.north);
+    ew.noflyIds = nf.ids;
+    ew.noflyNear = nf.near;
+  }
+
+  /** Зоны на шаге: сила помех, вход и выход, ГНСС, подмена, связь, контроль навигации. */
+  private environment(h: number) {
+    const s = this.state;
+    const fx = this.sampleZones();
+    const now = this.insideMap(fx);
+    for (const [id, z] of now) if (!this.inside.has(id)) this.envEvents.push({ t: s.t, text: zoneEvent(z, 'in') });
+    for (const [id, z] of this.inside) if (!now.has(id)) this.envEvents.push({ t: s.t, text: zoneEvent(z, 'out') });
+    this.inside = now;
+    this.applyZones(fx);
+    this.gnssTick(h, fx.gnssJam);
+    this.spoofTick(h, fx.gnssSpoof);
+    this.linkTick(h, fx.linkJam);
+    this.navCheck(h);
+  }
+
+  /** Подавление ГНСС: решение пропадает; после выхода — повторный захват с задержкой. */
+  private gnssTick(h: number, jam: number) {
+    const s = this.state;
+    const was = this.ewGnss;
+    if (this.ewGnss === 'ok') {
+      if (jam >= EW_EFFECT_THRESHOLD) {
+        this.ewGnss = 'lost';
+        this.gnssLostT = s.t;
+        this.events.push({ t: s.t, text: 'ГНСС: нет решения — сильные помехи, место по счислению' });
+      }
+    } else if (jam >= EW_EFFECT_THRESHOLD) this.ewGnss = 'lost';
+    else if (this.ewGnss === 'lost') {
+      if (jam < EW_RELEASE_THRESHOLD) {
+        this.ewGnss = 'acquiring';
+        const outage = Math.min(1, (s.t - this.gnssLostT) / GNSS_REACQ_LONG_OUTAGE_S);
+        this.acquireLeft = GNSS_REACQ_MIN_S + GNSS_REACQ_LONG_S * outage + GNSS_REACQ_JITTER_S * this.ewRand();
+      }
+    } else if ((this.acquireLeft -= h) <= 0) {
+      this.ewGnss = 'ok';
+      if (!this.failed.has('gnss')) this.events.push({ t: s.t, text: `ГНСС: повторный захват — место снова по ГНСС (перерыв ${Math.round(s.t - this.gnssLostT)} с)` });
+    }
+    if (this.ewGnss !== was) this.updateGnss(this.ewRand);
+  }
+
+  /**
+   * Подмена ГНСС: ложный сигнал захватывает приёмник и медленно уводит место вбок от линии пути.
+   * Автопилот летит по уведённому месту — на самом деле уходит с трассы в обратную сторону, а
+   * на карте НСУ всё ровно. Ослаб ложный сигнал — срыв слежения, повторный захват настоящего, и
+   * оценка сходится к истинному месту (не мгновенно).
+   */
+  private spoofTick(h: number, k: number) {
+    const s = this.state;
+    const ew = s.ew;
+    if (!ew.spoofed) {
+      this.spoofHold = !this.windEst && k >= EW_EFFECT_THRESHOLD ? this.spoofHold + h : 0;
+      if (this.spoofHold < SPOOF_CAPTURE_S) return;
+      ew.spoofed = true;
+      this.spoofT = 0;
+      const side = this.ewRand() < 0.5 ? -1 : 1;
+      const a = (s.trackDeg + side * (60 + 60 * this.ewRand())) * RAD;
+      this.spoofDir = { e: Math.sin(a), n: Math.cos(a) };
+      this.envEvents.push({ t: s.t, text: 'РЭБ: подмена ГНСС — приёмник захвачен ложным сигналом, место уводится' });
+      return;
+    }
+    if (k < EW_RELEASE_THRESHOLD) {
+      this.envEvents.push({ t: s.t, text: `РЭБ: подмена ГНСС прекратилась — место было уведено на ${Math.round(Math.hypot(this.spoof.e, this.spoof.n))} м` });
+      this.events.push({ t: s.t, text: 'ГНСС: срыв слежения — нет решения, повторный захват' });
+      this.ewGnss = 'acquiring';
+      this.gnssLostT = s.t;
+      this.acquireLeft = GNSS_REACQ_MIN_S + GNSS_REACQ_JITTER_S * this.ewRand();
+      this.updateGnss(this.ewRand);
+      return;
+    }
+    this.spoofT += h;
+    const v = Math.min(SPOOF_MAX_MS, SPOOF_ACCEL * this.spoofT);
+    this.spoofVel = { e: this.spoofDir.e * v, n: this.spoofDir.n * v };
+    this.spoof.e += this.spoofVel.e * h;
+    this.spoof.n += this.spoofVel.n * h;
+    ew.spoofOffsetM = Math.hypot(this.spoof.e, this.spoof.n);
+  }
+
+  /** Увод подмены переходит в ошибку счисления: автопилот продолжает с того места, где себя считал. */
+  private releaseSpoof() {
+    const ew = this.state.ew;
+    this.navErr.e += this.spoof.e;
+    this.navErr.n += this.spoof.n;
+    this.spoof = { e: 0, n: 0 };
+    this.spoofVel = { e: 0, n: 0 };
+    this.spoofHold = 0;
+    ew.spoofed = false;
+    ew.spoofOffsetM = 0;
+  }
+
+  /** ГНСС нет — по отказу или из-за помех: автопилот на счислении; вернулся — снова по ГНСС. */
+  private updateGnss(r: () => number = this.rand) {
+    const s = this.state;
+    const out = this.failed.has('gnss') || this.ewGnss !== 'ok';
+    s.ew.gnss = this.failed.has('gnss') ? 'lost' : this.ewGnss;
+    if (out && !this.windEst) {
+      this.releaseSpoof();
+      const w = windVec(this.windNow());
+      const a = 2 * Math.PI * r();
+      const err = WIND_EST_ERR_MS * (0.5 + r());
+      this.windEst = { e: w.e + err * Math.sin(a), n: w.n + err * Math.cos(a) };
+    } else if (!out && this.windEst) {
+      this.windEst = null;
+      this.converging = true;
+    }
+  }
+
+  /**
+   * Радиолиния НСУ ↔ борт (radio.ts): рельеф, дальность, ретрансляторы, помеха у борта (сила k
+   * 0…1 → linkJamDb). Рельеф считается раз в 0,25 с; связь теряется, если запас ниже порога
+   * дольше 2 с, и возвращается с гистерезисом.
+   */
+  private linkTick(h: number, k: number) {
+    const s = this.state;
+    const p = fromLocal(this.site, s.east, s.north);
+    this.radio.update(h, { ...p, altitudeM: this.site.elevationM + s.up + BOARD_ANTENNA_M }, linkJamDb(k));
+    const link = this.radio.state;
+    s.link = link;
+    const why = link.cause === 'jam' ? 'помехи в радиоканале' : link.cause === 'terrain' ? 'рельеф закрывает НСУ' : 'борт за пределом дальности связи';
+    this.updateLink(`Нет связи с НСУ: ${why}`);
+    s.linkQuality = s.linkLost ? 0 : link.quality;
+    // Потери больше половины — кадры телеметрии доходят заметно реже.
+    if (s.linkLost || link.telemetryHz >= TELEMETRY_HZ / 2) {
+      this.rxFrame = null;
+      this.rxPhase = 0;
+    } else if (!this.rxFrame || (this.rxPhase += h * link.telemetryHz) >= 1) {
+      this.rxPhase %= 1;
+      this.rxFrame = this.snapshot();
+    }
+  }
+
+  /** Связи нет — по отказу или по радиолинии: телеметрия замирает, идёт отсчёт до ВОЗВРАТА. */
+  private updateLink(lostText?: string) {
+    const s = this.state;
+    const lost = this.failed.has('link') || this.radio.monitor.lost;
+    if (lost === s.linkLost) return;
+    s.linkLost = lost;
+    this.rxFrame = null;
+    if (lost) {
+      this.frozen = this.snapshot();
+      this.linkLostT = s.t;
+      if (lostText) this.events.push({ t: s.t, text: lostText });
+    } else {
+      this.frozen = null;
+      this.events.push({ t: s.t, text: 'Связь с НСУ восстановлена' });
+    }
+  }
+
+  /** Без связи LINK_TIMEOUT_S — типовая реакция автопилота: ВОЗВРАТ. */
+  private linkTimeout() {
+    const s = this.state;
+    if (s.t - this.linkLostT < LINK_TIMEOUT_S) return;
+    if (['auto', 'guided', 'hold', 'manual'].includes(s.mode)) {
+      this.events.push({ t: s.t, text: `Нет связи ${LINK_TIMEOUT_S} с — ВОЗВРАТ` });
+      this.startRtl();
+    } else if (s.mode === 'transition') this.afterTransition = 'rtl';
+  }
+
+  /**
+   * Контроль навигации, как у автопилота: ветер = путевая по ГНСС − воздушная по курсу. Медленно
+   * сглаженный — «известный ветер»; быстрое расхождение с ним — признак подмены (или болтанки).
+   */
+  private navCheck(h: number) {
+    const s = this.state;
+    const plane = AIRBORNE.includes(s.mode) || (s.mode === 'failsafe' && s.failsafePhase === 'plane');
+    if (!plane || this.windEst || s.tasMs < 5) {
+      this.windRef = null;
+      this.mismatch *= Math.exp(-h / MISMATCH_TAU_S);
+    } else {
+      const psi = s.headingDeg * RAD;
+      const we = this.lastVel.e + this.spoofVel.e - s.tasMs * Math.sin(psi);
+      const wn = this.lastVel.n + this.spoofVel.n - s.tasMs * Math.cos(psi);
+      this.windRef ??= { e: we, n: wn };
+      const a = 1 - Math.exp(-h / WIND_REF_TAU_S);
+      this.windRef.e += (we - this.windRef.e) * a;
+      this.windRef.n += (wn - this.windRef.n) * a;
+      const r = Math.hypot(we - this.windRef.e, wn - this.windRef.n);
+      this.mismatch += (r - this.mismatch) * (1 - Math.exp(-h / MISMATCH_TAU_S));
+    }
+    s.ew.navMismatchMs = this.mismatch;
   }
 
   /** Продвинуть полёт на dt секунд (внутри — шаги не длиннее 0.1 с); onTick — после каждого шага. */
@@ -734,16 +1187,73 @@ export class LiveFlight {
     this.setMode('descent');
   }
 
-  /** ВОЗВРАТ: посадочный маршрут к дому строится по фактическому ветру (как у автопилота). */
+  /**
+   * ВОЗВРАТ: посадочный маршрут к дому строится по фактическому ветру (как у автопилота; с полем
+   * рельефа — по ветру, измеренному у борта). Сразу — высоты, нужные на пути над рельефом.
+   */
   private startRtl() {
     const p = this.navPos();
-    const wind10 = windAt(this.weather, 10);
+    const wind10 = this.lw ? this.windNow() : windAt(this.weather, 10);
     const here = fromLocal(this.site, p.east, p.north);
     const proc = windProcedures(this.homeSite, this.homeSite, wind10, null, here);
     this.rtlApproach = proc.approach.map((q) => this.local(q, 0));
     this.rtlStage = 0;
     this.hoverHeadingDeg = proc.landingHeadingDeg;
+    this.planRtlClearance();
     this.setMode('rtl');
+  }
+
+  /**
+   * Высоты для ВОЗВРАТА над рельефом: в каждой точке захода — с какой высоты дальше до дома рельеф
+   * проходится с запасом, если набирать не круче rtlGrad. Точки захода от места борта не зависят.
+   */
+  private planRtlClearance() {
+    const s = this.state;
+    const tas = Math.max(10, tasFromIas(Math.max(s.iasMs, AIRCRAFT.cruiseIasMs), this.rho(s.up)));
+    // Путевая по ветру — наибольшая: чем быстрее над землёй, тем положе набор.
+    this.rtlGrad = (RTL_CLIMB_SHARE * AIRCRAFT.planeClimbRateMaxMs) / (tas + windAt(this.weather, 300).speedMs);
+    const pts = [...this.rtlApproach, this.home];
+    this.rtlRest = pts.map(() => -Infinity);
+    for (let k = pts.length - 2; k >= 0; k--) {
+      const a = pts[k]!;
+      const b = pts[k + 1]!;
+      this.rtlRest[k] = Math.max(this.legNeed(a, b, k + 1 === pts.length - 1), this.rtlRest[k + 1]! - this.rtlGrad * Math.hypot(b.east - a.east, b.north - a.north));
+    }
+    this.rtlClimb = null;
+    this.rtlNeedCache = { t: -Infinity, stage: -1, up: 0 };
+  }
+
+  /** Высота в a, с которой до b рельеф проходится с запасом при наборе не круче rtlGrad. На посадочной прямой запас — до высоты обратного перехода. */
+  private legNeed(a: { east: number; north: number }, b: { east: number; north: number }, final: boolean): number {
+    const len = Math.hypot(b.east - a.east, b.north - a.north);
+    const n = Math.max(1, Math.ceil(len / RTL_STEP_M));
+    const margin = final ? Math.max(AIRCRAFT.minClearanceM, VT.backTransitionHeightM - 5) : RTL_CLEARANCE_M;
+    let need = -Infinity;
+    for (let i = 0; i <= n; i++) {
+      const f = i / n;
+      need = Math.max(need, this.groundUp(a.east + (b.east - a.east) * f, a.north + (b.north - a.north) * f) + margin - this.rtlGrad * f * len);
+    }
+    return need;
+  }
+
+  /** Высота, нужная сейчас: пройти к текущей точке захода и дальше до дома над рельефом с запасом. */
+  private rtlNeed(nav: { east: number; north: number }, pts: PathPoint[]): number {
+    const c = this.rtlNeedCache;
+    const t = this.state.t;
+    if (c.stage === this.rtlStage && t - c.t < RTL_NEED_PERIOD_S) return c.up;
+    const target = pts[this.rtlStage]!;
+    const d = Math.hypot(target.east - nav.east, target.north - nav.north);
+    const up = Math.max(this.legNeed(nav, target, this.rtlStage === pts.length - 1), this.rtlRest[this.rtlStage]! - this.rtlGrad * d);
+    this.rtlNeedCache = { t, stage: this.rtlStage, up };
+    return up;
+  }
+
+  /** Наибольшая высота рельефа с запасом margin на отрезке a → b (шаг 25 м). */
+  private pathFloor(a: { east: number; north: number }, b: { east: number; north: number }, margin: number): number {
+    const n = Math.max(1, Math.ceil(Math.hypot(b.east - a.east, b.north - a.north) / 25));
+    let top = -Infinity;
+    for (let i = 0; i <= n; i++) top = Math.max(top, this.groundUp(a.east + ((b.east - a.east) * i) / n, a.north + ((b.north - a.north) * i) / n));
+    return top + margin;
   }
 
   private setMode(m: LiveMode, text?: string) {
@@ -770,7 +1280,7 @@ export class LiveFlight {
     if (!auto && !this.rcInRange()) return `ПДУ не достаёт: борт дальше ${fmtKm(this.rcRangeM)} км от пилота`;
     const rho = this.rho(s.up);
     const plane = AIRBORNE.includes(s.mode) || ((s.mode === 'transition' || s.mode === 'backtransition') && s.tasMs > this.stallTas(rho));
-    const w = windVec(windAt(this.weather, Math.max(0, s.aglM)));
+    const w = windVec(this.windNow());
     this.vAir = { e: this.lastVel.e - w.e, n: this.lastVel.n - w.n };
     this.iasHold = s.iasMs;
     this.rcLostS = 0;
@@ -804,6 +1314,24 @@ export class LiveFlight {
     return null;
   }
 
+  /** Ветер у борта: с полем рельефа — местный (посчитан в начале шага), без него — ветер погоды на высоте над землёй. */
+  private windNow(): Wind {
+    const lw = this.lw;
+    if (!lw) return windAt(this.weather, Math.max(0, this.state.aglM));
+    return { speedMs: Math.hypot(lw.eastMs, lw.northMs), fromDeg: norm360(Math.atan2(-lw.eastMs, -lw.northMs) / RAD) };
+  }
+
+  /** Вертикальный поток воздуха у борта (обтекание склонов, тень за грядой, термики), м/с: + вверх. */
+  get upflowMs(): number {
+    return this.lw?.upMs ?? 0;
+  }
+
+  /** Роторы держат вертикальную относительно земли: в нисходящем потоке тяги нужно больше, в восходящем — меньше. */
+  private rotorUpflow(): number {
+    const w = this.lw?.upMs ?? 0;
+    return w === 0 ? 1 : clamp(1 - ((VT.climbFactor - 1) * w) / VT.climbRateMs, 0.85, 1.3);
+  }
+
   private rho(up: number): number {
     const alt = this.site.elevationM + up;
     return airDensity({ altitudeM: alt, temperatureC: temperatureAt(alt, this.weather.groundTemperatureC, this.site.elevationM) });
@@ -813,10 +1341,12 @@ export class LiveFlight {
     return STALL_SHARE * tasFromIas(AIRCRAFT.transitionLowIasMs, rho);
   }
 
-  /** Где аппарат по мнению автопилота: с ГНСС — где есть, без — счисление. */
+  /** Где аппарат по мнению автопилота: с ГНСС — где есть (или куда увела подмена), без — счисление. */
   private navPos(): { east: number; north: number } {
     const s = this.state;
-    return this.windEst ? { east: s.east + this.navErr.e, north: s.north + this.navErr.n } : s;
+    const e = this.navErr.e + this.spoof.e;
+    const n = this.navErr.n + this.spoof.n;
+    return e === 0 && n === 0 ? s : { east: s.east + e, north: s.north + n };
   }
 
   /** Тяга подъёмных роторов на максимуме в долях веса. */
@@ -861,8 +1391,10 @@ export class LiveFlight {
     const n0 = s.north;
     const ground = this.groundUp(s.east, s.north);
     s.aglM = s.up - ground;
+    if (this.tw) this.lw = this.tw.localWind(s.east, s.north, s.aglM, s.t);
     this.sampleGust(h);
     if (this.failed.size > 0) this.failureTick(h);
+    if (s.linkLost) this.linkTimeout();
     const rho = this.rho(s.up);
     const hover = hoverPowerW(this.mass, rho);
     let power = 0;
@@ -889,7 +1421,7 @@ export class LiveFlight {
 
       case 'climb':
         // Висение носом на первую точку взлётного маршрута — против ветра.
-        power = VT.climbFactor * hover;
+        power = VT.climbFactor * hover * this.rotorUpflow();
         s.lift = 1;
         this.hoverMove(h, this.takeoffPt);
         this.spin(h);
@@ -950,7 +1482,7 @@ export class LiveFlight {
         // Снижение — над точкой; до неё аппарат идёт на роторах, держа высоту.
         const nav = this.navPos();
         const over = Math.hypot(target.east - nav.east, target.north - nav.north) < 5;
-        power = (over ? VT.descentFactor : 1) * hover;
+        power = (over ? VT.descentFactor : 1) * hover * this.rotorUpflow();
         s.vzMs = this.rotorVz(h, over ? -VT.descentRateMs : 0);
         s.up += s.vzMs * h;
         const g = this.groundUp(s.east, s.north);
@@ -961,7 +1493,7 @@ export class LiveFlight {
       }
 
       case 'final': {
-        power = hover;
+        power = hover * this.rotorUpflow();
         s.lift = 1;
         s.pusher = 0.1;
         this.hoverYaw(h);
@@ -988,7 +1520,8 @@ export class LiveFlight {
     s.soc = (this.capacityWh - s.energyWh) / this.capacityWh;
     s.aglM = s.up - this.groundUp(s.east, s.north);
     this.lastVel = { e: (s.east - e0) / h, n: (s.north - n0) / h };
-    this.updateNavigation();
+    this.environment(h);
+    this.updateNavigation(h);
     const powered = s.mode !== 'falling' && s.mode !== 'crashed' && s.mode !== 'landed';
     if (s.energyWh >= this.capacityWh) s.energyWh = this.capacityWh;
     if (s.energyWh >= this.capacityWh && powered && (s.mode !== 'ground' || s.armed)) {
@@ -1015,7 +1548,7 @@ export class LiveFlight {
   private sampleGust(h: number) {
     if (!this.turb) return;
     const s = this.state;
-    const g = this.turb.sample(s.t, s.east, s.north, Math.max(0, s.aglM));
+    const g = this.turb.sample(s.t, s.east, s.north, Math.max(0, s.aglM), this.lw ?? undefined);
     this.gust = g;
     const a = 1 - Math.exp(-h / GUST_LAG_S);
     this.gustLp = { e: this.gustLp.e + (g.e - this.gustLp.e) * a, n: this.gustLp.n + (g.n - this.gustLp.n) * a, u: this.gustLp.u + (g.u - this.gustLp.u) * a };
@@ -1072,13 +1605,6 @@ export class LiveFlight {
       this.events.push({ t: s.t, text: 'Пожар: отказ питания' });
       this.inject('power');
     }
-    if (s.linkLost && since('link') >= LINK_TIMEOUT_S) {
-      // Типовая реакция автопилота на потерю связи — ВОЗВРАТ.
-      if (['auto', 'guided', 'hold', 'manual'].includes(s.mode)) {
-        this.events.push({ t: s.t, text: `Нет связи ${LINK_TIMEOUT_S} с — ВОЗВРАТ` });
-        this.startRtl();
-      } else if (s.mode === 'transition') this.afterTransition = 'rtl';
-    }
     if (this.failed.has('airspeed')) this.airspeedK += (this.airspeedGoal - this.airspeedK) * (1 - Math.exp(-h / AIRSPEED_TAU_S));
     if (this.failed.has('compass')) {
       // На висении курс только по компасу; в самолёте — по путевому углу ГНСС.
@@ -1105,17 +1631,25 @@ export class LiveFlight {
     if (why) this.enterFailsafe(`ФЭЙЛСЕЙФ: ${why} больше предельного`, true);
   }
 
-  /** Счисление без ГНСС: неучтённый автопилотом снос копится в ошибке места. */
-  private updateNavigation() {
+  /** Счисление без ГНСС: неучтённый автопилотом снос копится в ошибке места; с ГНСС — ошибка уходит. */
+  private updateNavigation(h: number) {
     const s = this.state;
     if (this.windEst) {
       this.navErr.e -= this.unknownE;
       this.navErr.n -= this.unknownN;
+    } else if (this.converging) {
+      const k = Math.exp(-h / NAV_CONVERGE_S);
+      this.navErr.e *= k;
+      this.navErr.n *= k;
+      if (Math.hypot(this.navErr.e, this.navErr.n) < 0.5) {
+        this.navErr = { e: 0, n: 0 };
+        this.converging = false;
+      }
     }
     this.unknownE = 0;
     this.unknownN = 0;
-    s.estimate.east = s.east + this.navErr.e;
-    s.estimate.north = s.north + this.navErr.n;
+    s.estimate.east = s.east + this.navErr.e + this.spoof.e;
+    s.estimate.north = s.north + this.navErr.n + this.spoof.n;
     // Показания ПВД: при отказе — доля истинной; порывы вдоль курса дёргают стрелку.
     let reading = s.iasMs * this.airspeedK;
     if (this.turb && s.iasMs > 0) {
@@ -1135,7 +1669,7 @@ export class LiveFlight {
     const s = this.state;
     s.lift = 0;
     s.pusher = 0;
-    const wind = windAt(this.weather, Math.max(0, s.aglM));
+    const wind = this.windNow();
     s.wind = wind;
     const to = (wind.fromDeg + 180) * RAD;
     const tas = Math.max(0, s.tasMs);
@@ -1163,7 +1697,8 @@ export class LiveFlight {
     s.iasMs = s.tasMs * Math.sqrt(rho / RHO0);
     s.east += ve * h;
     s.north += vn * h;
-    s.up += s.vzMs * h;
+    // Вертикальная — относительно воздуха; воздух и сам несёт вверх или вниз.
+    s.up += (s.vzMs + this.upflowMs) * h;
     s.groundSpeedMs = Math.hypot(ve, vn);
     if (s.groundSpeedMs > 0.5) s.trackDeg = norm360(Math.atan2(ve, vn) / RAD);
     s.distanceM += s.groundSpeedMs * h;
@@ -1276,7 +1811,7 @@ export class LiveFlight {
     let we = 0;
     let wn = 0;
     if (this.windEst) {
-      const w = windVec(windAt(this.weather, Math.max(0, s.aglM)));
+      const w = windVec(this.windNow());
       we += 0.9 * w.e * h;
       wn += 0.9 * w.n * h;
     }
@@ -1323,7 +1858,8 @@ export class LiveFlight {
     s.iasMs = tasNew * Math.sqrt(rho / RHO0);
     // С выключенным маршевым аппарат планирует к высоте обратного перехода над точкой (как в плане),
     // но не набирает: тяги для набора нет.
-    const alt = Math.min(s.up, this.groundUp(target.east, target.north) + VT.backTransitionHeightM);
+    // Над гребнем по пути к точке — не ниже запаса над рельефом: снижаться, только когда впереди чисто.
+    const alt = Math.min(s.up, Math.max(this.groundUp(target.east, target.north) + VT.backTransitionHeightM, this.pathFloor(p, target, AIRCRAFT.minClearanceM)));
     this.fly(h, d > 5 ? bearing(p, target) : s.trackDeg, alt, rho, 1 - 0.8 * lift, tasNew > 5);
     s.lift = lift;
     s.pusher = 0;
@@ -1401,14 +1937,33 @@ export class LiveFlight {
         target = pts[this.rtlStage]!;
         d = Math.hypot(target.east - nav.east, target.north - nav.north);
       }
-      track = bearing(nav, target);
-      const approachAgl = [Math.min(c.heightAglM, 150), 100, VT.backTransitionHeightM][this.rtlStage]!;
-      const floor = this.rtlStage === 2 ? VT.backTransitionHeightM - 5 : 60;
-      alt = Math.max(this.groundUp(target.east, target.north) + approachAgl, this.terrainFollow(floor, track, tas));
-      if (this.rtlStage === 2 && d <= pusherOff) {
-        this.landAt = { east: this.home.east, north: this.home.north };
-        this.setMode('backtransition', 'Посадочная прямая — маршевый выключен');
-        return this.brake(h, rho, hoverPowerW(this.mass, rho));
+      // Нужная высота над рельефом на всём пути домой. Ниже её — набор по кругу над местом, пока не наберём.
+      const need = this.rtlNeed(nav, pts);
+      const orbitR = Math.max(1.3 * R, 150);
+      if (!this.rtlClimb && s.up < need - RTL_ORBIT_SLACK_M) {
+        // Круг — под уклон от места: весь он над рельефом не выше здешнего, а не в склон.
+        const ge = this.groundUp(nav.east + 100, nav.north) - this.groundUp(nav.east - 100, nav.north);
+        const gn = this.groundUp(nav.east, nav.north + 100) - this.groundUp(nav.east, nav.north - 100);
+        const gl = Math.hypot(ge, gn);
+        this.rtlClimb = gl > 1 ? { east: nav.east - (ge / gl) * orbitR, north: nav.north - (gn / gl) * orbitR } : { east: nav.east, north: nav.north };
+        this.events.push({ t: s.t, text: `ВОЗВРАТ: набор высоты над местом до ${Math.round(this.site.elevationM + need)} м — впереди рельеф` });
+      } else if (this.rtlClimb && s.up >= need + 10) {
+        this.rtlClimb = null;
+        this.events.push({ t: s.t, text: 'ВОЗВРАТ: высота набрана — иду домой' });
+      }
+      if (this.rtlClimb) {
+        track = this.orbitTrack(this.rtlClimb, orbitR);
+        alt = Math.max(need + 20, this.terrainFollow(RTL_CLEARANCE_M, track, tas));
+      } else {
+        track = bearing(nav, target);
+        const approachAgl = [Math.min(c.heightAglM, 150), 100, VT.backTransitionHeightM][this.rtlStage]!;
+        const floor = this.rtlStage === 2 ? VT.backTransitionHeightM - 5 : RTL_CLEARANCE_M;
+        alt = Math.max(this.groundUp(target.east, target.north) + approachAgl, need, this.terrainFollow(floor, track, tas));
+        if (this.rtlStage === 2 && d <= pusherOff) {
+          this.landAt = { east: this.home.east, north: this.home.north };
+          this.setMode('backtransition', 'Посадочная прямая — маршевый выключен');
+          return this.brake(h, rho, hoverPowerW(this.mass, rho));
+        }
       }
     }
 
@@ -1467,7 +2022,7 @@ export class LiveFlight {
     const s = this.state;
     const tas = tasFromIas(s.iasMs, rho);
     s.tasMs = tas;
-    const wind = windAt(this.weather, Math.max(0, s.aglM));
+    const wind = this.windNow();
     s.wind = wind;
     const aileron = this.failed.has('aileron');
     if (steer && tas > 5) {
@@ -1491,7 +2046,8 @@ export class LiveFlight {
       s.iasMs += ((-G * s.vzMs) / Math.max(tas, 5)) * 0.3 * h * Math.sqrt(rho / RHO0);
     } else {
       this.stalled = false;
-      let vzCmd = this.pitchFailure(clamp(0.3 * (alt - s.up), -AIRCRAFT.planeDescentRateMaxMs, AIRCRAFT.planeClimbRateMaxMs));
+      // Вертикальная относительно воздуха; поток воздуха автопилот видит по баро и ГНСС и парирует.
+      let vzCmd = this.pitchFailure(clamp(0.3 * (alt - s.up) - this.upflowMs, -AIRCRAFT.planeDescentRateMaxMs, AIRCRAFT.planeClimbRateMaxMs));
       // Без тяги скорость держится только снижением: Vz = −D·V / (m·g).
       if (glide) vzCmd = Math.min(vzCmd, -(polar(this.mass, Math.max(tas, 5), rho).dragN * tas) / (this.mass * G));
       s.vzMs += clamp(vzCmd - s.vzMs, -0.6 * h, 0.6 * h);
@@ -1510,7 +2066,7 @@ export class LiveFlight {
     }
     s.east += ve * h;
     s.north += vn * h;
-    s.up += s.vzMs * h;
+    s.up += (s.vzMs + this.upflowMs) * h;
     s.groundSpeedMs = Math.hypot(ve, vn);
     if (s.groundSpeedMs > 0.5) s.trackDeg = norm360(Math.atan2(ve, vn) / RAD);
     s.driftDeg = wrap180(s.headingDeg - s.trackDeg);
@@ -1554,7 +2110,7 @@ export class LiveFlight {
     s.tasMs = tasNew;
     s.iasMs = tasNew * Math.sqrt(rho / RHO0);
     s.headingDeg = norm360(s.headingDeg + ((G * Math.tan(clamp(s.bankDeg, -80, 80) * RAD)) / tasNew / RAD) * h);
-    const wind = windAt(this.weather, Math.max(0, s.aglM));
+    const wind = this.windNow();
     s.wind = wind;
     const w = windVec(wind);
     const psi = s.headingDeg * RAD;
@@ -1566,7 +2122,7 @@ export class LiveFlight {
     }
     s.east += ve * h;
     s.north += vn * h;
-    s.up += s.vzMs * h;
+    s.up += (s.vzMs + this.upflowMs) * h;
     s.groundSpeedMs = Math.hypot(ve, vn);
     if (s.groundSpeedMs > 0.5) s.trackDeg = norm360(Math.atan2(ve, vn) / RAD);
     s.driftDeg = wrap180(s.headingDeg - s.trackDeg);
@@ -1577,7 +2133,7 @@ export class LiveFlight {
     const g = this.groundUp(s.east, s.north);
     if (s.up <= g) {
       s.up = g;
-      const sink = -s.vzMs;
+      const sink = -(s.vzMs + this.upflowMs);
       const gs = s.groundSpeedMs;
       if (sink <= BELLY_SINK_MS && gs <= BELLY_GROUND_MS && Math.abs(s.bankDeg) < BELLY_BANK_DEG) {
         s.vzMs = 0;
@@ -1602,7 +2158,7 @@ export class LiveFlight {
    */
   private manualCopter(h: number, st: Stick, rho: number, hover: number): number {
     const s = this.state;
-    const wind = windAt(this.weather, Math.max(0, s.aglM));
+    const wind = this.windNow();
     s.wind = wind;
     const w = windVec(wind);
     const rotorLost = this.failed.has('rotor');
@@ -1655,7 +2211,7 @@ export class LiveFlight {
     s.driftDeg = 0;
     s.distanceM += s.groundSpeedMs * h;
     const aux = AIRCRAFT.auxPowerHoverW;
-    const power = aux + (hover - aux) * rotorFrac ** 1.5 * (1 + ((VT.climbFactor - 1) * Math.max(0, s.vzMs)) / VT.climbRateMs);
+    const power = aux + (hover - aux) * rotorFrac ** 1.5 * (1 + ((VT.climbFactor - 1) * Math.max(0, s.vzMs - this.upflowMs)) / VT.climbRateMs);
     if (s.up <= this.groundUp(s.east, s.north)) this.touchdown(rotorLost ? 'ручная посадка без подъёмного винта' : 'ручная посадка');
     return power;
   }

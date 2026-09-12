@@ -18,6 +18,14 @@ import { windAt, windTriangle } from './wind';
 const EARTH_RADIUS_M = 6371000;
 const RAD = Math.PI / 180;
 const VTOL = AIRCRAFT.vtol;
+/** Вертикальная скорость проверяется на участках не короче этого, м: на коротких отрезках скругления округление высот даёт ложные всплески. */
+const VZ_WINDOW_M = 50;
+
+/** Высота перехода в самолётный режим над площадкой взлёта, м над морем: по плану или по РЛЭ. */
+export const transitionAltitudeM = (plan: MissionPlan): number => plan.transitionAltitudeM ?? plan.takeoff.elevationM + VTOL.transitionHeightM;
+
+/** Высота обратного перехода над площадкой посадки, м над морем: по плану или по РЛЭ. */
+export const backTransitionAltitudeM = (plan: MissionPlan): number => plan.backTransitionAltitudeM ?? plan.landing.elevationM + VTOL.backTransitionHeightM;
 
 export function distanceM(a: GeoPoint, b: GeoPoint): number {
   const dLat = (b.lat - a.lat) * RAD;
@@ -67,11 +75,11 @@ function phase(name: string, durationS: number, powerW: number): Phase {
   return { name, durationS, powerW, energyWh: (powerW * durationS) / 3600 };
 }
 
-/** Взлёт: раскрутка на земле и вертикальный набор до высоты перехода. ρ — у площадки. */
-export function takeoffPhases(massKg: number, rho: number): Phase[] {
+/** Взлёт: раскрутка на земле и вертикальный набор до высоты перехода climbM над площадкой. ρ — у площадки. */
+export function takeoffPhases(massKg: number, rho: number, climbM = VTOL.transitionHeightM): Phase[] {
   return [
     phase('Раскрутка на земле', VTOL.spoolUpS, VTOL.spoolUpFactor * hoverPowerW(massKg, rho)),
-    phase('Вертикальный набор', VTOL.transitionHeightM / VTOL.climbRateMs, verticalClimbPowerW(massKg, rho)),
+    phase('Вертикальный набор', climbM / VTOL.climbRateMs, verticalClimbPowerW(massKg, rho)),
   ];
 }
 
@@ -80,11 +88,11 @@ export function transitionPhase(massKg: number, rho: number): Phase {
 }
 
 /**
- * Посадка: вертикальное снижение с высоты обратного перехода и финальный участок.
- * Снижение почти не дешевле висения и длится вдвое дольше набора — поэтому
+ * Посадка: вертикальное снижение с высоты обратного перехода descentM над площадкой и финальный
+ * участок. Снижение почти не дешевле висения и длится вдвое дольше набора — поэтому
  * посадка дороже взлёта.
  */
-export function landingPhases(massKg: number, rho: number, approach?: { tasMs: number; headwindMs: number }): Phase[] {
+export function landingPhases(massKg: number, rho: number, approach?: { tasMs: number; headwindMs: number }, descentM = VTOL.backTransitionHeightM): Phase[] {
   const phases: Phase[] = [];
   if (approach) {
     // Маршевый выключен за pusherOffBeforeLandingM; если встречный ветер погасил путевую раньше,
@@ -94,7 +102,7 @@ export function landingPhases(massKg: number, rho: number, approach?: { tasMs: n
     if (crawl > 1) phases.push(phase('Подход к точке на роторах', crawl / HOVER_TRANSLATE_MS, hoverPowerW(massKg, rho)));
   }
   phases.push(
-    phase('Вертикальное снижение', (VTOL.backTransitionHeightM - VTOL.finalHeightM) / VTOL.descentRateMs, verticalDescentPowerW(massKg, rho)),
+    phase('Вертикальное снижение', (descentM - VTOL.finalHeightM) / VTOL.descentRateMs, verticalDescentPowerW(massKg, rho)),
     phase('Финальный участок и касание', VTOL.finalS, hoverPowerW(massKg, rho)),
   );
   return phases;
@@ -121,8 +129,9 @@ function flySegment(
   const blocked = { ...base, driftDeg: 0, groundSpeedMs: 0, verticalSpeedMs: 0, bankDeg: 0, durationS: Infinity, powerW: 0, energyWh: Infinity, infeasible: true };
 
   if (dist < 1) {
-    // Смена высоты без горизонтального участка в самолётном режиме не считается.
-    if (dh !== 0) return blocked;
+    // Смена высоты без горизонтального участка в самолётном режиме не считается;
+    // доли метра — погрешность округления на стыке участков.
+    if (Math.abs(dh) > 0.5) return blocked;
     return { ...base, driftDeg: 0, groundSpeedMs: 0, verticalSpeedMs: 0, bankDeg: 0, durationS: 0, powerW: 0, energyWh: 0, infeasible: false };
   }
   const tri = windTriangle(trueAirspeedMs, trackDeg, wind);
@@ -176,18 +185,18 @@ export function simulateMission(plan: MissionPlan, weather: Weather, opts: SimOp
   const rhoTakeoff = airDensity(airAt(plan.takeoff.elevationM));
   const rhoLanding = airDensity(airAt(plan.landing.elevationM));
 
-  const takeoff = takeoffPhases(massKg, rhoTakeoff);
+  const takeoff = takeoffPhases(massKg, rhoTakeoff, transitionAltitudeM(plan) - plan.takeoff.elevationM);
   const transition = transitionPhase(massKg, rhoTakeoff);
   // Заход: курс последнего отрезка и встречная составляющая ветра на высоте обратного перехода.
   const beforeLanding = plan.waypoints[plan.waypoints.length - 1] ?? plan.takeoff;
   const finalWind = windAt(weather, VTOL.backTransitionHeightM);
   const headwindMs = finalWind.speedMs * Math.cos((finalWind.fromDeg - bearingDeg(beforeLanding, plan.landing)) * RAD);
-  const landing = landingPhases(massKg, rhoLanding, { tasMs: tasFromIas(plan.iasMs, rhoLanding), headwindMs });
+  const landing = landingPhases(massKg, rhoLanding, { tasMs: tasFromIas(plan.iasMs, rhoLanding), headwindMs }, backTransitionAltitudeM(plan) - plan.landing.elevationM);
 
   const path: Waypoint[] = [
-    { lat: plan.takeoff.lat, lon: plan.takeoff.lon, altitudeM: plan.takeoff.elevationM + VTOL.transitionHeightM },
+    { lat: plan.takeoff.lat, lon: plan.takeoff.lon, altitudeM: transitionAltitudeM(plan) },
     ...plan.waypoints,
-    { lat: plan.landing.lat, lon: plan.landing.lon, altitudeM: plan.landing.elevationM + VTOL.backTransitionHeightM },
+    { lat: plan.landing.lat, lon: plan.landing.lon, altitudeM: backTransitionAltitudeM(plan) },
   ];
   const terrain = plan.terrain;
   const groundAt = terrain ? (p: GeoPoint) => terrain.elevationM(p) : () => plan.takeoff.elevationM;
@@ -213,8 +222,18 @@ export function simulateMission(plan: MissionPlan, weather: Weather, opts: SimOp
     );
   });
 
-  const vzMax = Math.max(0, ...segments.map((s) => s.verticalSpeedMs));
-  const vzMin = Math.min(0, ...segments.map((s) => s.verticalSpeedMs));
+  const vz: number[] = [];
+  let acc = { d: 0, dh: 0, t: 0 };
+  for (const s of segments) {
+    if (s.infeasible) continue;
+    acc = { d: acc.d + s.distanceM, dh: acc.dh + (s.to.altitudeM - s.from.altitudeM), t: acc.t + s.durationS };
+    if (acc.d < VZ_WINDOW_M) continue;
+    vz.push(acc.dh / acc.t);
+    acc = { d: 0, dh: 0, t: 0 };
+  }
+  if (acc.t > 0) vz.push(acc.dh / acc.t);
+  const vzMax = Math.max(0, ...vz);
+  const vzMin = Math.min(0, ...vz);
   if (vzMax > AIRCRAFT.planeClimbRateMaxMs + 0.05) {
     issues.push(`Нужен набор ${vzMax.toFixed(1)} м/с — аппарат может ${AIRCRAFT.planeClimbRateMaxMs} м/с`);
   }

@@ -6,10 +6,12 @@ import { roundSharpCorners } from '../sim/dubins';
 import { CAMERAS } from '../sim/payload';
 import { windProcedures, type WindProcedures } from '../sim/procedures';
 import { heightForGsdM, planSurvey, type SurveyCamera, type SurveyParams, type SurveyPlan } from '../sim/survey';
-import { followTerrain } from '../sim/terrain';
-import type { RoutePoint } from '../sim/profile';
+import { followTerrain, terrainEndAltitudes } from '../sim/terrain';
+import type { LocationSpec, RoutePoint } from '../sim/profile';
+import type { Relay } from '../sim/radio';
 import type { GeoPoint, MissionPlan, PayloadLoad, Site, Terrain, Weather } from '../sim/types';
 import { windAt, windTriangle } from '../sim/wind';
+import { activeRegion } from './regions';
 
 /** То, что игрок выбирает на планировании. Часть полей нужна не всем заданиям. */
 export interface Settings {
@@ -53,6 +55,8 @@ interface ScenarioBase {
   date: string;
   utcOffsetH: number;
   defaults: Settings;
+  /** Ретрансляторы связи района (radio.ts) — для полёта, предполётной проверки и карты. */
+  relays: Relay[];
 }
 
 export interface SurveyScenario extends ScenarioBase {
@@ -90,83 +94,96 @@ export interface TransferScenario extends ScenarioBase {
 
 export type Scenario = TransferScenario | SurveyScenario | DeliveryScenario | RouteScenario;
 
-/** Район заданий — из профиля. */
-const L = PROFILE.location;
+/** Брифинг и ретрансляторы района одной фразой. */
+export function withRelays(briefing: string, relays: readonly Relay[] = []): string {
+  if (!relays.length) return briefing;
+  const where = relays.map((r) => (r.kind === 'air' ? `аппарат-ретранслятор ${r.name ?? ''}` : `мачта ${r.name ?? ''}`).trim());
+  return `${briefing} Связь за рельефом держ${relays.length > 1 ? 'ат ретрансляторы' : 'ит ретранслятор'}: ${where.join(', ')}.`;
+}
+
+/** Задания района. Первое — стартовое. */
+export function buildScenarios(L: LocationSpec): Scenario[] {
+  const common = {
+    site: L.site,
+    siteName: L.siteName,
+    relays: L.relays ?? [],
+    shearExponent: 0.2,
+    cloudCover: 0.3,
+    cloudBaseM: 1500,
+    date: L.date,
+    utcOffsetH: L.utcOffsetH,
+  };
+  const defaults: Settings = {
+    cameraId: PROFILE.camera.id,
+    gsdCm: 4,
+    forwardOverlapPct: 80,
+    sideOverlapPct: 60,
+    directionDeg: 90,
+    shutter: 1600,
+    cargoKg: AIRCRAFT.payloadMaxKg,
+    iasMs: AIRCRAFT.cruiseIasMs,
+    windSpeedMs: L.windSpeedMs,
+    windFromDeg: L.windFromDeg,
+    temperatureC: L.temperatureC,
+    localHour: 11,
+  };
+  return [
+    {
+      ...common,
+      id: 'transfer',
+      kind: 'transfer',
+      title: L.transfer.title,
+      briefing: withRelays(L.transfer.briefing, L.relays),
+      destination: L.transfer.destination,
+      destinationName: L.transfer.destinationName,
+      route: L.transfer.route,
+      defaults: { ...defaults },
+    },
+    {
+      ...common,
+      id: 'route',
+      kind: 'route',
+      title: 'Облёт по маршруту',
+      briefing: withRelays(L.route.briefing, L.relays),
+      route: L.route.route,
+      defaults: { ...defaults },
+    },
+    {
+      ...common,
+      id: 'survey',
+      kind: 'survey',
+      title: L.survey.title,
+      briefing: withRelays(L.survey.briefing, L.relays),
+      area: L.survey.area,
+      requiredGsdM: 0.04,
+      minFrames: 5,
+      minCoverage: 0.95,
+      defaults: { ...defaults },
+    },
+    {
+      ...common,
+      id: 'delivery',
+      kind: 'delivery',
+      title: L.delivery.title,
+      briefing: withRelays(L.delivery.briefing, L.relays),
+      destination: L.delivery.destination,
+      destinationName: L.delivery.destinationName,
+      route: L.delivery.route,
+      unloadS: 60,
+      defaults: { ...defaults },
+    },
+  ];
+}
+
+/** Район заданий — выбранный оператором (src/game/regions.ts); переключение — перезагрузкой страницы. */
+export const ACTIVE_REGION = activeRegion();
 /** Область рельефа и снимков, на которой строятся все задания. */
-export const REGION = L.region;
+export const REGION = ACTIVE_REGION.location.region;
+/** Дома, леса, дороги и вода района (src/sim/osm.ts), если они есть. */
+export const ACTIVE_OSM_URL = ACTIVE_REGION.osmUrl;
 
-const COMMON = {
-  site: L.site,
-  siteName: L.siteName,
-  shearExponent: 0.2,
-  cloudCover: 0.3,
-  cloudBaseM: 1500,
-  date: L.date,
-  utcOffsetH: L.utcOffsetH,
-};
-
-const DEFAULTS: Settings = {
-  cameraId: PROFILE.camera.id,
-  gsdCm: 4,
-  forwardOverlapPct: 80,
-  sideOverlapPct: 60,
-  directionDeg: 90,
-  shutter: 1600,
-  cargoKg: AIRCRAFT.payloadMaxKg,
-  iasMs: AIRCRAFT.cruiseIasMs,
-  windSpeedMs: L.windSpeedMs,
-  windFromDeg: L.windFromDeg,
-  temperatureC: L.temperatureC,
-  localHour: 11,
-};
-
-/** Первое задание — стартовое. */
-export const SCENARIOS: readonly Scenario[] = [
-  {
-    ...COMMON,
-    id: 'transfer',
-    kind: 'transfer',
-    title: L.transfer.title,
-    briefing: L.transfer.briefing,
-    destination: L.transfer.destination,
-    destinationName: L.transfer.destinationName,
-    route: L.transfer.route,
-    defaults: { ...DEFAULTS },
-  },
-  {
-    ...COMMON,
-    id: 'route',
-    kind: 'route',
-    title: 'Облёт по маршруту',
-    briefing: L.route.briefing,
-    route: L.route.route,
-    defaults: { ...DEFAULTS },
-  },
-  {
-    ...COMMON,
-    id: 'survey',
-    kind: 'survey',
-    title: L.survey.title,
-    briefing: L.survey.briefing,
-    area: L.survey.area,
-    requiredGsdM: 0.04,
-    minFrames: 5,
-    minCoverage: 0.95,
-    defaults: { ...DEFAULTS },
-  },
-  {
-    ...COMMON,
-    id: 'delivery',
-    kind: 'delivery',
-    title: L.delivery.title,
-    briefing: L.delivery.briefing,
-    destination: L.delivery.destination,
-    destinationName: L.delivery.destinationName,
-    route: L.delivery.route,
-    unloadS: 60,
-    defaults: { ...DEFAULTS },
-  },
-];
+/** Задания выбранного района. Первое — стартовое. */
+export const SCENARIOS: readonly Scenario[] = buildScenarios(ACTIVE_REGION.location);
 
 export function findCamera(id: string): SurveyCamera {
   return CAMERAS.find((c) => c.id === id) ?? CAMERAS[0]!;
@@ -221,6 +238,10 @@ const siteAt = (terrain: Terrain, p: GeoPoint): Site => ({ lat: p.lat, lon: p.lo
 const CLIMB = () => AIRCRAFT.planeClimbRateMaxMs * 0.9;
 const DESCENT = () => AIRCRAFT.planeDescentRateMaxMs * 0.9;
 const TAKEOFF_LEG = 'Взлётный маршрут: разгон против ветра';
+/** Рельеф у площадки круче предельного набора или снижения — переход выше, но не больше чем на столько сверх РЛЭ, м. */
+const MAX_EXTRA_VERTICAL_M = 200;
+/** Запас к минимальной высоте над рельефом: профиль строится по точкам через 100 м, а между ними рельеф бывает выше, м. */
+const BETWEEN_SAMPLES_M = 15;
 
 /**
  * Радиус разворота — по наибольшей путевой скорости (по ветру) с 10 % запаса, иначе на
@@ -255,18 +276,17 @@ function routeStage(
   const tas = tasFromIas(s.iasMs, airDensity({ altitudeM: from.elevationM + mean, temperatureC: weather.groundTemperatureC }));
   const wind = windAt(weather, mean);
   const rounded = roundSharpCorners([from, proc.departure, ...points, proc.approach[0], proc.approach[1], to], turnRadius(tas, wind.speedMs));
-  const waypoints = followTerrain(rounded.points, terrain, from.elevationM + VT.transitionHeightM, to.elevationM + VT.backTransitionHeightM, CLIMB(), DESCENT(), {
-    heightAglM: byNodes(heights),
-    groundSpeedMs: (track) => windTriangle(tas, track, wind)?.groundSpeedMs ?? tas,
-    stepM: 100,
-    parts: rounded.parts,
-  });
+  const follow = { heightAglM: byNodes(heights), groundSpeedMs: (track: number) => windTriangle(tas, track, wind)?.groundSpeedMs ?? tas, stepM: 100, parts: rounded.parts };
+  const ends = terrainEndAltitudes(rounded.points, terrain, from.elevationM + VT.transitionHeightM, to.elevationM + VT.backTransitionHeightM, CLIMB(), DESCENT(), follow, AIRCRAFT.minClearanceM + BETWEEN_SAMPLES_M, MAX_EXTRA_VERTICAL_M);
+  const waypoints = followTerrain(rounded.points, terrain, ends.startAltitudeM, ends.endAltitudeM, CLIMB(), DESCENT(), follow);
   const userLegs = points.length + 1;
   return {
     plan: {
       takeoff: from,
       landing: to,
       waypoints,
+      transitionAltitudeM: ends.startAltitudeM,
+      backTransitionAltitudeM: ends.endAltitudeM,
       iasMs: s.iasMs,
       payload,
       terrain,
@@ -326,15 +346,24 @@ function surveyMission(sc: SurveyScenario, s: Settings, terrain: Terrain, weathe
   };
   const heights = [height, height, ...base.route.map(() => height), APPROACH_AGL[0], APPROACH_AGL[1], VT.backTransitionHeightM];
   const rounded = roundSharpCorners([sc.site, ...survey.route, sc.site], radius);
-  const waypoints = followTerrain(rounded.points, terrain, site.elevationM + VT.transitionHeightM, site.elevationM + VT.backTransitionHeightM, CLIMB(), DESCENT(), {
-    heightAglM: byNodes(heights),
-    groundSpeedMs: (track) => windTriangle(tas, track, wind)?.groundSpeedMs ?? tas,
-    stepM: 100,
-    parts: rounded.parts,
-  });
+  const follow = { heightAglM: byNodes(heights), groundSpeedMs: (track: number) => windTriangle(tas, track, wind)?.groundSpeedMs ?? tas, stepM: 100, parts: rounded.parts };
+  const ends = terrainEndAltitudes(rounded.points, terrain, site.elevationM + VT.transitionHeightM, site.elevationM + VT.backTransitionHeightM, CLIMB(), DESCENT(), follow, AIRCRAFT.minClearanceM + BETWEEN_SAMPLES_M, MAX_EXTRA_VERTICAL_M);
+  const waypoints = followTerrain(rounded.points, terrain, ends.startAltitudeM, ends.endAltitudeM, CLIMB(), DESCENT(), follow);
   return {
     kind: 'survey',
-    stages: [{ takeoff: site, landing: site, waypoints, iasMs: s.iasMs, payload: camera, terrain, legLabels: survey.legLabels }],
+    stages: [
+      {
+        takeoff: site,
+        landing: site,
+        waypoints,
+        transitionAltitudeM: ends.startAltitudeM,
+        backTransitionAltitudeM: ends.endAltitudeM,
+        iasMs: s.iasMs,
+        payload: camera,
+        terrain,
+        legLabels: survey.legLabels,
+      },
+    ],
     stageNames: ['Съёмка'],
     procedures: [proc],
     site,

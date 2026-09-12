@@ -46,6 +46,54 @@ export interface GcsHandlers {
   onPrepRequired(on: boolean): void;
   onResize(): void;
   onRouteEdit(points: RoutePoint[]): void;
+  /** Район полётов. Переключение — перезагрузка страницы (делает main.ts). */
+  onRegion?(id: string): void;
+  /** Инструмент рисования зоны на карте; null — отмена. */
+  onZoneTool?(kind: ZoneKind | null): void;
+  onZonesImport?(text: string, fileName: string): void;
+  onZonesExport?(): void;
+  onZonesClear?(): void;
+  onZoneDelete?(id: string): void;
+  /** Поставить ретранслятор щелчком по карте: мачта или аппарат-ретранслятор; null — отмена. */
+  onRelayTool?(kind: RelayKind | null): void;
+  onRelayDelete?(index: number): void;
+  /** Речевые сообщения НСУ: вкл/выкл. */
+  onVoice?(on: boolean): void;
+  /** Выбран голос из списка; «Прослушать» — пробная фраза. */
+  onVoicePick?(uri: string): void;
+  onVoicePreview?(): void;
+}
+
+/** Виды зон — тот же набор, что в модели зон; объявлены здесь, чтобы интерфейс от неё не зависел. */
+export type ZoneKind = 'nofly' | 'gnss-jam' | 'gnss-spoof' | 'link-jam';
+/** Ретранслятор: наземная мачта или аппарат-ретранслятор. */
+export type RelayKind = 'ground' | 'air';
+const ZONE_TITLES: Record<ZoneKind, string> = {
+  nofly: 'Запретная зона',
+  'gnss-jam': 'РЭБ: подавление ГНСС',
+  'gnss-spoof': 'РЭБ: подмена ГНСС',
+  'link-jam': 'РЭБ: подавление связи',
+};
+const ZONE_KINDS = Object.keys(ZONE_TITLES) as ZoneKind[];
+
+/** Строка списка зон: detail — размер («R 1,2 км», «6 вершин, 2,4 км²»). */
+export interface ZoneItem {
+  id: string;
+  kind: ZoneKind;
+  title: string;
+  detail: string;
+}
+
+export interface RegionItem {
+  id: string;
+  title: string;
+  /** Подсказка к пункту списка. */
+  hint: string;
+}
+
+export interface GcsOptions {
+  regions?: RegionItem[];
+  regionId?: string;
 }
 
 export interface SurveyInfo {
@@ -118,6 +166,21 @@ export interface Gcs {
   setSoundMuted(muted: boolean): void;
   /** Выбрать источник погоды в списке (режим задаёт свою погоду). */
   setWeatherSource(src: string): void;
+  /** Список районов; при одном районе и меньше выбор скрыт. */
+  setRegions(list: RegionItem[], currentId: string): void;
+  setZones(list: ZoneItem[]): void;
+  /** Подсветить активный инструмент зон (null — рисования нет). Обработчик onZoneTool не вызывается. */
+  setZoneTool(kind: ZoneKind | null): void;
+  /** Ретрансляторы в окне «Зоны» по порядку (Р1, Р2…). */
+  setRelays(list: { title: string; detail: string }[]): void;
+  /** Подсветить инструмент ретранслятора (null — не ставится). Обработчик onRelayTool не вызывается. */
+  setRelayTool(kind: RelayKind | null): void;
+  /** Голос: available = false — переключатель неактивен, hint — почему (в подсказке). */
+  setVoice(on: boolean, available: boolean, hint?: string): void;
+  /** Русские голоса для выбора (пусто — выбор скрыт) и подсказка, где взять голос лучше. */
+  setVoiceOptions(list: { uri: string; label: string; selected: boolean }[], hint: string | null): void;
+  /** Качество радиосвязи 0..1 (null — скрыть); text — подсказка («Связь: запас 12 дБ, прямая видимость»). */
+  setLink(quality: number | null, text: string): void;
 }
 
 const COMPASS = ['С', 'СВ', 'В', 'ЮВ', 'Ю', 'ЮЗ', 'З', 'СЗ'];
@@ -150,6 +213,8 @@ const ICON: Record<string, string> = {
   console: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/>',
   horizon: '<circle cx="12" cy="12" r="9"/><path d="M3 13h18M8 9h8"/>',
   control: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
+  zones: '<path d="M4 7l7-4 9 4-2 11-8 3-6-6z"/><path d="M9 9l6 6M15 9l-6 6"/>',
+  clear: '<path d="M3 18c2-5 5-1 7-5s4-5 7-6" stroke-dasharray="2 3"/><path d="M15 14l6 6M21 14l-6 6"/>',
 };
 const icon = (k: string) => `<svg viewBox="0 0 24 24">${ICON[k]}</svg>`;
 /** Источник погоды: задание, фактическая сейчас или пресет (weatherPreset в game/weather.ts). */
@@ -167,6 +232,11 @@ const WEATHER_SOURCES: [string, string][] = [
 ];
 
 const button = (a: string, label: string, ic: string, extra = '') => `<button class="gbtn" data-a="${a}" ${extra}>${ic}<span>${label}</span></button>`;
+/** Группа кнопок с подписью. low — прижата к низу колонки. */
+const group = (cls: string, title: string, ...buttons: string[]) => `<div class="grp ${cls}"><i>${title}</i>${buttons.join('')}</div>`;
+/** Кнопки, открывающие одноимённые окна. */
+const WINDOWS = ['task', 'profile', 'prep', 'instructor', 'zones', 'telemetry', 'horizon', 'control', 'console'];
+const ZONE_HINT = 'Выберите вид и нарисуйте на карте. Зона РЭБ — круг: щелчок — центр, второй щелчок — граница. Запретная зона — многоугольник: щелчки по вершинам, двойной щелчок — завершить. Правый щелчок по зоне — удалить.';
 
 type NumKey = Exclude<keyof Settings, 'cameraId' | 'shutter'>;
 const FORMAT: Record<NumKey, (v: number) => string> = {
@@ -199,7 +269,7 @@ const CTL_FORMAT: Record<'iasMs' | 'heightAglM' | 'courseDeg', (v: number) => st
   courseDeg: (v) => `${v}° · ${COMPASS[Math.round(v / 45) % 8]}`,
 };
 
-export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: GcsHandlers): Gcs {
+export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: GcsHandlers, opts: GcsOptions = {}): Gcs {
   const el = document.createElement('div');
   el.className = 'gcs';
 
@@ -216,49 +286,82 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
 
   el.innerHTML = `
   <header class="topbar">
-    <button class="tb" data-a="menu" title="Задача">≡</button>
-    <select class="tb scen" title="Задание">${scenarios.map((s) => `<option value="${s.id}">${s.title}</option>`).join('')}</select>
-    <button class="tb" data-a="restart" title="Сбросить полёт и начать это задание сначала">⟲ Начать заново</button>
-    <div class="tb field photo">📷 Фото <b data-v="photos">0</b></div>
-    <button class="tb field" data-a="rate" title="Ускорение времени">1x</button>
-    <button class="tb field" data-a="pause" title="Пауза (пробел)">❚❚</button>
-    <select class="tb quality" title="Качество графики: дома, деревья, тени, сглаживание">${(Object.keys(QUALITY) as Quality[])
-      .map((k) => `<option value="${k}" ${k === loadQuality() ? 'selected' : ''}>Графика: ${QUALITY[k].label.toLowerCase()}</option>`)
-      .join('')}</select>
-    <button class="tb field" data-a="sound" title="Звук: вкл/выкл">🔊</button>
-    <div class="status" data-v="status">ГОТОВ</div>
+    <div class="tb-group tb-mission">
+      <select class="tb scen" title="Задание">${scenarios.map((s) => `<option value="${s.id}">${s.title}</option>`).join('')}</select>
+      <select class="tb region" hidden></select>
+      <button class="tb" data-a="restart" title="Сбросить полёт и начать это задание сначала">⟲<span class="lbl">Начать заново</span></button>
+    </div>
+    <div class="tb-group tb-sim">
+      <button class="tb field" data-a="rate" title="Ускорение времени">1x</button>
+      <button class="tb field" data-a="pause" title="Пауза (пробел)">❚❚</button>
+      <div class="status" data-v="status">ГОТОВ</div>
+    </div>
     <div class="tb-right">
+      <span class="photo" title="Снято кадров" hidden>📷 <b data-v="photos">0</b></span>
+      <span class="link" data-level="good" data-bars="4" hidden><i></i><i></i><i></i><i></i></span>
       <span class="batt" title="Заряд и напряжение (оценка без просадки)">🔋 <b data-v="soc">100%</b> <small data-v="volt">50,4 В</small></span>
-      <span title="Мощность">⚡ <b data-v="power">0</b> Вт</span>
+      <span class="power" title="Мощность">⚡ <b data-v="power">0</b> Вт</span>
       <span class="time" data-v="time">T+0:00</span>
+      <button class="tb" data-a="settings" title="Настройки: графика, звук, голос">⚙</button>
     </div>
   </header>
+  <div class="menu settings" data-menu="settings" hidden>
+    <label class="select"><span>Графика</span><select class="quality" title="Качество графики: дома, деревья, тени, сглаживание">${(Object.keys(QUALITY) as Quality[])
+      .map((k) => `<option value="${k}" ${k === loadQuality() ? 'selected' : ''}>${QUALITY[k].label}</option>`)
+      .join('')}</select></label>
+    <button data-a="sound">🔊 Звук включён</button>
+    <button data-a="voice" ${h.onVoice ? '' : 'hidden'}>🗣 Голос: выкл</button>
+    <label class="select voice-pick" hidden><span>Голос</span><select data-voice-pick title="Русские голоса браузера: нейросетевые звучат естественнее"></select></label>
+    <button data-a="voice-preview" hidden>▶ Прослушать</button>
+    <p class="hint voice-hint" hidden></p>
+  </div>
   <main class="split">
     <section class="map-pane">
       <div class="map"></div>
-      <div class="map-top"><button class="small" data-a="clear">Очистить траекторию</button></div>
-      <div class="col left top">
-        ${button('arm', 'АРМ', icon('arm'))}
-        ${button('takeoff', 'Взлёт', icon('takeoff'))}
-        ${button('mode', 'Режим', icon('mode'))}
-        ${button('emergency', 'Аварийная', icon('emergency'))}
-        ${button('unload', 'Разгрузка', icon('unload'), 'hidden')}
+      <!-- Слева — по порядку работы: план, подготовка и полёт; внизу — тренажёр. Справа — карта и приборы. -->
+      <div class="col left">
+        ${group(
+          'plan',
+          'План',
+          button('task', 'Задача', icon('task'), 'title="Задание, маршрут, погода, бюджет энергии"'),
+          button('profile', 'Рельеф', icon('terrain'), 'title="Профиль рельефа вдоль маршрута"'),
+        )}
+        ${group(
+          'flight',
+          'Полёт',
+          button('prep', 'Подготовка', icon('prep'), 'title="Предполётная подготовка (РЛЭ) — до АРМ"'),
+          button('arm', 'АРМ', icon('arm')),
+          button('takeoff', 'Взлёт', icon('takeoff')),
+          button('mode', 'Режим', icon('mode'), 'title="Режим полёта"'),
+          button('emergency', 'Аварийная', icon('emergency'), 'title="Возврат, посадка, фэйлсейф"'),
+          button('unload', 'Разгрузка', icon('unload'), 'hidden'),
+        )}
+        ${group(
+          'trainer low',
+          'Тренажёр',
+          button('instructor', 'Инструктор', icon('instructor'), 'title="Ввести особый случай"'),
+          button('zones', 'Зоны', icon('zones'), `title="Запретные зоны и РЭБ" ${h.onZoneTool ? '' : 'hidden'}`),
+          button('debrief', 'Разбор', icon('debrief'), 'title="Разбор полёта"'),
+        )}
       </div>
-      <div class="col left mid">${button('task', 'Задача', icon('task'))}${button('prep', 'Подготовка', icon('prep'))}${button('debrief', 'Разбор', icon('debrief'))}${button('instructor', 'Инструктор', icon('instructor'))}</div>
-      <div class="col right top">${button('telemetry', 'Телеметрия', icon('telemetry'))}</div>
-      <div class="col right mid">
-        ${button('follow', 'Навигация', icon('nav'))}
-        ${button('target', 'Цель', icon('target'))}
-        ${button('zoomIn', 'Зум +', icon('zoomIn'))}
-        ${button('zoomOut', 'Зум −', icon('zoomOut'))}
-      </div>
-      <div class="col bottom left">
-        ${button('profile', 'Рельеф', icon('terrain'))}
-        ${button('console', 'Консоль', icon('console'))}
-      </div>
-      <div class="col bottom right">
-        ${button('horizon', 'Авиагоризонт', icon('horizon'))}
-        ${button('control', 'Управление', icon('control'))}
+      <div class="col right">
+        ${group(
+          'maptools',
+          'Карта',
+          button('follow', 'Навигация', icon('nav'), 'title="Карта следует за аппаратом"'),
+          button('target', 'Цель', icon('target'), 'title="Оперативная точка: указать на карте"'),
+          button('zoomIn', 'Зум +', icon('zoomIn')),
+          button('zoomOut', 'Зум −', icon('zoomOut')),
+          button('clear', 'Очистить', icon('clear'), 'title="Очистить траекторию на карте и в 3D"'),
+        )}
+        ${group(
+          'instruments low',
+          'Приборы',
+          button('telemetry', 'Телеметрия', icon('telemetry')),
+          button('horizon', 'Авиагоризонт', icon('horizon')),
+          button('control', 'Управление', icon('control'), 'title="Скорость, высота, курс"'),
+          button('console', 'Консоль', icon('console'), 'title="Журнал событий"'),
+        )}
       </div>
       <div class="menu" data-menu="mode" hidden>
         ${(['auto', 'manual', 'target', 'hold', 'rtl', 'land'] as const).map((m) => `<button data-cmd="${m}">${{ auto: 'МАРШРУТ — по заданию', manual: 'РУЧНОЙ — курс и высота', target: 'ОПЕРАТИВНАЯ ТОЧКА — круг над точкой', hold: 'ОЖИДАНИЕ — круг над аэродромом', rtl: 'ВОЗВРАТ на аэродром', land: 'ПОСАДКА на месте' }[m]}</button>`).join('')}
@@ -284,13 +387,13 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       <div class="pip" hidden><i></i><span></span></div>
     </section>
   </main>
-  ${win('task', 'Задача', '<div class="task-body"></div>', 'left:80px;top:52px;width:330px', true)}
+  ${win('task', 'Задача', '<div class="task-body"></div>', 'width:330px', true)}
   ${win(
     'prep',
     'Предполётная подготовка (РЛЭ, прил. А)',
     `<label class="prep-req"><input type="checkbox" data-prep-req> Требовать подготовку перед АРМ</label>
     <ol class="prep">${PREP_STEPS.map((s) => `<li data-step="${s.id}" data-status="todo"><button class="small" data-prep="${s.id}">Выполнить</button><div><b>${s.title}</b><small>${s.hint}</small><em></em></div></li>`).join('')}</ol>`,
-    'left:80px;top:52px;width:380px',
+    'width:380px',
   )}
   ${win(
     'instructor',
@@ -298,13 +401,27 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     `<p class="hint">Отказ вводится сразу — как в таблице особых случаев РЛЭ. Оператор действует по порядку, разбор оценит реакцию.</p>
     <ul class="inject">${FAILURES.map((f) => `<li><button class="small" data-inject="${f.id}">Ввести</button><div><b>${f.title}</b><small>${f.effect}</small></div></li>`).join('')}</ul>
     <div class="row"><button class="small" data-restore="link">Восстановить связь</button><button class="small" data-restore="gnss">Восстановить ГНСС</button></div>`,
-    'right:calc(45% + 84px);top:52px;width:380px',
+    'width:380px',
   )}
-  ${win('control', 'Управление', controlBody, 'right:calc(45% + 84px);bottom:78px;width:250px')}
-  ${win('telemetry', 'Телеметрия', '<dl class="tm"></dl>', 'right:calc(45% + 84px);top:52px;width:220px')}
-  ${win('horizon', 'Авиагоризонт', '<canvas class="adi" width="150" height="150"></canvas><dl class="tm adi-tm"></dl>', 'right:calc(45% + 84px);top:330px;width:170px')}
-  ${win('console', 'Консоль', '<ul class="log"></ul>', 'left:80px;bottom:78px;width:320px')}
-  ${win('profile', 'Рельеф вдоль маршрута', '<canvas class="prof" width="440" height="130"></canvas>', 'left:80px;bottom:78px;width:460px')}
+  ${win(
+    'zones',
+    'Зоны — запреты, РЭБ и связь',
+    `<div class="zone-tools">${ZONE_KINDS.map((k) => `<button class="small" data-zone="${k}" title="Нарисовать на карте; повторное нажатие или Esc — отмена"><i class="zk" data-kind="${k}"></i>${ZONE_TITLES[k]}</button>`).join('')}</div>
+    <p class="hint zhint">${ZONE_HINT}</p>
+    <ul class="zones"></ul>
+    <div class="row zone-io"><button class="small" data-za="import" title="Файл GeoJSON или KML">Импорт GeoJSON…</button><button class="small" data-za="export">Экспорт</button><button class="small" data-za="clear">Очистить все</button></div>
+    <input type="file" accept=".geojson,.json,.kml" data-zfile hidden>
+    <h4 class="zsub">Ретрансляторы связи</h4>
+    <div class="zone-tools"><button class="small" data-relay="ground" title="Щелчок по карте — поставить мачту 10 м; повторное нажатие или Esc — отмена"><i class="zk rk"></i>Мачта 10 м</button><button class="small" data-relay="air" title="Аппарат-ретранслятор над точкой: около 1000 м над площадкой, не ниже 300 м над рельефом"><i class="zk rk"></i>Аппарат-ретранслятор</button></div>
+    <ul class="zones rlist"></ul>
+    <p class="hint">За хребтом связь пропадает — ретранслятор на гребне её держит. Правый щелчок по значку на карте — убрать.</p>`,
+    'width:350px',
+  )}
+  ${win('control', 'Управление', controlBody, 'width:250px')}
+  ${win('telemetry', 'Телеметрия', '<dl class="tm"></dl>', 'width:220px')}
+  ${win('horizon', 'Авиагоризонт', '<canvas class="adi" width="150" height="150"></canvas><dl class="tm adi-tm"></dl>', 'width:170px')}
+  ${win('console', 'Консоль', '<ul class="log"></ul>', 'width:320px')}
+  ${win('profile', 'Рельеф вдоль маршрута', '<canvas class="prof" width="440" height="130"></canvas>', 'width:460px')}
   <div class="toast" hidden></div>`;
   root.appendChild(el);
 
@@ -312,20 +429,120 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   const mapPane = q<HTMLElement>('.map-pane');
   const taskBody = q<HTMLElement>('.task-body');
 
+  // Окна открываются у своей кнопки и не закрывают другие окна, кнопки и выбор ракурса.
+  // Сдвинутое оператором окно остаётся где было, только не уходит за край.
+  type Box = { l: number; t: number; r: number; b: number };
+  const GAP = 8;
+  const boxOf = (x: Element): Box => {
+    const r = x.getBoundingClientRect();
+    return { l: r.left, t: r.top, r: r.right, b: r.bottom };
+  };
+  const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(x, hi));
+  const area = (): Box => ({ ...boxOf(el), t: boxOf(q('.topbar')).b });
+  const moveTo = (w: HTMLElement, x: number, y: number) => {
+    const g = el.getBoundingClientRect();
+    Object.assign(w.style, { left: `${Math.round(x - g.left)}px`, top: `${Math.round(y - g.top)}px`, right: 'auto', bottom: 'auto' });
+  };
+  const keepIn = (w: HTMLElement, x: number, y: number) => {
+    const a = area();
+    moveTo(w, clamp(x, a.l + GAP, a.r - GAP - w.offsetWidth), clamp(y, a.t + GAP, a.b - GAP - w.offsetHeight));
+  };
+  // Окно выросло (загрузилось задание, пришла телеметрия) — не дать ему уйти за нижний край.
+  const grown = new ResizeObserver((entries) => {
+    const a = area();
+    for (const { target } of entries) {
+      const w = target as HTMLElement;
+      const b = boxOf(w);
+      if (!w.hidden && b.b > a.b - GAP) keepIn(w, b.l, b.t);
+    }
+  });
+  el.querySelectorAll('.win').forEach((w) => grown.observe(w));
+  const place = (w: HTMLElement) => {
+    const r = boxOf(w);
+    if (w.dataset.moved) return keepIn(w, r.l, r.t);
+    const a = area();
+    const wd = r.r - r.l;
+    const ht = r.b - r.t;
+    // Желаемое место — напротив своей кнопки: справа от левой колонки, слева от правой.
+    const btn = el.querySelector(`.gbtn[data-a="${w.dataset.win}"]`);
+    const grp = btn?.closest('.grp');
+    let px = a.l + GAP;
+    let py = a.t + GAP;
+    if (btn && grp) {
+      const g = boxOf(grp);
+      const m = boxOf(mapPane);
+      px = g.l < (m.l + m.r) / 2 ? g.r + GAP : g.l - GAP - wd;
+      py = boxOf(btn).t;
+    }
+    px = clamp(px, a.l + GAP, a.r - GAP - wd);
+    py = clamp(py, a.t + GAP, a.b - GAP - ht);
+    const busy = [...root.querySelectorAll<HTMLElement>('.win, .grp, .view-pane .camera')]
+      .filter((x) => x !== w && x.offsetParent !== null)
+      .map((x) => ({ ...boxOf(x), k: x.classList.contains('win') ? 1 : 4 }));
+    // Цена места: сколько закрыто (кнопки — вчетверо дороже окон), затем — удалённость от желаемого.
+    const cost = (x: number, y: number) => {
+      let s = 0;
+      for (const b of busy) {
+        const dx = Math.min(x + wd, b.r + GAP) - Math.max(x, b.l - GAP);
+        const dy = Math.min(y + ht, b.b + GAP) - Math.max(y, b.t - GAP);
+        if (dx > 0 && dy > 0) s += dx * dy * b.k;
+      }
+      return s * 1e4 + (x - px) ** 2 + (y - py) ** 2;
+    };
+    let best: [number, number] = [px, py];
+    let c = cost(px, py);
+    // Желаемое место занято — лучшее по сетке 12 px: свободное и ближайшее, иначе наименее закрывающее.
+    if (c > 0)
+      for (let y = a.t + GAP; y <= a.b - GAP - ht; y += 12)
+        for (let x = a.l + GAP; x <= a.r - GAP - wd; x += 12) {
+          const cc = cost(x, y);
+          if (cc < c) {
+            c = cc;
+            best = [x, y];
+          }
+        }
+    moveTo(w, ...best);
+  };
+  /** Окно поверх остальных; порядок — через z-index, чтобы не сбрасывать прокрутку. */
+  const front = (w: HTMLElement) => {
+    const z = (x: HTMLElement) => +x.style.zIndex || 0;
+    [...root.querySelectorAll<HTMLElement>('.win')]
+      .filter((x) => x !== w)
+      .sort((a, b) => z(a) - z(b))
+      .concat(w)
+      .forEach((x, i) => (x.style.zIndex = String(1003 + i)));
+  };
+  const openWins = () =>
+    [...el.querySelectorAll<HTMLElement>('.win')].filter((w) => !w.hidden).sort((a, b) => (+a.style.zIndex || 0) - (+b.style.zIndex || 0));
+  /** После изменения размеров: окна у кнопок — заново, сдвинутые — только в пределы экрана. */
+  const relayout = () => openWins().forEach((w) => (w.dataset.moved ? keepIn(w, boxOf(w).l, boxOf(w).t) : place(w)));
+
   // Окна: открыть/закрыть, перетаскивание за заголовок.
   const toggle = (id: string, show?: boolean) => {
     const w = q<HTMLElement>(`[data-win="${id}"]`);
     w.hidden = show === undefined ? !w.hidden : !show;
+    el.querySelector(`.gbtn[data-a="${id}"]`)?.classList.toggle('open', !w.hidden);
+    if (!w.hidden) {
+      front(w);
+      place(w);
+    } else if (id === 'zones') {
+      setTool(null, true);
+      setRelayMode(null, true);
+    }
   };
   el.querySelectorAll<HTMLButtonElement>('[data-close]').forEach((b) => b.addEventListener('click', () => toggle(b.dataset.close!, false)));
   el.querySelectorAll<HTMLElement>('.win-title').forEach((t) => {
     t.addEventListener('pointerdown', (e) => {
       if ((e.target as HTMLElement).closest('button')) return;
       const w = t.parentElement!;
+      front(w);
       const r = w.getBoundingClientRect();
       const dx = e.clientX - r.left;
       const dy = e.clientY - r.top;
-      const move = (ev: PointerEvent) => Object.assign(w.style, { left: `${ev.clientX - dx}px`, top: `${ev.clientY - dy}px`, right: 'auto', bottom: 'auto' });
+      const move = (ev: PointerEvent) => {
+        w.dataset.moved = '1';
+        keepIn(w, ev.clientX - dx, ev.clientY - dy);
+      };
       const up = () => {
         window.removeEventListener('pointermove', move);
         window.removeEventListener('pointerup', up);
@@ -342,12 +559,19 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     const wasHidden = m.hidden;
     closeMenus();
     if (!wasHidden) return;
-    const r = anchor.getBoundingClientRect();
-    const pr = mapPane.getBoundingClientRect();
-    Object.assign(m.style, { left: `${r.right - pr.left + 8}px`, top: `${r.top - pr.top}px` });
     m.hidden = false;
+    // Меню строки состояния — под кнопкой, меню колонки — справа от кнопки, не ниже края.
+    const r = anchor.getBoundingClientRect();
+    const pr = (m.offsetParent ?? el).getBoundingClientRect();
+    if (anchor.closest('.topbar')) Object.assign(m.style, { left: `${Math.max(8, r.right - pr.left - m.offsetWidth)}px`, top: `${r.bottom - pr.top + 4}px` });
+    else Object.assign(m.style, { left: `${r.right - pr.left + 8}px`, top: `${Math.max(8, Math.min(r.top - pr.top, pr.height - m.offsetHeight - 8))}px` });
   };
+  document.addEventListener('pointerdown', (e) => {
+    if (!(e.target as Element).closest?.('.menu, [data-a="mode"], [data-a="emergency"], [data-a="settings"]')) closeMenus();
+  });
 
+  let voiceOn = false;
+  const showVoice = () => (q<HTMLButtonElement>('[data-a="voice"]').textContent = `🗣 Голос: ${voiceOn ? 'вкл' : 'выкл'}`);
   let follow = false;
   let weatherSource = 'scenario';
   let weatherSummary = '';
@@ -360,9 +584,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       if (a === 'arm') h.onCommand(armed ? 'disarm' : 'arm');
       else if (a === 'takeoff') h.onCommand('takeoff');
       else if (a === 'unload') h.onCommand('unload');
-      else if (a === 'mode' || a === 'emergency') openMenu(a, b);
-      else if (a === 'task' || a === 'menu') toggle('task');
-      else if (['telemetry', 'horizon', 'console', 'profile', 'control', 'prep', 'instructor'].includes(a)) toggle(a);
+      else if (a === 'mode' || a === 'emergency' || a === 'settings') openMenu(a, b);
+      else if (WINDOWS.includes(a)) toggle(a);
       else if (a === 'follow') {
         follow = !follow;
         b.classList.toggle('on', follow);
@@ -373,6 +596,11 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       else if (a === 'rate') h.onRate();
       else if (a === 'pause') h.onPause();
       else if (a === 'sound') h.onSound();
+      else if (a === 'voice') {
+        voiceOn = !voiceOn;
+        showVoice();
+        h.onVoice?.(voiceOn);
+      } else if (a === 'voice-preview') h.onVoicePreview?.();
       else if (a === 'debrief') h.onDebrief();
       else if (a === 'restart') h.onRestart();
       else if (a === 'clear') h.onClearTrail();
@@ -387,6 +615,11 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   const scen = q<HTMLSelectElement>('.scen');
   scen.addEventListener('change', () => h.onScenario(scen.value));
   window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeMenus();
+      if (zoneTool) setTool(null, true);
+      return;
+    }
     if (e.code === 'Space' && !(e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement)) {
       e.preventDefault();
       h.onPause();
@@ -402,10 +635,85 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   );
   q<HTMLSelectElement>('.camera').addEventListener('change', (e) => h.onCamera((e.target as HTMLSelectElement).value as CameraMode));
   q<HTMLSelectElement>('.quality').addEventListener('change', (e) => h.onQuality((e.target as HTMLSelectElement).value as Quality));
+  q<HTMLSelectElement>('[data-voice-pick]').addEventListener('change', (e) => h.onVoicePick?.((e.target as HTMLSelectElement).value));
   el.querySelectorAll<HTMLButtonElement>('[data-prep]').forEach((b) => b.addEventListener('click', () => h.onPrepStep(b.dataset.prep as PrepStepId)));
   q<HTMLInputElement>('[data-prep-req]').addEventListener('change', (e) => h.onPrepRequired((e.target as HTMLInputElement).checked));
   el.querySelectorAll<HTMLButtonElement>('[data-inject]').forEach((b) => b.addEventListener('click', () => h.onInject(b.dataset.inject!)));
   el.querySelectorAll<HTMLButtonElement>('[data-restore]').forEach((b) => b.addEventListener('click', () => h.onRestore(b.dataset.restore as 'link' | 'gnss')));
+
+  // Район полётов: выбор скрыт, пока район один.
+  const regionSel = q<HTMLSelectElement>('.region');
+  const setRegions = (list: RegionItem[], currentId: string) => {
+    regionSel.replaceChildren(
+      ...list.map((r) => {
+        const o = new Option(r.title, r.id, false, r.id === currentId);
+        o.title = r.hint;
+        return o;
+      }),
+    );
+    regionSel.hidden = list.length < 2;
+    const cur = list.find((r) => r.id === currentId);
+    regionSel.title = cur ? `Район: ${cur.hint}` : 'Район полётов';
+  };
+  setRegions(opts.regions ?? [], opts.regionId ?? '');
+  regionSel.addEventListener('change', () => h.onRegion?.(regionSel.value));
+
+  // Зоны: инструмент рисования, список, импорт и экспорт. Сами зоны — в main.ts и на карте.
+  let zoneTool: ZoneKind | null = null;
+  const setTool = (k: ZoneKind | null, notify: boolean) => {
+    if (k === zoneTool) return;
+    zoneTool = k;
+    el.querySelectorAll<HTMLButtonElement>('[data-zone]').forEach((b) => b.classList.toggle('on', b.dataset.zone === k));
+    q('.gbtn[data-a="zones"]').classList.toggle('on', k !== null);
+    el.classList.toggle('zone-drawing', k !== null);
+    q('.zhint').textContent =
+      k === null
+        ? ZONE_HINT
+        : k === 'nofly'
+          ? `${ZONE_TITLES[k]}: щелчки по вершинам, двойной щелчок или щелчок по первой вершине — завершить. Esc — отмена.`
+          : `${ZONE_TITLES[k]}: щелчок — центр, второй щелчок — граница. Esc — отмена.`;
+    if (k !== null) setRelayMode(null, true);
+    if (notify) h.onZoneTool?.(k);
+  };
+  // Ретрансляторы: поставить щелчком по карте, убрать — крестиком в списке или правым щелчком по значку.
+  let relayTool: RelayKind | null = null;
+  const setRelayMode = (k: RelayKind | null, notify: boolean) => {
+    if (k === relayTool) return;
+    relayTool = k;
+    el.querySelectorAll<HTMLButtonElement>('[data-relay]').forEach((b) => b.classList.toggle('on', b.dataset.relay === k));
+    if (k !== null) setTool(null, true);
+    if (notify) h.onRelayTool?.(k);
+  };
+  el.querySelectorAll<HTMLButtonElement>('[data-relay]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const k = b.dataset.relay as RelayKind;
+      setRelayMode(relayTool === k ? null : k, true);
+    }),
+  );
+  el.querySelectorAll<HTMLButtonElement>('[data-zone]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const k = b.dataset.zone as ZoneKind;
+      setTool(zoneTool === k ? null : k, true);
+    }),
+  );
+  const zoneFile = q<HTMLInputElement>('[data-zfile]');
+  el.querySelectorAll<HTMLButtonElement>('[data-za]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const a = b.dataset.za;
+      if (a === 'import') zoneFile.click();
+      else if (a === 'export') h.onZonesExport?.();
+      else if (a === 'clear' && window.confirm('Удалить все зоны?')) h.onZonesClear?.();
+    }),
+  );
+  zoneFile.addEventListener('change', () => {
+    const f = zoneFile.files?.[0];
+    zoneFile.value = '';
+    if (f)
+      f.text().then(
+        (text) => h.onZonesImport?.(text, f.name),
+        () => api.log(0, `Не удалось прочитать файл ${f.name}`, 'warn'),
+      );
+  });
 
   // Граница карта | 3D.
   q<HTMLElement>('.splitter').addEventListener('pointerdown', (e) => {
@@ -419,6 +727,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
       h.onResize();
+      relayout();
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
@@ -430,6 +739,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   const prof = q<HTMLCanvasElement>('.prof').getContext('2d')!;
   const logEl = q<HTMLUListElement>('.log');
   let current: Settings | null = null;
+  let isSurvey = false;
   let locked = false;
   let keepRouteOpen = false;
 
@@ -475,7 +785,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
 
   const rows = (list: [string, string, string?][]) => list.map(([k, v, c]) => `<tr class="${c ?? ''}"><td>${k}</td><td>${v}</td></tr>`).join('');
 
-  return {
+  const api: Gcs = {
     mapEl: q<HTMLElement>('.map'),
     viewEl: q<HTMLElement>('.view'),
 
@@ -484,6 +794,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       scen.value = sc.id;
       q<HTMLElement>('[data-win="task"] .win-title span').textContent = `Задача — ${sc.title}`;
       const survey = sc.kind === 'survey';
+      isSurvey = survey;
       taskBody.innerHTML = `
         <div class="brief"><b>${sc.title}</b><p>${sc.briefing}</p></div>
         <label class="select"><span>Режим</span><select data-a="diff">
@@ -657,8 +968,10 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
 
     setSoundMuted(muted) {
       const b = q<HTMLButtonElement>('[data-a="sound"]');
-      b.textContent = muted ? '🔇' : '🔊';
-      b.title = muted ? 'Звук выключен — включить' : 'Звук включён — выключить';
+      b.textContent = muted ? '🔇 Звук выключен' : '🔊 Звук включён';
+      b.title = muted ? 'Включить звук' : 'Выключить звук';
+      // Звук спрятан в меню настроек — выключенный виден на кнопке ⚙.
+      q<HTMLButtonElement>('[data-a="settings"]').textContent = muted ? '⚙ 🔇' : '⚙';
     },
 
     showPreparation(p, required, live) {
@@ -682,6 +995,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       taskBody.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>('[data-k], [data-a="error"], [data-a="day"], [data-a="wsrc"], [data-a="diff"]').forEach((i) => (i.disabled = on));
       taskBody.querySelectorAll<HTMLInputElement | HTMLButtonElement>('[data-rh], [data-rdel], [data-a="route-clear"]').forEach((i) => (i.disabled = on && !keepRoute));
       scen.disabled = on;
+      regionSel.disabled = on;
       el.classList.toggle('flying', on);
     },
 
@@ -698,6 +1012,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       q<HTMLElement>('[data-v="volt"]').textContent = `${fmt(tm.voltageV, 1)} В`;
       q<HTMLElement>('[data-v="power"]').textContent = fmt(s.powerW);
       q<HTMLElement>('[data-v="photos"]').textContent = String(tm.frames.total);
+      q<HTMLElement>('.tb-right .photo').hidden = !isSurvey && tm.frames.total === 0;
       q<HTMLElement>('[data-v="time"]').textContent = `T+${fmtTime(s.t)}`;
       q<HTMLButtonElement>('[data-a="rate"]').textContent = `${tm.rate}x`;
       q<HTMLButtonElement>('[data-a="pause"]').textContent = tm.paused ? '▶' : '❚❚';
@@ -792,5 +1107,94 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       el.classList.toggle('picking', on);
       q<HTMLButtonElement>('[data-a="target"]').classList.toggle('on', on);
     },
+
+    setRegions,
+
+    setZones(list) {
+      const ul = q<HTMLUListElement>('ul.zones');
+      ul.replaceChildren(
+        ...list.map((z) => {
+          const li = document.createElement('li');
+          li.innerHTML = '<i class="zk"></i><div><b></b><small></small></div><button class="x" title="Удалить зону">✕</button>';
+          li.querySelector<HTMLElement>('.zk')!.dataset.kind = z.kind;
+          // Название и размер приходят и из импортированных файлов — только как текст.
+          li.querySelector('b')!.textContent = z.title;
+          li.querySelector('small')!.textContent = [z.title === ZONE_TITLES[z.kind] ? '' : ZONE_TITLES[z.kind], z.detail].filter(Boolean).join(' · ');
+          li.querySelector('button')!.addEventListener('click', () => h.onZoneDelete?.(z.id));
+          return li;
+        }),
+      );
+      if (list.length === 0) ul.innerHTML = '<li class="empty">Зон нет</li>';
+      el.querySelectorAll<HTMLButtonElement>('[data-za="export"], [data-za="clear"]').forEach((b) => (b.disabled = list.length === 0));
+      q('.gbtn[data-a="zones"] span').textContent = list.length ? `Зоны ${list.length}` : 'Зоны';
+    },
+
+    setZoneTool(kind) {
+      setTool(kind, false);
+    },
+
+    setRelays(list) {
+      const ul = q<HTMLUListElement>('ul.rlist');
+      ul.replaceChildren(
+        ...list.map((r, i) => {
+          const li = document.createElement('li');
+          li.innerHTML = '<i class="zk rk"></i><div><b></b><small></small></div><button class="x" title="Убрать ретранслятор">✕</button>';
+          li.querySelector('b')!.textContent = `Р${i + 1} · ${r.title}`;
+          li.querySelector('small')!.textContent = r.detail;
+          li.querySelector('button')!.addEventListener('click', () => h.onRelayDelete?.(i));
+          return li;
+        }),
+      );
+      if (list.length === 0) ul.innerHTML = '<li class="empty">Ретрансляторов нет</li>';
+    },
+
+    setRelayTool(kind) {
+      setRelayMode(kind, false);
+    },
+
+    setVoice(on, available, hint) {
+      voiceOn = on;
+      showVoice();
+      const b = q<HTMLButtonElement>('[data-a="voice"]');
+      b.disabled = !available;
+      b.title = hint ?? (available ? 'Речевые сообщения НСУ' : 'Голос недоступен');
+    },
+
+    setVoiceOptions(list, hint) {
+      const sel = q<HTMLSelectElement>('[data-voice-pick]');
+      // Названия голосов приходят из браузера — только как текст.
+      sel.replaceChildren(
+        ...list.map((v) => {
+          const o = document.createElement('option');
+          o.value = v.uri;
+          o.textContent = v.label;
+          o.selected = v.selected;
+          return o;
+        }),
+      );
+      q<HTMLElement>('.voice-pick').hidden = list.length === 0;
+      q<HTMLButtonElement>('[data-a="voice-preview"]').hidden = list.length === 0;
+      const p = q<HTMLElement>('.voice-hint');
+      p.hidden = !hint;
+      p.textContent = hint ?? '';
+    },
+
+    setLink(quality, text) {
+      const s = q<HTMLElement>('.tb-right .link');
+      s.hidden = quality === null;
+      if (quality === null) return;
+      const k = Math.max(0, Math.min(1, quality));
+      // Палочки: 0 — нет связи; хоть какая-то связь — не меньше одной.
+      s.dataset.bars = String(k <= 0 ? 0 : Math.max(1, Math.round(k * 4)));
+      s.dataset.level = k <= 0 ? 'lost' : k < 0.4 ? 'weak' : 'good';
+      s.title = text;
+    },
   };
+
+  api.setZones([]);
+  // Окно «Задача» открыто с начала — у своей кнопки.
+  place(q<HTMLElement>('[data-win="task"]'));
+  q('.gbtn[data-a="task"]').classList.add('open');
+  window.addEventListener('resize', relayout);
+  return api;
 }

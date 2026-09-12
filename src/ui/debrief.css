@@ -24,6 +24,17 @@
   margin-bottom: 6px;
 }
 
+/* Вывод о полёте одним абзацем. */
+.db-conclusion {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border-left: 3px solid var(--accent, #ff7a00);
+  background: rgba(255, 122, 0, 0.06);
+  font-size: 12.5px;
+  line-height: 1.45;
+  user-select: text;
+}
+
 .db-player {
   display: flex;
   align-items: center;

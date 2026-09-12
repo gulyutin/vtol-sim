@@ -1,5 +1,6 @@
 import { AIRCRAFT } from '../sim/aircraft';
-import { GROUND_MODES, summarize, type Recording, type Sample } from './recorder';
+import type { Zone } from '../sim/zones';
+import { GROUND_MODES, summarize, type Recording, type RecordingEvent, type Sample } from './recorder';
 
 /*
  * Оценка полёта по записи — как разбор у инструктора: выполнено ли задание и где сели,
@@ -50,6 +51,11 @@ export interface AssessInput {
   surveyCoverage?: number;
   /** Груз доставлен (доставка). */
   delivered?: boolean;
+  /**
+   * Зоны задания: есть запретные — в оценке пункт «Запретные зоны» и без нарушений. Сами
+   * нарушения берутся из событий среды в записи (LiveFlight.envEvents).
+   */
+  zones?: readonly Zone[];
 }
 
 /** Названия отказов для разбора; неизвестный id показывается как есть. */
@@ -78,6 +84,20 @@ const REACTION_WINDOW_S = 180;
 /** «АРМ» отдельным словом: в «ДИЗАРМ» перед ним буква. */
 const ARM_RE = /(?<!\p{L})АРМ(?!\p{L})/u;
 const DISARM_RE = /ДИЗАРМ/u;
+/** События зон и помех: в «Ограничениях» не считаются — у них свои пункты. */
+const ENV_RE = /^(РЭБ:|ЗАПРЕТНАЯ ЗОНА:|ГНСС:|Нет связи с НСУ: помехи)/u;
+/** Помехи до посадки: вынужденная посадка не в районе оправдана, как при отказе. */
+const EW_FORCED_RE = /^(РЭБ:|ГНСС: (нет решения|срыв)|Нет связи с НСУ: помехи)/u;
+const NOFLY_IN_RE = /^ЗАПРЕТНАЯ ЗОНА: (вход|борт внутри)/u;
+const NOFLY_ENTRY_RE = /^ЗАПРЕТНАЯ ЗОНА: вход/u;
+const NOFLY_OUT_RE = /^ЗАПРЕТНАЯ ЗОНА: выход/u;
+const EW_ENTER_RE = /^РЭБ: (?:вход в зону|борт внутри новой зоны) /u;
+/** Запретная зона: штраф за каждый вход и за время внутри сверх льготного (10 с — балл), итог не выше NOFLY_CAP. */
+const NOFLY_ENTRY_PENALTY = 15;
+const NOFLY_ENTRY_MAX = 30;
+const NOFLY_GRACE_S = 30;
+const NOFLY_TIME_MAX = 15;
+const NOFLY_CAP = 69;
 
 const fmt = (x: number, digits = 0) => x.toFixed(digits).replace('.', ',');
 const clock = (t: number) => {
@@ -113,6 +133,63 @@ function episodes(samples: Sample[], over: (s: Sample) => boolean): { count: num
   return { count, firstT };
 }
 
+/** Входы в запретные зоны и время внутри — по событиям среды между t0 и t1. */
+function noflyStats(events: readonly RecordingEvent[], t0: number, t1: number): { entries: number; firstT: number; insideS: number } {
+  let entries = 0;
+  let firstT = NaN;
+  let open = 0;
+  let since = 0;
+  let insideS = 0;
+  for (const e of [...events].sort((a, b) => a.t - b.t)) {
+    if (e.t < t0 || e.t > t1) continue;
+    if (NOFLY_IN_RE.test(e.text)) {
+      if (NOFLY_ENTRY_RE.test(e.text)) {
+        entries++;
+        if (Number.isNaN(firstT)) firstT = e.t;
+      }
+      if (open++ === 0) since = e.t;
+    } else if (NOFLY_OUT_RE.test(e.text) && open > 0 && --open === 0) insideS += e.t - since;
+  }
+  if (open > 0) insideS += t1 - since;
+  return { entries, firstT, insideS };
+}
+
+/** Сколько длились перерывы от события start до события end (незакрытый — до t1). */
+function outage(events: readonly RecordingEvent[], start: RegExp, end: RegExp, t1: number): { count: number; s: number } {
+  let count = 0;
+  let s = 0;
+  let from = NaN;
+  for (const e of events) {
+    if (start.test(e.text)) {
+      if (Number.isNaN(from)) {
+        from = e.t;
+        count++;
+      }
+    } else if (end.test(e.text) && !Number.isNaN(from)) {
+      s += e.t - from;
+      from = NaN;
+    }
+  }
+  if (!Number.isNaN(from)) s += t1 - from;
+  return { count, s };
+}
+
+/** Зоны РЭБ для разбора: куда входили, сколько были без ГНСС и без связи, на сколько уводила подмена. */
+function ewSummary(events: readonly RecordingEvent[], t0: number, t1: number): string {
+  const ev = events.filter((e) => e.t >= t0 && e.t <= t1).sort((a, b) => a.t - b.t);
+  const parts: string[] = [];
+  const entered = ev.filter((e) => EW_ENTER_RE.test(e.text)).map((e) => `${e.text.replace(EW_ENTER_RE, '')} на T+${clock(e.t)}`);
+  if (entered.length) parts.push(`зона ${entered.slice(0, 4).join(', ')}${entered.length > 4 ? ' …' : ''}`);
+  const gnss = outage(ev, /^ГНСС: (нет решения|срыв)/u, /^(ГНСС: повторный захват|Сигнал ГНСС восстановлен)/u, t1);
+  if (gnss.count) parts.push(`без ГНСС ${clock(gnss.s)}`);
+  const link = outage(ev, /^Нет связи с НСУ: помехи/u, /^Связь с НСУ восстановлена/u, t1);
+  if (link.count) parts.push(`без связи из-за помех ${clock(link.s)}`);
+  const offsets = ev.map((e) => /^РЭБ: подмена ГНСС прекратилась — место было уведено на (\d+) м/u.exec(e.text)).filter((m) => m !== null);
+  if (offsets.length) parts.push(`подмена ГНСС уводила место до ${Math.max(...offsets.map((m) => Number(m[1])))} м`);
+  else if (ev.some((e) => /^РЭБ: подмена ГНСС — приёмник захвачен/u.test(e.text))) parts.push('приёмник ГНСС захвачен подменой');
+  return parts.join('; ');
+}
+
 export function assessFlight(input: AssessInput): Assessment {
   const { rec, landing, landingZoneRadiusM: R, failures } = input;
   const samples = rec.samples;
@@ -125,6 +202,8 @@ export function assessFlight(input: AssessInput): Assessment {
   const flightEndT = td ? td.t : sum.endT;
   // Отказы, которые успели наступить в полёте, — только они оправдывают посадку не там.
   const occurred = failures.filter((f) => f.t >= sum.startT && f.t <= flightEndT);
+  // Помехи РЭБ до посадки тоже оправдывают вынужденную посадку не там.
+  const forced = occurred.length > 0 || events.some((e) => e.t >= sum.startT && e.t <= flightEndT && EW_FORCED_RE.test(e.text));
   const items: AssessmentItem[] = [];
 
   // 1. Задание и посадка в точке.
@@ -153,7 +232,7 @@ export function assessFlight(input: AssessInput): Assessment {
       } else if (miss! <= 3 * R) {
         land = 0.7;
         landNote = 'посадка рядом с районом';
-      } else if (occurred.length) {
+      } else if (forced) {
         land = 0.6;
         landNote = 'вынужденная посадка вне района';
       } else {
@@ -243,7 +322,7 @@ export function assessFlight(input: AssessInput): Assessment {
     const lim = AIRCRAFT.limits;
     // Сообщение о самом отказе нарушением оператора не считается.
     const alerts = events.filter(
-      (e) => (e.kind === 'warn' || e.kind === 'bad') && !failures.some((f) => Math.abs(e.t - f.t) <= 1) && !/^Отказ/u.test(e.text),
+      (e) => (e.kind === 'warn' || e.kind === 'bad') && !failures.some((f) => Math.abs(e.t - f.t) <= 1) && !/^Отказ/u.test(e.text) && !ENV_RE.test(e.text),
     );
     const bank = episodes(samples, (s) => Math.abs(s.bankDeg) > lim.maxBankDeg + 1);
     const ias = episodes(samples, (s) => s.iasMs > lim.maxIasMs);
@@ -293,6 +372,20 @@ export function assessFlight(input: AssessInput): Assessment {
     }
   }
 
+  // 7. Запретные зоны: вход — грубое нарушение, штраф сверх сотни и потолок итога.
+  const nf = noflyStats(events, sum.startT, flightEndT);
+  if (nf.entries || nf.insideS > 0 || input.zones?.some((z) => z.kind === 'nofly')) {
+    const penalty = Math.min(NOFLY_ENTRY_MAX, NOFLY_ENTRY_PENALTY * nf.entries) + Math.min(NOFLY_TIME_MAX, Math.floor(Math.max(0, nf.insideS - NOFLY_GRACE_S) / 10));
+    const notes: string[] = [];
+    if (nf.entries) notes.push(`вход в запретную зону — ${nf.entries} раз, впервые на T+${clock(nf.firstT)}`);
+    if (nf.insideS > 0) notes.push(`в зоне ${clock(nf.insideS)}`);
+    items.push({ title: 'Запретные зоны', points: penalty ? -penalty : 0, max: 0, note: notes.length ? notes.join('; ') : 'запретные зоны не нарушены' });
+  }
+
+  // 8. Зоны РЭБ — для разбора, без баллов.
+  const ew = ewSummary(events, sum.startT, flightEndT);
+  if (ew) items.push({ title: 'Зоны РЭБ', points: 0, max: 0, note: ew });
+
   for (const it of items) it.points = Math.round(it.points * 10) / 10;
   let total = Math.round(items.reduce((s, it) => s + it.points, 0));
 
@@ -301,8 +394,9 @@ export function assessFlight(input: AssessInput): Assessment {
   let capNote = '';
   if (crashed) [cap, capNote] = [20, 'авария'];
   else if (!landed) [cap, capNote] = [45, 'полёт не закончен посадкой'];
-  else if (miss! > 3 * R && !occurred.length) [cap, capNote] = [45, 'посадка вне района без отказа'];
-  else if (miss! > R && !occurred.length) [cap, capNote] = [69, 'посадка за пределами района'];
+  else if (miss! > 3 * R && !forced) [cap, capNote] = [45, 'посадка вне района без отказа'];
+  else if (miss! > R && !forced) [cap, capNote] = [69, 'посадка за пределами района'];
+  if (nf.entries && cap > NOFLY_CAP) [cap, capNote] = [NOFLY_CAP, 'заход в запретную зону'];
   if (total > cap) {
     items.push({ title: 'Итог ограничен', points: cap - total, max: 0, note: capNote });
     total = cap;

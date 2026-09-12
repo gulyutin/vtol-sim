@@ -1,5 +1,6 @@
 // Только тип: записи живут в src/game, но во время выполнения профиль от них не зависит.
 import type { Recording } from '../game/recorder';
+import type { Relay } from './radio';
 import type { SurveyCamera } from './survey';
 import type { AirState, GeoPoint } from './types';
 
@@ -137,6 +138,8 @@ export interface RoutePoint extends GeoPoint {
 
 /** Район заданий: площадка, область рельефа и снимков, точки заданий. */
 export interface LocationSpec {
+  /** Название района для выбора в интерфейсе: «Подмосковье — долина Оки». */
+  regionName?: string;
   site: GeoPoint;
   /** Название площадки в именительном падеже: «аэродром …». */
   siteName: string;
@@ -154,6 +157,11 @@ export interface LocationSpec {
   route: { briefing: string; route: RoutePoint[] };
   /** Перелёт из А в Б: взлёт на площадке, посадка в другой точке. */
   transfer: { title: string; briefing: string; destination: GeoPoint; destinationName: string; route: RoutePoint[] };
+  /**
+   * Ретрансляторы связи района (radio.ts) — для всех заданий: чтобы задания по умолчанию не теряли
+   * связь за рельефом дольше таймаута и борт на земле в пункте Б был на связи.
+   */
+  relays?: Relay[];
 }
 
 export interface Profile {

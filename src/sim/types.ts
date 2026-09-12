@@ -84,6 +84,13 @@ export interface MissionPlan {
   terrain?: Terrain;
   /** Подписи участков маршрута по номеру routeLeg: «Галс 3 из 13», «Разворот». */
   legLabels?: string[];
+  /**
+   * Высоты перехода в самолётный режим над площадкой взлёта и обратного перехода над площадкой
+   * посадки, м над морем. Нет — по РЛЭ (vtol.transitionHeightM, backTransitionHeightM); выше —
+   * если рельеф у площадки круче предельного набора или снижения (terrainEndAltitudes).
+   */
+  transitionAltitudeM?: number;
+  backTransitionAltitudeM?: number;
 }
 
 /** Фаза с фиксированной длительностью и мощностью (взлёт, переход, посадка). */

@@ -45,13 +45,13 @@ body,
   font-size: 13px;
 }
 
-/* Строка состояния */
+/* Строка состояния: задание и район | симуляция и статус | показатели и настройки */
 .topbar {
   height: 44px;
   flex: none;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 12px;
   padding: 0 8px;
   background: var(--bar);
   border-bottom: 1px solid #b5b5b5;
@@ -76,13 +76,32 @@ button.tb {
   cursor: pointer;
 }
 
-.tb.photo b {
-  min-width: 2ch;
+.tb-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tb-mission {
+  flex: 0 1 auto;
+}
+
+.tb-sim {
+  flex: none;
+  margin: 0 auto;
+}
+
+[data-a='restart'] .lbl {
+  margin-left: 4px;
 }
 
 .status {
-  margin: 0 auto;
-  min-width: 150px;
+  min-width: 130px;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   padding: 5px 18px;
   border: 1px solid #999;
   border-radius: 5px;
@@ -114,10 +133,65 @@ button.tb {
 }
 
 .tb-right {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 14px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.tb-right .photo b {
+  display: inline-block;
+  min-width: 2ch;
+}
+
+/* Качество радиосвязи: палочки, цвет — хорошо / плохо / нет связи */
+.tb-right .link {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 16px;
+  cursor: help;
+}
+
+.tb-right .link i {
+  width: 4px;
+  border-radius: 1px;
+  background: #b9b9b9;
+}
+
+.tb-right .link i:nth-child(1) { height: 25%; }
+.tb-right .link i:nth-child(2) { height: 50%; }
+.tb-right .link i:nth-child(3) { height: 75%; }
+.tb-right .link i:nth-child(4) { height: 100%; }
+
+.tb-right .link[data-bars='1'] i:nth-child(-n + 1),
+.tb-right .link[data-bars='2'] i:nth-child(-n + 2),
+.tb-right .link[data-bars='3'] i:nth-child(-n + 3),
+.tb-right .link[data-bars='4'] i {
+  background: var(--good);
+}
+
+.tb-right .link[data-level='weak'][data-bars='1'] i:nth-child(1),
+.tb-right .link[data-level='weak'][data-bars='2'] i:nth-child(-n + 2) {
+  background: var(--warn);
+}
+
+.tb-right .link[data-level='lost'] i {
+  background: var(--bad);
+  opacity: 0.35;
+}
+
+/* Настройки: графика, звук, голос */
+.menu.settings {
+  min-width: 230px;
+}
+
+.menu.settings label.select {
+  margin: 0;
+  padding: 8px 12px 9px;
+  border-bottom: 1px solid #e2e2e2;
 }
 
 .tb-right .batt.low b {
@@ -183,49 +257,80 @@ button.tb {
   background: var(--btn);
 }
 
-/* Кнопки по краям карты */
+/*
+ * Кнопки по краям карты — группами по порядку работы оператора.
+ * Слева: План → Полёт, внизу Тренажёр; справа: Карта, внизу Приборы.
+ * Высота кнопки подстраивается, чтобы левая колонка (11 кнопок) влезала без прокрутки.
+ */
 .col {
   position: absolute;
+  top: 8px;
+  bottom: 8px;
+  z-index: 1000;
   display: flex;
   flex-direction: column;
   gap: 8px;
-  z-index: 1000;
+  overflow-y: auto;
+  scrollbar-width: none;
+  /* Промежутки между группами — карте, кнопки — в группах. */
+  pointer-events: none;
+  --bh: clamp(34px, calc((100vh - 44px - 146px) / 11), 60px);
+}
+
+.col::-webkit-scrollbar {
+  display: none;
 }
 
 .col.left {
   left: 8px;
 }
 
+/* Справа внизу — масштаб и атрибуция карты */
 .col.right {
   right: 8px;
+  bottom: 44px;
 }
 
-.col.top {
-  top: 8px;
+.grp {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 8px;
+  background: rgba(24, 28, 34, 0.3);
+  pointer-events: auto;
 }
 
-.col.mid {
-  top: 44%;
+.grp > i {
+  font: 600 9px/11px system-ui, sans-serif;
+  font-style: normal;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.9);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+  user-select: none;
 }
 
-.col.bottom {
-  bottom: 12px;
-  flex-direction: row;
+.grp.low {
+  margin-top: auto;
 }
 
-.col.bottom.center {
-  left: 50%;
-  transform: translateX(-50%);
+/* Тренажёр — не боевые кнопки: другой фон группы */
+.grp.trainer {
+  background: rgba(40, 78, 140, 0.45);
 }
 
-.col.bottom.right {
-  right: 70px;
+.grp.trainer .gbtn {
+  background: rgba(228, 236, 248, 0.94);
 }
 
 .gbtn {
   width: 64px;
-  height: 60px;
-  padding: 4px 2px;
+  height: var(--bh, 60px);
+  flex: none;
+  padding: 2px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -241,8 +346,9 @@ button.tb {
 }
 
 .gbtn svg {
-  width: 24px;
-  height: 24px;
+  flex: none;
+  width: clamp(16px, calc(var(--bh, 60px) - 30px), 24px);
+  height: clamp(16px, calc(var(--bh, 60px) - 30px), 24px);
   fill: none;
   stroke: currentColor;
   stroke-width: 1.8;
@@ -271,17 +377,24 @@ button.tb {
   cursor: default;
 }
 
-.map-top {
-  position: absolute;
-  top: 8px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 1000;
+/* Окно кнопки открыто */
+.gbtn.open {
+  box-shadow: inset 0 -3px 0 var(--accent), 0 1px 3px rgba(0, 0, 0, 0.25);
 }
 
+.gbtn[data-a='emergency'] {
+  color: #a8231b;
+}
+
+button.small.on {
+  background: #ffe7cc;
+  border-color: var(--accent);
+}
+
+/* Меню — поверх окон */
 .menu {
   position: absolute;
-  z-index: 1002;
+  z-index: 4000;
   display: flex;
   flex-direction: column;
   min-width: 210px;
@@ -306,7 +419,13 @@ button.tb {
   background: #fff3e6;
 }
 
-.picking .map {
+.menu button:disabled {
+  cursor: default;
+  background: transparent;
+}
+
+.picking .map,
+.zone-drawing .map {
   cursor: crosshair;
 }
 
@@ -319,6 +438,7 @@ button.tb {
   border-radius: 6px;
   box-shadow: 0 8px 26px rgba(0, 0, 0, 0.35);
   max-height: calc(100% - 70px);
+  max-width: calc(100% - 16px);
   display: flex;
   flex-direction: column;
 }
@@ -601,7 +721,7 @@ ul.log li.bad {
   left: 50%;
   top: 70px;
   transform: translateX(-50%);
-  z-index: 1005;
+  z-index: 3000;
   max-width: min(560px, calc(100% - 40px));
   padding: 14px 18px;
   border-radius: 8px;
@@ -721,16 +841,181 @@ ul.log li.bad {
   image-rendering: pixelated;
 }
 
-/* Выбор задания в строке состояния */
+/* Выбор задания и района в строке состояния — сжимаются первыми */
+select.tb {
+  flex: 0 1 auto;
+  min-width: 96px;
+  cursor: pointer;
+}
+
 select.tb.scen {
   max-width: 230px;
   font-weight: 600;
 }
 
-/* Качество графики — рядом с ускорением и паузой, покороче */
-select.tb.quality {
-  max-width: 170px;
+select.tb.region {
+  max-width: 190px;
+}
+
+/* Узкая строка состояния: короче подписи, меньше второстепенного */
+@media (max-width: 1240px) {
+  [data-a='restart'] .lbl,
+  .tb-right small {
+    display: none;
+  }
+  .tb-right {
+    gap: 10px;
+  }
+}
+
+@media (max-width: 1000px) {
+  .tb-right .power {
+    display: none;
+  }
+  select.tb.scen {
+    max-width: 180px;
+  }
+  select.tb.region {
+    max-width: 140px;
+  }
+  .status {
+    min-width: 110px;
+    padding: 5px 10px;
+  }
+}
+
+/* Зоны: инструменты, список */
+.zone-tools {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+}
+
+.zone-tools button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+  line-height: 1.2;
+}
+
+i.zk {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  color: #1f6feb;
+}
+
+i.zk[data-kind='nofly'] {
+  color: var(--bad);
+  border-radius: 2px;
+  background: rgba(214, 69, 69, 0.3);
+}
+
+i.zk[data-kind='gnss-jam'] {
+  color: #d98200;
+}
+
+i.zk[data-kind='gnss-spoof'] {
+  color: #8e44ad;
+}
+
+i.zk[data-kind='link-jam'] {
+  color: #1f6feb;
+}
+
+ul.zones {
+  list-style: none;
+  margin: 6px 0 4px;
+  padding: 0;
+  max-height: 34vh;
+  overflow-y: auto;
+}
+
+ul.zones li {
+  display: grid;
+  grid-template-columns: 13px 1fr auto;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 0;
+  border-top: 1px solid #e3e3e3;
+}
+
+ul.zones li.empty {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+ul.zones li b {
+  display: block;
   font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+ul.zones li small {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.row.zone-io {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.zone-io button {
+  white-space: nowrap;
+}
+
+.zone-io [data-za='clear'] {
+  margin-left: auto;
+}
+
+ul.zones .x {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  color: var(--bad);
+}
+
+.win canvas.prof {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+/* Узкий экран: карта над 3D, строка состояния прокручивается, кнопки мельче */
+@media (max-width: 760px) {
+  .topbar {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .topbar > * {
+    flex: none;
+  }
+  .split {
+    flex-direction: column;
+  }
+  .map-pane {
+    flex: 0 0 58% !important;
+  }
+  .splitter {
+    display: none;
+  }
+  .col {
+    --bh: 40px;
+  }
+  .gbtn {
+    width: 54px;
+  }
+  .gbtn span {
+    max-width: 50px;
+    font-size: 10px;
+  }
 }
 
 /* Предполётная подготовка */
@@ -959,4 +1244,27 @@ ul.checks li.warn {
 .win-title {
   padding: 4px 6px 4px 10px;
   font-size: 12px;
+}
+
+/* Ретрансляторы в окне «Зоны». */
+.win .zsub {
+  margin: 12px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+i.zk.rk {
+  background: #35d0ff;
+  border-color: #35d0ff;
+}
+
+/* Выбор голоса НСУ в меню настроек. */
+.menu.settings .voice-hint {
+  max-width: 300px;
+  margin: 4px 0 0;
+  white-space: normal;
+  line-height: 1.35;
 }

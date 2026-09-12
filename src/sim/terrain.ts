@@ -86,27 +86,12 @@ function bearingDeg(a: GeoPoint, b: GeoPoint): number {
   return (Math.atan2(y, x) / RAD + 360) % 360;
 }
 
-/**
- * Профиль полёта с огибанием рельефа — так летает автопилот: держит заданную высоту над землёй,
- * а не над уровнем моря. points — маршрут в плане от площадки взлёта
- * до площадки посадки. Высота на первом и последнем пункте — startAltitudeM и endAltitudeM.
- *
- * Набор и снижение ограничены предельной вертикальной скоростью, поэтому перед высоким
- * рельефом набор начинается заранее. Где рельеф круче возможного, профиль проходит ниже
- * заданной высоты — это покажет проверка запаса высоты в simulateMission.
- * Возвращает промежуточные точки без первого и последнего пункта.
- */
-export function followTerrain(
-  points: GeoPoint[],
-  terrain: Terrain,
-  startAltitudeM: number,
-  endAltitudeM: number,
-  climbRateMs: number,
-  descentRateMs: number,
-  o: TerrainFollowing,
-): Waypoint[] {
+/** Точка профиля: место, участок и доля участка, путь от начала; набор и снижение — м высоты на метр пути. */
+type RouteSample = GeoPoint & { leg: number; f: number; d: number; climb: number; descent: number };
+
+function sampleRoute(points: GeoPoint[], climbRateMs: number, descentRateMs: number, o: TerrainFollowing): RouteSample[] {
   const step = o.stepM ?? 100;
-  const samples: (GeoPoint & { leg: number; f: number; d: number; climb: number; descent: number })[] = [];
+  const samples: RouteSample[] = [];
   let d = 0;
   for (let k = 1; k < points.length; k++) {
     const a = points[k - 1]!;
@@ -130,6 +115,66 @@ export function followTerrain(
     }
     d += len;
   }
+  return samples;
+}
+
+/**
+ * Высоты концов профиля с огибанием рельефа, м над морем. Если рельеф сразу за площадкой взлёта
+ * поднимается быстрее предельного набора (или перед площадкой посадки — быстрее предельного
+ * снижения), профиль followTerrain прошёл бы ниже рельефа. Тогда переход в самолётный режим
+ * выше: вертикальный набор (снижение) на роторах длиннее — но не больше maxExtraM сверх
+ * startAltitudeM и endAltitudeM; остальное покажет проверка запаса высоты в simulateMission.
+ */
+export function terrainEndAltitudes(
+  points: GeoPoint[],
+  terrain: Terrain,
+  startAltitudeM: number,
+  endAltitudeM: number,
+  climbRateMs: number,
+  descentRateMs: number,
+  o: TerrainFollowing,
+  clearanceM: number,
+  maxExtraM: number,
+): { startAltitudeM: number; endAltitudeM: number } {
+  const samples = sampleRoute(points, climbRateMs, descentRateMs, o);
+  const last = samples.length - 1;
+  if (last < 2) return { startAltitudeM, endAltitudeM };
+  const dd = (i: number) => samples[i + 1]!.d - samples[i]!.d;
+  const req = (i: number) => terrain.elevationM(samples[i]!) + clearanceM;
+  // Наименьшая высота в точке i, с которой набором не круче предельного проходим над всеми следующими.
+  let start = -Infinity;
+  for (let i = last - 1; i >= 1; i--) start = Math.max(req(i), start - samples[i + 1]!.climb * dd(i));
+  start -= samples[1]!.climb * dd(0);
+  // То же к площадке посадки — со снижением не круче предельного.
+  let end = -Infinity;
+  for (let i = 1; i <= last - 1; i++) end = Math.max(req(i), end - samples[i]!.descent * dd(i - 1));
+  end -= samples[last]!.descent * dd(last - 1);
+  return {
+    startAltitudeM: Math.min(startAltitudeM + maxExtraM, Math.max(startAltitudeM, start)),
+    endAltitudeM: Math.min(endAltitudeM + maxExtraM, Math.max(endAltitudeM, end)),
+  };
+}
+
+/**
+ * Профиль полёта с огибанием рельефа — так летает автопилот: держит заданную высоту над землёй,
+ * а не над уровнем моря. points — маршрут в плане от площадки взлёта
+ * до площадки посадки. Высота на первом и последнем пункте — startAltitudeM и endAltitudeM.
+ *
+ * Набор и снижение ограничены предельной вертикальной скоростью, поэтому перед высоким
+ * рельефом набор начинается заранее. Где рельеф круче возможного, профиль проходит ниже
+ * заданной высоты — это покажет проверка запаса высоты в simulateMission.
+ * Возвращает промежуточные точки без первого и последнего пункта.
+ */
+export function followTerrain(
+  points: GeoPoint[],
+  terrain: Terrain,
+  startAltitudeM: number,
+  endAltitudeM: number,
+  climbRateMs: number,
+  descentRateMs: number,
+  o: TerrainFollowing,
+): Waypoint[] {
+  const samples = sampleRoute(points, climbRateMs, descentRateMs, o);
   const last = samples.length - 1;
   const height = (s: { leg: number; f: number }) => (typeof o.heightAglM === 'number' ? o.heightAglM : o.heightAglM(s.leg, s.f));
   const alt = samples.map((s, i) => (i === 0 ? startAltitudeM : i === last ? endAltitudeM : terrain.elevationM(s) + height(s)));
