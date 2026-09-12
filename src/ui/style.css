@@ -1,0 +1,831 @@
+:root {
+  --bar: #dcdcdc;
+  --btn: rgba(236, 236, 236, 0.94);
+  --btn-line: #b9b9b9;
+  --text: #1f2328;
+  --muted: #5f6b76;
+  --win: rgba(246, 246, 246, 0.97);
+  --good: #1f9d55;
+  --warn: #b7791f;
+  --bad: #d64545;
+  --accent: #ff8a1a;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  color: var(--text);
+}
+
+/* Окна, меню и всплывающие сообщения задают display сами — hidden должен побеждать. */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #1b1f24;
+}
+
+.loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 16px;
+  color: #aab4be;
+  background: #1b1f24;
+}
+
+.gcs {
+  position: relative;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+}
+
+/* Строка состояния */
+.topbar {
+  height: 44px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  background: var(--bar);
+  border-bottom: 1px solid #b5b5b5;
+  z-index: 1001;
+}
+
+.tb {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--btn-line);
+  border-radius: 4px;
+  background: #f4f4f4;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+button.tb {
+  cursor: pointer;
+}
+
+.tb.photo b {
+  min-width: 2ch;
+}
+
+.status {
+  margin: 0 auto;
+  min-width: 150px;
+  padding: 5px 18px;
+  border: 1px solid #999;
+  border-radius: 5px;
+  background: #fafafa;
+  text-align: center;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.status[data-mode='auto'],
+.status[data-mode='guided'],
+.status[data-mode='manual'] {
+  background: #d8f5e2;
+  border-color: #3cae6b;
+}
+
+.status[data-mode='rtl'],
+.status[data-mode='backtransition'],
+.status[data-mode='descent'],
+.status[data-mode='final'] {
+  background: #fff0cf;
+  border-color: #d69e2e;
+}
+
+.status[data-mode='crashed'] {
+  background: #ffd9d9;
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+.tb-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tb-right .batt.low b {
+  color: var(--bad);
+}
+
+.tb-right small {
+  color: var(--muted);
+}
+
+/* Карта | 3D */
+.split {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.map-pane {
+  position: relative;
+  flex: 0 0 55%;
+  min-width: 0;
+}
+
+.map {
+  position: absolute;
+  inset: 0;
+  background: #2a2f35;
+}
+
+.splitter {
+  flex: none;
+  width: 6px;
+  cursor: col-resize;
+  background: #9a9a9a;
+  border-left: 1px solid #777;
+  border-right: 1px solid #bbb;
+}
+
+.view-pane {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.view {
+  position: absolute;
+  inset: 0;
+}
+
+.view canvas {
+  display: block;
+}
+
+.view-pane .camera {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  z-index: 5;
+  font: inherit;
+  padding: 4px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--btn-line);
+  background: var(--btn);
+}
+
+/* Кнопки по краям карты */
+.col {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 1000;
+}
+
+.col.left {
+  left: 8px;
+}
+
+.col.right {
+  right: 8px;
+}
+
+.col.top {
+  top: 8px;
+}
+
+.col.mid {
+  top: 44%;
+}
+
+.col.bottom {
+  bottom: 12px;
+  flex-direction: row;
+}
+
+.col.bottom.center {
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.col.bottom.right {
+  right: 70px;
+}
+
+.gbtn {
+  width: 64px;
+  height: 60px;
+  padding: 4px 2px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  border: 1px solid var(--btn-line);
+  border-radius: 6px;
+  background: var(--btn);
+  color: var(--text);
+  font: 11px system-ui, sans-serif;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+
+.gbtn svg {
+  width: 24px;
+  height: 24px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.gbtn span {
+  max-width: 60px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gbtn:hover {
+  background: #fff;
+}
+
+.gbtn.on {
+  background: #ffe7cc;
+  border-color: var(--accent);
+}
+
+.gbtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.map-top {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+}
+
+.menu {
+  position: absolute;
+  z-index: 1002;
+  display: flex;
+  flex-direction: column;
+  min-width: 210px;
+  background: var(--win);
+  border: 1px solid var(--btn-line);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
+}
+
+.menu button {
+  border: 0;
+  border-bottom: 1px solid #e2e2e2;
+  background: transparent;
+  padding: 9px 12px;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+
+.menu button:hover {
+  background: #fff3e6;
+}
+
+.picking .map {
+  cursor: crosshair;
+}
+
+/* Окна */
+.win {
+  position: absolute;
+  z-index: 1003;
+  background: var(--win);
+  border: 1px solid #a9a9a9;
+  border-radius: 6px;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.35);
+  max-height: calc(100% - 70px);
+  display: flex;
+  flex-direction: column;
+}
+
+.win-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 8px 6px 12px;
+  background: #d5d5d5;
+  border-bottom: 1px solid #b3b3b3;
+  border-radius: 6px 6px 0 0;
+  font-weight: 600;
+  cursor: move;
+  user-select: none;
+}
+
+.win-title .x {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.win-body {
+  padding: 10px 12px;
+  overflow: auto;
+}
+
+.brief {
+  margin-bottom: 6px;
+  padding: 7px 9px;
+  border-left: 3px solid var(--accent);
+  background: #fff4e8;
+  border-radius: 3px;
+}
+
+.brief p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+details {
+  border-top: 1px solid #ddd;
+  padding: 6px 0 2px;
+}
+
+summary {
+  cursor: pointer;
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
+}
+
+label.range,
+label.select {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 1px 8px;
+  margin: 5px 0;
+}
+
+label.range input,
+label.select select {
+  grid-column: 1 / -1;
+  width: 100%;
+}
+
+output {
+  font-variant-numeric: tabular-nums;
+  color: #c05a00;
+  font-weight: 600;
+}
+
+select {
+  font: inherit;
+  padding: 3px 4px;
+  border-radius: 4px;
+  border: 1px solid var(--btn-line);
+  background: #fff;
+}
+
+input[type='range'] {
+  accent-color: var(--accent);
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 2px;
+}
+
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+button.small {
+  border: 1px solid var(--btn-line);
+  border-radius: 4px;
+  background: #f4f4f4;
+  padding: 4px 9px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+button.small:hover {
+  background: #fff;
+}
+
+button:disabled,
+input:disabled,
+select:disabled {
+  opacity: 0.55;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+table.kv {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+table.kv td {
+  padding: 2px 0;
+  vertical-align: top;
+}
+
+table.kv td:last-child {
+  text-align: right;
+  padding-left: 8px;
+}
+
+table.kv tr.total td {
+  border-top: 1px solid #ccc;
+  font-weight: 600;
+}
+
+table.kv tr.good td:last-child {
+  color: var(--good);
+}
+
+table.kv tr.bad td:last-child {
+  color: var(--bad);
+}
+
+.verdict {
+  margin-top: 6px;
+  padding: 7px 9px;
+  border-radius: 4px;
+  line-height: 1.4;
+}
+
+.verdict.good {
+  background: #e3f6ea;
+  color: #136c3a;
+}
+
+.verdict.warn {
+  background: #fff3d6;
+  color: #8a5a00;
+}
+
+.verdict.bad {
+  background: #fde2e2;
+  color: #9b1c1c;
+}
+
+.modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+dl.tm {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 3px 10px;
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+dl.tm dt {
+  color: var(--muted);
+}
+
+dl.tm dd {
+  margin: 0;
+  text-align: right;
+}
+
+canvas.adi {
+  display: block;
+  margin: 0 auto 6px;
+}
+
+ul.log {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 220px;
+  overflow: auto;
+  font: 12px ui-monospace, Menlo, monospace;
+}
+
+ul.log li {
+  padding: 2px 0;
+  border-bottom: 1px solid #eee;
+}
+
+ul.log li.warn {
+  color: var(--warn);
+}
+
+ul.log li.bad {
+  color: var(--bad);
+}
+
+/* Окно камеры в 3D-виде */
+.pip {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.7);
+  border-radius: 4px;
+  pointer-events: none;
+}
+
+.pip i {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 22px;
+  height: 22px;
+  margin: -11px 0 0 -11px;
+  border: 1px solid rgba(255, 60, 60, 0.9);
+}
+
+.pip span {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 2px 6px;
+  font: 11px ui-monospace, Menlo, monospace;
+  background: rgba(0, 0, 0, 0.6);
+  color: #e8ffe8;
+}
+
+.pip.flash {
+  animation: flash 0.35s ease-out;
+}
+
+@keyframes flash {
+  from {
+    border-color: #fff;
+    box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.8);
+  }
+  to {
+    border-color: rgba(255, 255, 255, 0.7);
+    box-shadow: none;
+  }
+}
+
+.toast {
+  position: absolute;
+  left: 50%;
+  top: 70px;
+  transform: translateX(-50%);
+  z-index: 1005;
+  max-width: min(560px, calc(100% - 40px));
+  padding: 14px 18px;
+  border-radius: 8px;
+  background: var(--win);
+  border: 2px solid #aaa;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  line-height: 1.45;
+}
+
+.toast.good {
+  border-color: var(--good);
+}
+
+.toast.warn {
+  border-color: #d69e2e;
+}
+
+.toast.bad {
+  border-color: var(--bad);
+}
+
+.toast b {
+  display: block;
+  font-size: 16px;
+  margin-bottom: 4px;
+}
+
+.toast small {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+}
+
+.toast [data-x] {
+  display: block;
+  margin: 10px 0 0 auto;
+}
+
+/* Значки на карте */
+.ac-icon .ac {
+  width: 30px;
+  height: 30px;
+}
+
+.ac-icon svg {
+  width: 30px;
+  height: 30px;
+  fill: #e32222;
+  stroke: #fff;
+  stroke-width: 1.4;
+}
+
+.home-pin div {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #ffe14a;
+  border: 2px solid #222;
+  font: bold 12px system-ui, sans-serif;
+  display: grid;
+  place-items: center;
+}
+
+.wp-pin {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.wp-pin .alt {
+  font: 10px system-ui, sans-serif;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.65);
+  padding: 0 3px;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+.wp-pin b {
+  width: 22px;
+  height: 22px;
+  margin-top: 1px;
+  border-radius: 50% 50% 50% 0;
+  transform: rotate(-45deg);
+  background: #9aa0a6;
+  border: 2px solid #333;
+  display: grid;
+  place-items: center;
+  font: bold 11px system-ui, sans-serif;
+}
+
+.leg-label span {
+  display: inline-block;
+  font: 10px system-ui, sans-serif;
+  background: rgba(255, 255, 255, 0.8);
+  border: 1px solid #999;
+  padding: 0 3px;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+.vertex {
+  background: #fff;
+  border: 2px solid #1f6feb;
+  border-radius: 2px;
+}
+
+.target-pin div {
+  width: 22px;
+  height: 22px;
+  border: 3px solid #ff3b3b;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px #fff;
+}
+
+.leaflet-image-layer.coverage {
+  image-rendering: pixelated;
+}
+
+/* Выбор задания в строке состояния */
+select.tb.scen {
+  max-width: 230px;
+  font-weight: 600;
+}
+
+/* Точки маршрута оператора и пункт доставки */
+.wp-pin.edit b {
+  background: #ffb35c;
+  cursor: grab;
+}
+
+.dest-pin div {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #4fd08a;
+  border: 2px solid #1b1f24;
+  font: bold 12px system-ui, sans-serif;
+  display: grid;
+  place-items: center;
+  cursor: grab;
+}
+
+table.route {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 4px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+table.route td {
+  padding: 2px 3px;
+  border-bottom: 1px solid #e3e3e3;
+}
+
+table.route td:first-child {
+  width: 22px;
+  font-weight: 600;
+  color: #c05a00;
+}
+
+table.route tr.end td {
+  color: var(--muted);
+}
+
+table.route input {
+  width: 64px;
+  font: inherit;
+  padding: 1px 3px;
+}
+
+table.route .x {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  color: var(--bad);
+}
+
+/* Предполётные проверки по РЛЭ */
+ul.checks {
+  list-style: none;
+  margin: 2px 0;
+  padding: 0;
+}
+
+ul.checks li {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  gap: 4px;
+  padding: 2px 0;
+  line-height: 1.3;
+}
+
+ul.checks li i {
+  font-style: normal;
+  font-weight: 700;
+}
+
+ul.checks li.ok i {
+  color: var(--good);
+}
+
+ul.checks li.block {
+  color: var(--bad);
+}
+
+ul.checks li.warn {
+  color: var(--warn);
+}
+
+/* Компактные окна приборов */
+.win[data-win='horizon'] .win-body,
+.win[data-win='telemetry'] .win-body,
+.win[data-win='control'] .win-body {
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.win[data-win='horizon'] dl.tm {
+  grid-template-columns: auto 1fr;
+  gap: 1px 8px;
+}
+
+.win-title {
+  padding: 4px 6px 4px 10px;
+  font-size: 12px;
+}

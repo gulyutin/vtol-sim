@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "lib": ["ES2022"],
+    "types": [],
+    "paths": {
+      "@profile": ["./private/profile/index.ts", "./src/profile-demo/index.ts"]
+    }
+  },
+  "include": ["src/sim", "src/game", "src/profile-demo", "tests", "private"]
+}

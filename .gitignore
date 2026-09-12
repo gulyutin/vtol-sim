@@ -1,0 +1,9 @@
+node_modules/
+dist/
+
+# Свой профиль аппарата и данные — не публикуются
+private/
+logs/
+
+.DS_Store
+*.log
