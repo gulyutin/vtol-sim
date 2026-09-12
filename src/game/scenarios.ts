@@ -112,7 +112,17 @@ const DEFAULTS: Settings = {
   localHour: 11,
 };
 
+/** Первое задание — стартовое. */
 export const SCENARIOS: readonly Scenario[] = [
+  {
+    ...COMMON,
+    id: 'route',
+    kind: 'route',
+    title: 'Облёт по маршруту',
+    briefing: L.route.briefing,
+    route: L.route.route,
+    defaults: { ...DEFAULTS },
+  },
   {
     ...COMMON,
     id: 'survey',
@@ -135,15 +145,6 @@ export const SCENARIOS: readonly Scenario[] = [
     destinationName: L.delivery.destinationName,
     route: L.delivery.route,
     unloadS: 60,
-    defaults: { ...DEFAULTS },
-  },
-  {
-    ...COMMON,
-    id: 'route',
-    kind: 'route',
-    title: 'Облёт по маршруту',
-    briefing: L.route.briefing,
-    route: L.route.route,
     defaults: { ...DEFAULTS },
   },
 ];

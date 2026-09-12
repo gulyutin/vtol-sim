@@ -6,7 +6,7 @@ import { simulateMission } from '../src/sim/mission';
 import { flatTerrain } from '../src/sim/terrain';
 import type { Terrain } from '../src/sim/types';
 
-const sc = SCENARIOS[0]!;
+const sc = SCENARIOS.find((s) => s.kind === 'survey')!;
 const terrain = flatTerrain(320);
 const weather = forecastWeather(sc, sc.defaults);
 const plan = buildMission(sc, sc.defaults, terrain, weather).stages[0]!;

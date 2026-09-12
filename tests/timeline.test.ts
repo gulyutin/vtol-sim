@@ -4,7 +4,7 @@ import { destination, simulateMission } from '../src/sim/mission';
 import { flatTerrain } from '../src/sim/terrain';
 import { buildTimeline, stateAt, timeWhenEnergyReaches } from '../src/sim/timeline';
 
-const sc = SCENARIOS[0]!;
+const sc = SCENARIOS.find((s) => s.kind === 'survey')!;
 const terrain = flatTerrain(320);
 const weather = forecastWeather(sc, sc.defaults);
 const mission = buildMission(sc, sc.defaults, terrain, weather);
