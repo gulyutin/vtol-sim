@@ -1,6 +1,6 @@
 import type { Check } from '../game/preflight';
 import type { RoutePoint, Scenario, ScenarioKind, Settings } from '../game/scenarios';
-import { MODE_NAMES, type Command, type Controls, type LiveState } from '../sim/flight';
+import { EMERGENCY_COMMANDS, MODE_NAMES, type Command, type Controls, type LiveState } from '../sim/flight';
 import { CAMERAS } from '../sim/payload';
 import { loadQuality, QUALITY, type Quality } from './quality';
 import { PREP_STEPS, type Preparation, type PrepStepId } from '../game/preparation';
@@ -371,6 +371,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         <button data-cmd="land">Посадка на месте</button>
         <button data-cmd="failsafe">ФЭЙЛСЕЙФ — ручное управление с ПДУ</button>
         <button data-cmd="copter">КОПТЕР — в фэйлсейфе перейти на роторы</button>
+        ${EMERGENCY_COMMANDS.map((c) => `<button data-cmd="${c.cmd}" title="${c.hint.replace(/"/g, '&quot;')}">${c.label}</button>`).join('')}
       </div>
     </section>
     <div class="splitter" title="Потяните, чтобы изменить доли"></div>

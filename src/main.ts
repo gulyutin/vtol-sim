@@ -74,6 +74,8 @@ const COMMAND_TITLE: Record<string, string> = {
   land: 'ПОСАДКА',
   failsafe: 'ФЭЙЛСЕЙФ',
   copter: 'КОПТЕР',
+  pusherStart: 'ЗАПУСК МАРШЕВОГО',
+  armAir: 'АРМ В ВОЗДУХЕ',
   unload: 'РАЗГРУЗКА',
 };
 
@@ -445,10 +447,23 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     else replan();
   };
   map.onDestinationChange = (p) => {
-    if (started || (scenario.kind !== 'delivery' && scenario.kind !== 'transfer')) return;
-    if (!inRegion(p)) return gcs.log(0, 'Пункт Б вне загруженного рельефа', 'warn');
+    if (scenario.kind !== 'delivery' && scenario.kind !== 'transfer') return;
+    const s = flight.state;
+    const keep = (text: string) => {
+      map.setDestination(destinationOf(scenario));
+      gcs.log(s.t, text, 'warn');
+    };
+    if (!inRegion(p)) return keep('Пункт Б вне загруженного рельефа');
+    if (!started) {
+      scenario = { ...scenario, destination: p };
+      return replan();
+    }
+    // В полёте Б можно перенести, пока аппарат не на посадке и не летит обратно: посадочный маршрут перестраивается.
+    if (stage > 0 || ['backtransition', 'descent', 'final', 'landed', 'crashed', 'falling'].includes(s.mode)) return keep('Пункт Б уже не перенести — аппарат на посадке или летит обратно');
     scenario = { ...scenario, destination: p };
-    replan();
+    rec.event(s.t, 'Пункт Б перенесён — посадочный маршрут перестроен', 'cmd');
+    gcs.log(s.t, 'Пункт Б перенесён — посадочный маршрут перестроен');
+    replanInFlight();
   };
   map.onClick = (p) => {
     if (targetMode) {
@@ -503,7 +518,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     }
     const err = flight.command(c);
     if (err) return gcs.log(s.t, err, 'warn');
-    if (c === 'arm') sound.alarm('arm');
+    if (c === 'arm' || c === 'armAir') sound.alarm('arm');
     if (c === 'disarm') sound.alarm('disarm');
     rec.event(s.t, `Команда: ${COMMAND_TITLE[c] ?? c}`, 'cmd');
     callouts.command(c, s.t);

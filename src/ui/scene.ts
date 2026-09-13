@@ -148,6 +148,7 @@ export class World {
   private readonly chaseOffset = new THREE.Vector3(0, 3.5, 13);
   private readonly pipCamera = new THREE.PerspectiveCamera(6, 3 / 2, 0.5, 30000);
   private readonly tmp = new THREE.Vector3();
+  private readonly lookDir = new THREE.Vector3();
   private clock = 0;
   private readonly windOffset = new THREE.Vector2();
   private readonly cloudWind = new THREE.Vector2();
@@ -618,13 +619,18 @@ export class World {
     (cu['cam']!.value as THREE.Vector3).copy(this.camera.position);
     this.clouds.position.x = this.camera.position.x;
     this.clouds.position.z = this.camera.position.z;
-    this.lod.update(this.camera.position, {
-      camera: this.camera.position,
-      cloudOffset: this.windOffset,
-      cloudCover: cu['cover']!.value as number,
-      cloudBaseY: this.clouds.position.y,
-      sunDir: this.sunDir,
-    });
+    // Направление взгляда — что впереди, то рельеф и загружает раньше.
+    this.lod.update(
+      this.camera.position,
+      {
+        camera: this.camera.position,
+        cloudOffset: this.windOffset,
+        cloudCover: cu['cover']!.value as number,
+        cloudBaseY: this.clouds.position.y,
+        sunDir: this.sunDir,
+      },
+      this.camera.getWorldDirection(this.lookDir),
+    );
     // Мир из OpenStreetMap: деревья качает ветер, ночью горят окна и фонари.
     this.osm?.update(this.camera.position, { time: this.clock, nightFactor: this.nightFactor, wind: this.groundWind });
     this.precip.update(dt, this.camera);

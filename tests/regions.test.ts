@@ -17,6 +17,8 @@ import type { GeoPoint } from '../src/sim/types';
 
 /** Высота площадки над морем, м; у домашнего района — условная. */
 const SITE_ELEVATION_M: Record<string, number> = { home: 250, elbrus: 1876, khibiny: 231, baikal: 488 };
+/** Дополнительные районы профиля (PROFILE.regions) — условная высота. */
+const siteElevationM = (id: string) => SITE_ELEVATION_M[id] ?? 200;
 
 const inside = (r: { south: number; west: number; north: number; east: number }, p: GeoPoint) =>
   p.lat > r.south && p.lat < r.north && p.lon > r.west && p.lon < r.east;
@@ -60,7 +62,7 @@ describe('районы', () => {
 
 describe.each(REGION_PRESETS.map((r) => [r.id, r] as const))('район %s', (id, preset) => {
   const L = preset.location;
-  const terrain = flatTerrain(SITE_ELEVATION_M[id]!);
+  const terrain = flatTerrain(siteElevationM(id));
   const scenarios = buildScenarios(L);
 
   it('четыре задания, первое — перелёт; все точки внутри области не больше 0,3° × 0,5°', () => {

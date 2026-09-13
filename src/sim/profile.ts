@@ -164,6 +164,17 @@ export interface LocationSpec {
   relays?: Relay[];
 }
 
+/** Район заданий для выбора в интерфейсе (src/game/regions.ts). */
+export interface RegionSpec {
+  id: string;
+  title: string;
+  /** Одна строка для выбора: рельеф и высота площадки. */
+  hint: string;
+  location: LocationSpec;
+  /** Дома, леса, дороги и вода района (src/sim/osm.ts). */
+  osmUrl?: string;
+}
+
 export interface Profile {
   /** Заголовок окна. */
   title: string;
@@ -177,6 +188,8 @@ export interface Profile {
   /** Штатная камера — первая в списке. */
   camera: SurveyCamera;
   location: LocationSpec;
+  /** Дополнительные районы профиля — в выборе района сразу после домашнего; id не совпадают с готовыми. */
+  regions?: RegionSpec[];
   /**
    * Бортовой журнал аппарата → запись для разбора (src/game/recorder.ts). Формат журнала —
    * дело профиля; без этого поля разбор открывает только записи симулятора.

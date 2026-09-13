@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Callout, CalloutPriority } from '../src/game/callouts';
 import {
   pickVoice,
+  REC_SAMPLE,
   Voice,
   VOICE_KEY,
   VOICE_LOADING,
@@ -9,13 +10,14 @@ import {
   VOICE_NO_RUSSIAN,
   VOICE_SAMPLE,
   voiceQuality,
+  type ClipPlayer,
   type Platform,
   type Synth,
   type SynthUtterance,
   type SynthVoice,
 } from '../src/ui/voice';
 
-/* Голос НСУ: выбор голоса и очередь — на поддельном синтезаторе, без браузера. */
+/* Голос НСУ: выбор голоса, очередь, записанная озвучка — на поддельных синтезаторе и аудио, без браузера. */
 
 const voice = (name: string, lang = 'ru-RU', localService = true, voiceURI = name): SynthVoice => ({ name, lang, voiceURI, localService });
 const MILENA = voice('Milena');
@@ -78,19 +80,90 @@ class FakeSynth implements Synth {
   }
 }
 
+/** Поддельное аудио: загрузка мгновенная (или с ошибкой), конец записи — end(). */
+class FakeClips implements ClipPlayer {
+  ready = false;
+  unlocks = 0;
+  loads: string[] = [];
+  played: string[] = [];
+  stopped: string[] = [];
+  fail = new Set<string>();
+  private have = new Set<string>();
+  private cur: { url: string; onend: () => void } | null = null;
+  unlock() {
+    this.unlocks++;
+    this.ready = true;
+  }
+  load(url: string) {
+    this.loads.push(url);
+    if (this.fail.has(url)) return Promise.reject(new Error('404'));
+    this.have.add(url);
+    return Promise.resolve();
+  }
+  loaded(url: string) {
+    return this.have.has(url);
+  }
+  play(url: string, _volume: number, onend: () => void) {
+    this.played.push(url);
+    const me = { url, onend };
+    this.cur = me;
+    return {
+      stop: () => {
+        this.stopped.push(url);
+        if (this.cur === me) this.cur = null;
+      },
+    };
+  }
+  end() {
+    const c = this.cur;
+    this.cur = null;
+    c?.onend();
+  }
+  get current() {
+    return this.cur?.url ?? null;
+  }
+}
+
 const utter = (text: string): SynthUtterance => ({ text, lang: '', voice: null, volume: 1, rate: 1, pitch: 1, onstart: null, onend: null, onerror: null });
 const co = (text: string, priority: CalloutPriority = 'info', key = text): Callout => ({ text, priority, key, t: 0 });
+/** Дождаться обещаний (манифест, загрузка записей) — без таймеров: проверки собираются без DOM. */
+const flush = async () => {
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+};
 
 function setup(voices: SynthVoice[] = [MILENA], store = new Map<string, string>(), platform: Platform = 'mac') {
   let now = 0;
   const synth = new FakeSynth(voices);
   const storage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) };
-  const v = new Voice({ synth, makeUtterance: utter, storage, now: () => now, platform });
+  const v = new Voice({ synth, makeUtterance: utter, storage, now: () => now, platform, packUrl: null });
   const advance = (s: number) => {
     now += s;
     v.update();
   };
   return { v, synth, store, advance };
+}
+
+const PACK = '/voice/xenia/';
+const MANIFEST = {
+  voice: 'xenia',
+  name: 'Ксения (запись)',
+  files: { Маршрут: 'marshrut.mp3', 'Потеря связи': 'poterya-svyazi.mp3', 'Переход в самолётный режим': 'perekhod.mp3', 'Пожар на борту': 'pozhar.mp3' },
+  preload: ['Потеря связи', 'Пожар на борту'],
+};
+
+async function setupRec(voices: SynthVoice[] = [MILENA], manifest: unknown = MANIFEST) {
+  let now = 0;
+  const synth = new FakeSynth(voices);
+  const clips = new FakeClips();
+  const store = new Map<string, string>();
+  const storage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) };
+  const v = new Voice({ synth, makeUtterance: utter, storage, now: () => now, platform: 'mac', packUrl: PACK, fetchJson: async () => manifest, clips });
+  await flush();
+  const advance = (s: number) => {
+    now += s;
+    v.update();
+  };
+  return { v, synth, clips, advance };
 }
 
 describe('выбор голоса', () => {
@@ -142,7 +215,7 @@ describe('выбор голоса', () => {
   });
 
   it('нет API — выключен с причиной и не падает', () => {
-    const v = new Voice({ synth: null, storage: null });
+    const v = new Voice({ synth: null, storage: null, packUrl: null });
     expect(v.available).toBe(false);
     expect(v.reason).toBe(VOICE_NO_API);
     expect(v.preview()).toBe(false);
@@ -211,6 +284,13 @@ describe('темп, тон, «Прослушать»', () => {
     expect(v.preview(null, 'Проверка')).toBe(true);
     expect(synth.last).toMatchObject({ text: 'Проверка', voice: GOOGLE });
     expect(synth.cancels).toBeGreaterThanOrEqual(2);
+  });
+
+  it('сокращения синтез говорит словами', () => {
+    const { v, synth, advance } = setup([GOOGLE]);
+    v.say(co('Потеря ГНСС', 'critical'));
+    advance(0);
+    expect(synth.current).toBe('Потеря гэ-эн-эс-эс');
   });
 });
 
@@ -313,5 +393,111 @@ describe('очередь', () => {
     advance(0.3);
     advance(0.5);
     expect(duck).toEqual([true, false]);
+  });
+});
+
+describe('записанная озвучка', () => {
+  it('запись — выбор по умолчанию, выше нейросетевого; есть и без голосов синтеза', async () => {
+    const { v } = await setupRec([MILENA, GOOGLE]);
+    expect(v.voices()[0]).toMatchObject({ uri: 'rec:xenia', name: 'Ксения (запись)', quality: 'recorded', qualityLabel: 'запись', selected: true });
+    expect(v.voices().filter((x) => x.selected)).toHaveLength(1);
+    expect(v.voiceName).toBe('Ксения (запись)');
+    expect(v.quality).toBe('recorded');
+    expect(v.recordedReady).toBe(true);
+    expect(v.hasRecording('Потеря связи')).toBe(true);
+
+    const bare = await setupRec([]);
+    expect(bare.v.available).toBe(true);
+    expect(bare.v.reason).toBeNull();
+    // С записью подсказка про компактный голос не нужна.
+    expect((await setupRec([MILENA])).v.upgradeHint).toBeNull();
+    // Негодный манифест — как без записи.
+    const bad = await setupRec([MILENA], { files: {} });
+    expect(bad.v.recordedReady).toBe(false);
+    expect(bad.v.voices()[0]!.name).toBe('Milena');
+  });
+
+  it('что записано — играет запись, остальное — синтез; критические загружаются при первом жесте', async () => {
+    const { v, synth, clips, advance } = await setupRec();
+    v.unlock();
+    expect(clips.loads).toEqual([`${PACK}poterya-svyazi.mp3`, `${PACK}pozhar.mp3`]);
+    v.say(co('Маршрут'));
+    advance(0);
+    await flush();
+    expect(clips.current).toBe(`${PACK}marshrut.mp3`);
+    clips.end();
+    advance(1);
+    v.say(co('Потеря ГНСС', 'critical'));
+    advance(0.3);
+    expect(synth.current).toBe('Потеря гэ-эн-эс-эс');
+    expect(clips.played).toEqual([`${PACK}marshrut.mp3`]);
+  });
+
+  it('до жеста пользователя запись ждёт; после unlock() — играет сразу', async () => {
+    const { v, clips, advance } = await setupRec();
+    v.say(co('Потеря связи', 'critical'));
+    advance(0);
+    advance(1);
+    expect(clips.played).toEqual([]);
+    v.unlock();
+    advance(0.3);
+    expect(clips.current).toBe(`${PACK}poterya-svyazi.mp3`);
+  });
+
+  it('очередь с записями: критическое перебивает, тот же ключ вытесняет, звук приглушается', async () => {
+    const { v, synth, clips, advance } = await setupRec();
+    const duck: boolean[] = [];
+    v.onSpeaking = (on) => duck.push(on);
+    v.unlock();
+    v.say(co('Маршрут'));
+    advance(0);
+    await flush();
+    v.say(co('Пожар на борту', 'critical'));
+    expect(clips.stopped).toEqual([`${PACK}marshrut.mp3`]);
+    advance(0.3);
+    expect(clips.current).toBe(`${PACK}pozhar.mp3`);
+    v.say([co('Ожидание', 'info', 'mode'), co('Переход в самолётный режим', 'info', 'mode')]);
+    clips.end();
+    advance(1);
+    await flush();
+    expect(clips.current).toBe(`${PACK}perekhod.mp3`);
+    clips.end();
+    advance(1);
+    advance(1);
+    expect(clips.played).toEqual([`${PACK}marshrut.mp3`, `${PACK}pozhar.mp3`, `${PACK}perekhod.mp3`]);
+    expect(synth.spoken.filter((t) => t.trim())).toEqual([]);
+    expect(duck).toEqual([true, false]);
+  });
+
+  it('запись не загрузилась — говорит синтез', async () => {
+    const { v, synth, clips, advance } = await setupRec();
+    clips.fail.add(`${PACK}marshrut.mp3`);
+    v.unlock();
+    v.say(co('Маршрут'));
+    advance(0);
+    await flush();
+    expect(synth.current).toBe('Маршрут');
+  });
+
+  it('выбран голос синтеза — записи не играют; «Прослушать» — и запись, и синтез', async () => {
+    const { v, synth, clips, advance } = await setupRec([MILENA]);
+    expect(v.preview()).toBe(true);
+    expect(clips.unlocks).toBe(1);
+    await flush();
+    expect(clips.current).toBe(`${PACK}perekhod.mp3`);
+    expect(REC_SAMPLE).toBe('Переход в самолётный режим');
+    expect(v.preview('rec:xenia', 'Пожар на борту')).toBe(true);
+    expect(clips.current).toBe(`${PACK}pozhar.mp3`);
+    expect(v.preview('Milena')).toBe(true);
+    expect(clips.current).toBeNull();
+    expect(synth.current).toBe(VOICE_SAMPLE);
+    synth.end();
+
+    v.setVoice('Milena');
+    expect(v.voices().find((x) => x.selected)?.name).toBe('Milena');
+    v.say(co('Маршрут'));
+    advance(1);
+    expect(synth.current).toBe('Маршрут');
+    expect(clips.played).toEqual([`${PACK}perekhod.mp3`, `${PACK}pozhar.mp3`]);
   });
 });

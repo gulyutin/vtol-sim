@@ -12,17 +12,25 @@
  * в выводе только количества и размеры. --cache — папка для ответов Overpass (повторный запуск
  * без сети; имя файла — по тексту запроса); в ней координаты места, поэтому держать её рядом с
  * приватным профилем и удалять.
+ *
+ * --buildings-radius — радиус домов от площадки, м (по умолчанию 14 000). --heights — таблица
+ * поправок по id OSM, JSON: {"w123": 25} или {"w123": {"height": 25, "roof": "pyramidal",
+ * "kind": "other", "levels": 5}} — высоты знаковых зданий и сооружений, которых нет в OSM.
+ * Знаковое (храмы, достопримечательности, памятники, высотки, трубы, башни и мачты) не
+ * отбрасывается по площади (--min-building-area) и упрощается мягче.
  */
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-const ENDPOINTS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+const ENDPOINTS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter', 'https://overpass.private.coffee/api/interpreter'];
 const USER_AGENT = 'vtol-sim/1.0 (fetch-osm.mjs: buildings, forests, roads and water for a 3D flight simulator view)';
 const R = 6371000;
 const RAD = Math.PI / 180;
-/** Дома — в этом радиусе от площадки, м. */
-const BUILDINGS_RADIUS_M = 14000;
+/** Дома — в этом радиусе от площадки, м (--buildings-radius). */
+const BUILDINGS_RADIUS_DEFAULT_M = 14000;
+/** Выше — ошибка в теге: у самых высоких зданий и труб меньше. */
+const MAX_HEIGHT_M = 500;
 /** Леса, дороги и вода — в области, расширенной на столько, м (как рельеф). */
 const MARGIN_M = 3000;
 
@@ -31,7 +39,7 @@ function parseArgs(argv) {
   const out = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (['--site', '--bounds', '--out', '--min-building-area', '--cache'].includes(a)) out[a.slice(2)] = argv[++i];
+    if (['--site', '--bounds', '--out', '--min-building-area', '--cache', '--buildings-radius', '--heights'].includes(a)) out[a.slice(2)] = argv[++i];
     else throw new Error(`Неизвестный аргумент: ${a}`);
   }
   return out;
@@ -43,13 +51,17 @@ const nums = (s, n, name) => {
 };
 const args = parseArgs(process.argv.slice(2));
 if (!args.site || !args.bounds || !args.out) {
-  console.error('Использование: node scripts/fetch-osm.mjs --site <lat>,<lon> --bounds <south>,<west>,<north>,<east> --out <file.bin> [--min-building-area м²] [--cache папка]');
+  console.error('Использование: node scripts/fetch-osm.mjs --site <lat>,<lon> --bounds <south>,<west>,<north>,<east> --out <file.bin> [--min-building-area м²] [--buildings-radius м] [--heights файл.json] [--cache папка]');
   process.exit(2);
 }
 const [lat0, lon0] = nums(args.site, 2, 'site');
 const [south, west, north, east] = nums(args.bounds, 4, 'bounds');
 if (!(south < north && west < east)) throw new Error('--bounds: south < north и west < east');
 const minBuildingArea = args['min-building-area'] ? Number(args['min-building-area']) : 0;
+const buildingsRadiusM = args['buildings-radius'] ? Number(args['buildings-radius']) : BUILDINGS_RADIUS_DEFAULT_M;
+if (!(buildingsRadiusM > 0)) throw new Error('--buildings-radius: ожидается число метров');
+/** Поправки по id OSM: «w123», «n45», «r6» → высота или {height, roof, kind, levels}. */
+const OVERRIDES = args.heights ? JSON.parse(readFileSync(args.heights, 'utf8')) : {};
 const cosLat0 = Math.cos(lat0 * RAD);
 
 /** Как toLocal: восток, север, м. */
@@ -383,7 +395,26 @@ const INDUSTRIAL = new Set(['industrial', 'warehouse', 'commercial', 'retail', '
 const SMALL = new Set(['garage', 'garages', 'shed', 'roof', 'hut']);
 /** roof:shape → код формы крыши (src/sim/osm.ts ROOF_SHAPES). */
 const ROOF = { flat: 1, gabled: 2, saltbox: 2, gambrel: 2, mansard: 2, 'half-hipped': 3, hipped: 3, pyramidal: 4, dome: 4, onion: 4, cone: 4, round: 2, skillion: 5, lean_to: 5 };
-function buildingKind(tags, area) {
+/** Храмы: building=* или amenity=place_of_worship. */
+const WORSHIP = new Set(['cathedral', 'church', 'chapel', 'mosque', 'synagogue', 'temple', 'shrine', 'monastery', 'bell_tower']);
+const isWorship = (tags) => WORSHIP.has(tags.building) || tags.amenity === 'place_of_worship';
+/** Знаковое: узнаётся с воздуха по силуэту — не отбрасывается по площади и упрощается мягче. */
+function isLandmark(tags) {
+  return (
+    isWorship(tags) ||
+    tags.tourism === 'attraction' ||
+    (!!tags.historic && tags.historic !== 'no') ||
+    /^(tower|mast|chimney)$/.test(tags.man_made ?? '') ||
+    parseNum(tags.height) >= 50 ||
+    parseNum(tags['building:levels']) >= 16
+  );
+}
+/** Поправка по id OSM (--heights) или null. */
+function overrideOf(el) {
+  const o = OVERRIDES[`${el.type[0]}${el.id}`];
+  return o == null ? null : typeof o === 'number' ? { height: o } : o;
+}
+function buildingKind(tags, area, ov = null) {
   const b = tags.building;
   let kind;
   let h;
@@ -392,23 +423,38 @@ function buildingKind(tags, area) {
   else if (APARTMENTS.has(b)) [kind, h] = ['apartments', 15];
   else if (INDUSTRIAL.has(b)) [kind, h] = ['industrial', 8];
   else if (SMALL.has(b)) [kind, h] = ['other', 3];
+  // Храм без высоты: часовня ниже, собор выше.
+  else if (isWorship(tags)) [kind, h] = ['other', b === 'cathedral' ? 25 : b === 'chapel' ? 8 : 14];
+  else if (tags.man_made === 'chimney' || tags['tower:type'] === 'cooling') [kind, h] = ['industrial', 40];
+  else if (tags.man_made === 'tower' || tags.man_made === 'mast') [kind, h] = ['other', 25];
   else [kind, h] = area < 250 ? ['house', 4.5] : ['other', 6];
   const height = parseNum(tags.height);
-  const levelsTag = parseNum(tags['building:levels']);
+  const roofHeight = parseNum(tags['roof:height']);
+  const levelsTag = ov?.levels > 0 ? ov.levels : parseNum(tags['building:levels']);
   const levels = levelsTag > 0 ? Math.min(60, Math.round(levelsTag)) : 0;
-  if (height > 0) h = height;
+  // height — до верха крыши, в файле — до карниза.
+  if (height > 0) h = roofHeight > 0 && roofHeight < height ? height - roofHeight : height;
   else if (levels > 0) h = levels * 3 + 1;
-  return { kind, height: Math.min(80, Math.max(2, h)), levels, roof: ROOF[tags['roof:shape']] ?? 0 };
+  if (ov?.height > 0) h = ov.height;
+  if (ov?.kind in KIND) kind = ov.kind;
+  let roof = ROOF[ov?.roof ?? tags['roof:shape']] ?? 0;
+  // Купол или шпиль небольшого храма без roof:shape — шатром.
+  if (!roof && isWorship(tags) && area < 1500) roof = ROOF.pyramidal;
+  return { kind, height: Math.min(MAX_HEIGHT_M, Math.max(2, h)), levels, roof };
 }
 
 async function fetchBuildings() {
-  const r = BUILDINGS_RADIUS_M;
+  const r = buildingsRadiusM;
   const parts = [];
-  // Четыре квадранта — меньше нагрузка на сервер за один запрос.
-  for (const [e0, e1] of [[-r, 0], [0, r]]) for (const [n0, n1] of [[-r, 0], [0, r]]) parts.push(bboxLocal(e0, n0, e1, n1));
+  // Квадраты со стороной до 14 км (при радиусе 14 км — четыре квадранта): меньше нагрузка на
+  // сервер за один запрос, и ответ по большому городу не упирается в тайм-аут.
+  const k = 2 * Math.ceil(r / 14000);
+  const step = (2 * r) / k;
+  for (let i = 0; i < k; i++) for (let j = 0; j < k; j++) parts.push(bboxLocal(-r + i * step, -r + j * step, -r + (i + 1) * step, -r + (j + 1) * step));
   const seen = new Set();
   const out = [];
   let dropped = 0;
+  let landmarks = 0;
   for (let p = 0; p < parts.length; p++) {
     const bb = parts[p];
     const q = `[out:json][timeout:180];(way["building"]["building"!="no"](${bb});relation["building"]["building"!="no"]["type"="multipolygon"](${bb}););out geom;`;
@@ -418,8 +464,10 @@ async function fetchBuildings() {
       if (seen.has(key)) continue;
       seen.add(key);
       const tags = el.tags ?? {};
+      const landmark = isLandmark(tags);
+      const ov = overrideOf(el);
       for (const { outer: raw } of polygonsOf(el)) {
-        let ring = simplifyRing(ccw(raw), 0.5);
+        let ring = simplifyRing(ccw(raw), landmark ? 0.2 : 0.5);
         ring = quantize(ring, true);
         const n = ring.length / 2;
         if (n < 3 || n > 65535) continue;
@@ -435,28 +483,102 @@ async function fetchBuildings() {
         ce /= n;
         cn /= n;
         if (ce * ce + cn * cn > r * r) continue;
-        const { kind, height, levels, roof } = buildingKind(tags, area);
-        if (kind === 'other' && area < minBuildingArea) {
+        const { kind, height, levels, roof } = buildingKind(tags, area, ov);
+        if (kind === 'other' && area < minBuildingArea && !landmark && !ov) {
           dropped++;
           continue;
         }
+        if (landmark) landmarks++;
         out.push({ kind: KIND[kind], heightDm: Math.round(height * 10), levels, roof, ring });
       }
     }
   }
-  return { buildings: out, dropped };
+  return { buildings: out, dropped, seen, landmarks };
+}
+
+// --- трубы, башни и мачты, не обведённые как здания ---
+/** Высота без тега и поперечник точки, м. Мачта — тонкая, у высокой трубы — широкое основание. */
+const STRUCTURE = {
+  chimney: { kind: 'industrial', height: 40, diameter: (h) => (h >= 150 ? 16 : h >= 60 ? 8 : 4) },
+  tower: { kind: 'other', height: 25, diameter: () => 8 },
+  mast: { kind: 'other', height: 30, diameter: () => 2.5 },
+};
+
+async function fetchStructures(seen) {
+  const r = buildingsRadiusM;
+  const els = await overpass(`[out:json][timeout:180];nwr["man_made"~"^(chimney|tower|mast)$"](${bboxLocal(-r, -r, r, r)});out geom;`, 'сооружения');
+  const out = [];
+  for (const el of els) {
+    const key = `${el.type}${el.id}`;
+    // Обведённые как здания уже взяты вместе с домами.
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const t = el.tags ?? {};
+    const s = STRUCTURE[t.man_made];
+    const type = t['tower:type'];
+    if (!s || type === 'lighting' || t.disused === 'yes' || t['demolished:man_made']) continue;
+    const ov = overrideOf(el);
+    let height = ov?.height > 0 ? ov.height : parseNum(t.height);
+    if (!(height > 0)) height = type === 'cooling' ? 60 : type === 'bell_tower' ? 15 : s.height;
+    let ring;
+    if (el.type === 'node') {
+      const dTag = parseNum(t.diameter);
+      const d = dTag > 0 && dTag < 200 ? dTag : type === 'cooling' ? 50 : s.diameter(height);
+      const [ce, cn] = toLocal(el.lat, el.lon);
+      ring = [];
+      for (let i = 0; i < 8; i++) ring.push(ce + (d / 2) * Math.cos((i * Math.PI) / 4), cn + (d / 2) * Math.sin((i * Math.PI) / 4));
+    } else {
+      const p = polygonsOf(el)[0];
+      if (!p) continue;
+      ring = simplifyRing(ccw(p.outer), 0.2);
+    }
+    const q = quantize(ring, true);
+    const n = q.length / 2;
+    if (n < 3) continue;
+    let ce = 0;
+    let cn = 0;
+    for (let i = 0; i < n; i++) {
+      ce += q[2 * i] / 10;
+      cn += q[2 * i + 1] / 10;
+    }
+    if ((ce / n) ** 2 + (cn / n) ** 2 > r * r) continue;
+    const kind = ov?.kind in KIND ? ov.kind : type === 'cooling' ? 'industrial' : s.kind;
+    out.push({ kind: KIND[kind], heightDm: Math.round(Math.min(MAX_HEIGHT_M, Math.max(2, height)) * 10), levels: 0, roof: ROOF[ov?.roof] ?? ROOF.flat, ring: q });
+  }
+  return out;
 }
 
 // --- леса ---
+/**
+ * Запрос по квадратам 2 × 2 области с запасом, без повторов на стыках: ответ по всей области
+ * с лесами или водой большого района не укладывается в тайм-аут сервера. Геометрия у
+ * элемента полная, режется по всей области потом — итог тот же, что одним запросом.
+ */
+async function overpassTiled(query, label) {
+  const parts = tiles(AREA_E0, AREA_N0, AREA_E1, AREA_N1, 2);
+  const seen = new Set();
+  const out = [];
+  for (let p = 0; p < parts.length; p++) {
+    for (const el of await overpass(query(parts[p]), `${label} ${p + 1}/${parts.length}`)) {
+      const key = `${el.type}${el.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(el);
+    }
+  }
+  return out;
+}
+
 async function fetchForests() {
   const [e0, n0, e1, n1] = [AREA_E0, AREA_N0, AREA_E1, AREA_N1];
-  const bb = bboxLocal(e0, n0, e1, n1);
-  const q =
-    `[out:json][timeout:180];(` +
-    `way["landuse"="forest"](${bb});way["natural"="wood"](${bb});` +
-    `relation["landuse"="forest"]["type"="multipolygon"](${bb});relation["natural"="wood"]["type"="multipolygon"](${bb});` +
-    `);out geom;`;
-  const els = await overpass(q, 'леса');
+  const els = await overpassTiled(
+    (bb) =>
+      `[out:json][timeout:180];(` +
+      `way["landuse"="forest"](${bb});way["natural"="wood"](${bb});` +
+      `relation["landuse"="forest"]["type"="multipolygon"](${bb});relation["natural"="wood"]["type"="multipolygon"](${bb});` +
+      `);out geom;`,
+    'леса',
+  );
   const prep = (raw) => {
     const r = quantize(simplifyRing(clipRect(raw, e0, n0, e1, n1), 6), true);
     if (r.length / 2 < 3) return null;
@@ -623,14 +745,16 @@ function waterKind(t) {
 }
 
 async function fetchWater() {
-  const bb = bboxLocal(AREA_E0, AREA_N0, AREA_E1, AREA_N1);
-  const q =
-    `[out:json][timeout:240];(` +
-    `way["natural"="water"](${bb});relation["natural"="water"]["type"="multipolygon"](${bb});` +
-    `way["waterway"="riverbank"](${bb});relation["waterway"="riverbank"]["type"="multipolygon"](${bb});` +
-    `way["landuse"~"^(reservoir|basin)$"](${bb});relation["landuse"~"^(reservoir|basin)$"]["type"="multipolygon"](${bb});` +
-    `);out tags geom;`;
-  const els = await overpass(q, 'вода');
+  const els = await overpassTiled(
+    (bb) =>
+      `[out:json][timeout:240];(` +
+      `way["natural"="water"](${bb});relation["natural"="water"]["type"="multipolygon"](${bb});` +
+      `way["waterway"="riverbank"](${bb});relation["waterway"="riverbank"]["type"="multipolygon"](${bb});` +
+      `way["landuse"~"^(reservoir|basin)$"](${bb});relation["landuse"~"^(reservoir|basin)$"]["type"="multipolygon"](${bb});` +
+      // Не «out tags geom»: без тела у мультиполигона нет членов — реки площадями пропадали бы.
+      `);out geom;`,
+    'вода',
+  );
   const prep = (raw) => {
     const r = quantize(simplifyRing(clipRect(raw, AREA_E0, AREA_N0, AREA_E1, AREA_N1), 1.5), true);
     if (r.length / 2 < 3) return null;
@@ -845,7 +969,9 @@ function encode(d) {
   return { bytes: w.bytes(), sizes };
 }
 
-const { buildings, dropped } = await fetchBuildings();
+const { buildings, dropped, seen, landmarks } = await fetchBuildings();
+const structures = await fetchStructures(seen);
+buildings.push(...structures);
 const forests = await fetchForests();
 const runways = await fetchRunways();
 const { roads, dropped: roadsDropped } = await fetchRoads();
@@ -857,7 +983,7 @@ writeFileSync(args.out, bytes);
 const count = (arr, names, key) => names.map((k, i) => `${k} ${arr.filter((x) => x[key] === i).length}`).join(', ');
 const holes = forests.reduce((s, f) => s + f.rings.length - 1, 0);
 const km = (arr) => (arr.reduce((s, r) => s + lineLengthDm(r.line), 0) / 1000).toFixed(0);
-console.log(`Дома: ${buildings.length} (${count(buildings, ['house', 'apartments', 'industrial', 'other'], 'kind')})${dropped ? `, отброшено мелких: ${dropped}` : ''}`);
+console.log(`Дома: ${buildings.length} (${count(buildings, ['house', 'apartments', 'industrial', 'other'], 'kind')})${dropped ? `, отброшено мелких: ${dropped}` : ''}; знаковых: ${landmarks}, труб, башен и мачт отдельно: ${structures.length}`);
 console.log(`Леса: ${forests.length} (дыр: ${holes})`);
 console.log(`Полосы: ${runways.length} (с твёрдым покрытием: ${runways.filter((r) => r.paved).length})`);
 console.log(`Дороги: ${roads.length}, ${km(roads)} км (${count(roads, ['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'unclassified', 'residential', 'service', 'track', 'rail'], 'cls')}), мостов: ${roads.filter((r) => r.flags & 2).length}, отброшено: ${roadsDropped}`);

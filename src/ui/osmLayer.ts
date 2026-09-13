@@ -26,6 +26,11 @@ export type { OsmEnv } from './osmShared';
 const CHUNK_M = 1000;
 /** Бюджеты сборки за один вызов update, мс: вместе не больше 6 мс, пока подгружается новое место. */
 const BUILD_BUDGET_MS = 1.5;
+/** Высотки, трубы и башни (от TALL_M) видны в TALL_RANGE раз дальше домов; их мало — квадраты крупнее. */
+const TALL_M = 40;
+const TALL_RANGE = 2.5;
+const TALL_CHUNK_M = 3000;
+const TALL_BUDGET_MS = 0.5;
 const WATER_BUDGET_MS = 1;
 const ROAD_BUDGET_MS = 1;
 const TREE_BUDGET_MS = 2.5;
@@ -431,6 +436,8 @@ export class OsmLayer {
   private readonly uniforms = createOsmUniforms();
 
   private readonly buildings: LazyChunks<number>;
+  /** Высотки, трубы и башни — отдельно: видны дальше домов. */
+  private readonly tall: LazyChunks<number>;
   private readonly buildingMat: THREE.MeshStandardMaterial;
   private readonly facadeAtlas: THREE.Texture;
   private readonly roads: OsmRoads;
@@ -462,6 +469,8 @@ export class OsmLayer {
     this.facadeAtlas = bm.atlas;
     this.buildings = new LazyChunks<number>(CHUNK_M, (items) => this.buildBuildings(items));
     this.buildings.group.name = 'osm-buildings';
+    this.tall = new LazyChunks<number>(TALL_CHUNK_M, (items) => this.buildBuildings(items));
+    this.tall.group.name = 'osm-tall';
     data.buildings.forEach((b, i) => {
       const n = b.ring.length >> 1;
       if (n < 3) return;
@@ -470,9 +479,10 @@ export class OsmLayer {
         e += b.ring[2 * k]!;
         nn += b.ring[2 * k + 1]!;
       }
-      this.buildings.add(e / n, nn / n, i);
+      (b.heightM >= TALL_M ? this.tall : this.buildings).add(e / n, nn / n, i);
     });
     this.group.add(this.buildings.group);
+    this.group.add(this.tall.group);
 
     this.water = new OsmWaterLayer(data, groundAt, this.uniforms);
     this.group.add(this.water.group);
@@ -538,6 +548,7 @@ export class OsmLayer {
     const ce = camera.x, cn = -camera.z;
     const r = osmRanges(this.quality);
     this.buildings.update(ce, cn, r.buildingsM, performance.now() + BUILD_BUDGET_MS);
+    this.tall.update(ce, cn, r.buildingsM * TALL_RANGE, performance.now() + TALL_BUDGET_MS);
     this.water.update(ce, cn, r.waterM, performance.now() + WATER_BUDGET_MS);
     this.roads.update(ce, cn, r.roadsM, u.osmNight.value, r.streetLights, performance.now() + ROAD_BUDGET_MS);
     this.updateTrees(ce, cn);
@@ -548,6 +559,7 @@ export class OsmLayer {
     if (this.disposed) return;
     this.disposed = true;
     this.buildings.dispose();
+    this.tall.dispose();
     this.buildingMat.dispose();
     this.facadeAtlas.dispose();
     this.water.dispose();

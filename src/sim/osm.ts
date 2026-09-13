@@ -103,6 +103,95 @@ export const ROAD_PAVED = 1;
 export const ROAD_BRIDGE = 2;
 export const ROAD_LIT = 4;
 
+/**
+ * Высоты концов настила мостов, м: [начало, конец] у каждой дороги-моста, null — не мост.
+ *
+ * Мост в OSM часто разрезан на несколько линий (пролёты, смена числа полос), и стык лежит над
+ * водой: рельеф под ним — русло, настил по нему лёг бы на воду. Берег — конец, где мост кончается
+ * или продолжается обычной дорогой; высота там — рельеф. Стыки — между берегами своей цепочки,
+ * с весами, обратными пути по мосту: у цепочки с двумя берегами высота меняется линейно по длине.
+ */
+export function bridgeDeckEnds(roads: readonly OsmRoad[], groundAt: (east: number, north: number) => number): ([number, number] | null)[] {
+  interface Node {
+    e: number;
+    n: number;
+    edges: number[];
+    shore: boolean;
+    h: number;
+  }
+  // Общие точки линий в файле совпадают до дециметра.
+  const key = (e: number, n: number) => `${Math.round(e * 10)},${Math.round(n * 10)}`;
+  const nodes = new Map<string, Node>();
+  const node = (e: number, n: number): Node => {
+    const k = key(e, n);
+    let v = nodes.get(k);
+    if (!v) nodes.set(k, (v = { e, n, edges: [], shore: false, h: NaN }));
+    return v;
+  };
+  const edges: { a: Node; b: Node; len: number; road: number }[] = [];
+  roads.forEach((r, i) => {
+    const L = r.line;
+    if (!r.bridge || L.length < 4) return;
+    const a = node(L[0]!, L[1]!);
+    const b = node(L[L.length - 2]!, L[L.length - 1]!);
+    let len = 0;
+    for (let k = 0; k + 3 < L.length; k += 2) len += Math.hypot(L[k + 2]! - L[k]!, L[k + 3]! - L[k + 1]!);
+    a.edges.push(edges.length);
+    b.edges.push(edges.length);
+    edges.push({ a, b, len, road: i });
+  });
+  const out: ([number, number] | null)[] = roads.map(() => null);
+  if (!edges.length) return out;
+  for (const r of roads) {
+    const L = r.line;
+    if (r.bridge || L.length < 4) continue;
+    for (const [e, n] of [
+      [L[0]!, L[1]!],
+      [L[L.length - 2]!, L[L.length - 1]!],
+    ] as const) {
+      const v = nodes.get(key(e, n));
+      if (v) v.shore = true;
+    }
+  }
+  const all = [...nodes.values()];
+  for (const v of all) if (v.edges.length === 1) v.shore = true;
+  const shores = all.filter((v) => v.shore);
+  for (const v of shores) v.h = groundAt(v.e, v.n);
+  // От каждого берега — кратчайшие пути по мосту до стыков (через другой берег не идём).
+  const sumW = new Map<Node, number>();
+  const sumH = new Map<Node, number>();
+  for (const s of shores) {
+    const dist = new Map<Node, number>([[s, 0]]);
+    const queue: Node[] = [s];
+    while (queue.length) {
+      // Цепочки короткие — ближайший узел линейным поиском.
+      let bi = 0;
+      for (let i = 1; i < queue.length; i++) if (dist.get(queue[i]!)! < dist.get(queue[bi]!)!) bi = i;
+      const u = queue.splice(bi, 1)[0]!;
+      if (u !== s && u.shore) continue;
+      const du = dist.get(u)!;
+      for (const ei of u.edges) {
+        const ed = edges[ei]!;
+        const w = ed.a === u ? ed.b : ed.a;
+        const d = du + ed.len;
+        if (d < (dist.get(w) ?? Infinity)) {
+          if (!dist.has(w)) queue.push(w);
+          dist.set(w, d);
+        }
+      }
+    }
+    for (const [v, d] of dist) {
+      if (v.shore || !(d > 0)) continue;
+      sumW.set(v, (sumW.get(v) ?? 0) + 1 / d);
+      sumH.set(v, (sumH.get(v) ?? 0) + s.h / d);
+    }
+  }
+  // Кольцо без берегов — по рельефу.
+  for (const v of all) if (!v.shore) v.h = sumW.has(v) ? sumH.get(v)! / sumW.get(v)! : groundAt(v.e, v.n);
+  for (const ed of edges) out[ed.road] = [ed.a.h, ed.b.h];
+  return out;
+}
+
 /** Разбор osm.bin (формат — в начале файла). Неверная сигнатура или обрезанный файл — исключение. */
 export function parseOsm(buf: ArrayBuffer): OsmData {
   const bytes = new Uint8Array(buf);

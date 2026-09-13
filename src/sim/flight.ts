@@ -64,6 +64,21 @@ const FS_IAS_RATE = 2;
 /** Маршевый разгоняет в горизонте до этой доли предельной приборной — выше тяги нет. */
 const PUSHER_TOP_IAS_SHARE = 1.15;
 
+/*
+ * Запуск моторов в воздухе. Остановленный мотор регулятор запускает без датчиков: синхронизация и
+ * раскрутка до рабочих оборотов. Роторы лёгкие — AIR_START_ROTORS_S; маршевый с большим винтом
+ * автопилот раскручивает плавнее (винт в потоке крутится ветряком, рывок срывает синхронизацию) —
+ * PUSHER_START_S. Из кувырка сначала надо выровняться: пока тяга роторов не вверх, она не держит —
+ * TUMBLE_LEVEL_S. Всё это время аппарат падает дальше: высоту на выход считает физика шага.
+ */
+export const AIR_START_ROTORS_S = 1.5;
+export const PUSHER_START_S = 3;
+export const TUMBLE_LEVEL_S = 1;
+/** Маршевый работает без тяги (висение, коптер) — обороты для отрисовки. */
+const PUSHER_IDLE = 0.1;
+/** Из коптера разгон — не ниже этой высоты над землёй, м. */
+const TRANSITION_MIN_AGL_M = 20;
+
 /** Тяга подъёмных роторов на максимуме, в долях веса. */
 const ROTOR_MAX_LIFT = 1.35;
 /**
@@ -199,8 +214,37 @@ export const MODE_NAMES: Record<LiveMode, string> = {
 
 /** Самолётные режимы, в которых оператор может переключаться. */
 const AIRBORNE: LiveMode[] = ['auto', 'guided', 'hold', 'manual', 'rtl'];
-/** Команды, которые подаются с ПДУ, — доходят и без связи с НСУ, если борт в зоне пульта. */
-const RC_COMMANDS: Command[] = ['failsafe', 'copter', 'disarm', 'auto', 'rtl'];
+/** Команды, которые подаются с ПДУ, — доходят и без связи с НСУ, если борт в зоне пульта. АРМ — тумблер на пульте, как и ДИЗАРМ. */
+const RC_COMMANDS: Command[] = ['failsafe', 'copter', 'disarm', 'armAir', 'auto', 'rtl'];
+
+/** Команда подаётся и с ПДУ — без связи с НСУ доходит, если борт в зоне пульта. */
+export const isRcCommand = (c: Command): boolean => RC_COMMANDS.includes(c);
+
+/**
+ * Аварийные команды восстановления — для меню «Аварийная»: cmd — что передать в command(),
+ * title — как назвать в журнале, label — подпись кнопки, hint — подсказка.
+ * «В САМОЛЁТНЫЙ РЕЖИМ» — это МАРШРУТ из «Фэйлсейфа» (ВОЗВРАТ, ОЖИДАНИЕ, РУЧНОЙ работают так же).
+ */
+export const EMERGENCY_COMMANDS = [
+  {
+    cmd: 'pusherStart',
+    title: 'ЗАПУСК МАРШЕВОГО',
+    label: 'ЗАПУСК МАРШЕВОГО',
+    hint: `Маршевый остановлен («квадрокоптер», ДИЗАРМ в полёте): раскрутка ${PUSHER_START_S} с. Только с НСУ`,
+  },
+  {
+    cmd: 'armAir',
+    title: 'АРМ В ВОЗДУХЕ',
+    label: 'АРМ В ВОЗДУХЕ — аварийный запуск моторов',
+    hint: 'Моторы остановлены в полёте: роторы и маршевый. Из планирования — сразу самолётом, из кувырка — на роторах, если хватит высоты',
+  },
+  {
+    cmd: 'auto',
+    title: 'МАРШРУТ',
+    label: 'В САМОЛЁТНЫЙ РЕЖИМ — продолжить маршрут',
+    hint: 'Из «Фэйлсейфа»: из коптера — разгон на маршевом, из самолёта — сразу; маршрут — с ближайшего участка',
+  },
+] as const satisfies readonly { cmd: Command; title: string; label: string; hint: string }[];
 /** Отказы, после которых аппарат неуправляем. */
 const FATAL: FailureId[] = ['power', 'autopilot', 'boom', 'wing'];
 const ZERO_STICK: Stick = { roll: 0, pitch: 0, yaw: 0, throttle: 0 };
@@ -294,8 +338,30 @@ export interface Controls {
 /**
  * arm / disarm — «заармить» и «задизармить» по РЛЭ: разрешение моторам работать.
  * failsafe — внешний пилот берёт управление с ПДУ; copter — с ПДУ в режим «квадрокоптер».
+ * pusherStart — запуск остановленного маршевого в полёте; armAir — аварийный АРМ в воздухе
+ * после остановки моторов (роторы и маршевый).
  */
-export type Command = 'arm' | 'disarm' | 'takeoff' | 'auto' | 'manual' | 'guided' | 'hold' | 'rtl' | 'land' | 'failsafe' | 'copter';
+export type Command =
+  | 'arm'
+  | 'disarm'
+  | 'takeoff'
+  | 'auto'
+  | 'manual'
+  | 'guided'
+  | 'hold'
+  | 'rtl'
+  | 'land'
+  | 'failsafe'
+  | 'copter'
+  | 'pusherStart'
+  | 'armAir';
+
+/** Маршевый: работает; остановлен («квадрокоптер», моторы остановлены в воздухе, не запустился); раскручивается. */
+export type PusherState = 'run' | 'off' | 'starting';
+/** Самолётные режимы автопилота. */
+type PlaneMode = 'auto' | 'guided' | 'hold' | 'manual' | 'rtl';
+/** Куда вернуться после запуска моторов в воздухе. */
+type Resume = PlaneMode | 'failsafe' | 'land';
 
 export interface LiveState {
   t: number;
@@ -347,6 +413,8 @@ export interface LiveState {
   gustMs: number;
   /** В «Фэйлсейфе»: самолётом или коптером ведёт пилот; вне его — null. */
   failsafePhase: 'plane' | 'copter' | null;
+  /** Маршевый двигатель: работает, остановлен или раскручивается («ЗАПУСК МАРШЕВОГО», «АРМ В ВОЗДУХЕ», переход из коптера). */
+  pusherState: PusherState;
   /** Помехи и запретные зоны (zones.ts): для тревог на НСУ и окна инструктора. */
   ew: EwState;
 }
@@ -387,7 +455,8 @@ export class LiveFlight {
   state: LiveState;
   path: PathPoint[];
   /** Площадка посадки этого полёта (конец задания в МАРШРУТЕ). */
-  readonly landing: PathPoint;
+  /** Точка посадки; новый план (пункт Б перенесли в полёте) её меняет. */
+  landing: PathPoint;
   /** Куда идёт ВОЗВРАТ. */
   readonly home: PathPoint;
   readonly capacityWh: number;
@@ -402,7 +471,7 @@ export class LiveFlight {
   private readonly terrain: Terrain;
   private readonly weather: Weather;
   private readonly takeoffPt: PathPoint;
-  private afterTransition: LiveMode = 'auto';
+  private afterTransition: PlaneMode = 'auto';
   private landAt: { east: number; north: number } | null = null;
   /** Почему моторы остановились в воздухе — для сообщения об ударе. */
   private fallCause = '';
@@ -460,6 +529,23 @@ export class LiveFlight {
   private vAir = { e: 0, n: 0 };
   private iasHold = 0;
   private rcLostS = 0;
+
+  /** Маршевый остановлен: в «квадрокоптере» (по РЛЭ), после остановки моторов в воздухе, после неудачного запуска. */
+  private pusherOff = false;
+  /** Запуск в полёте: сколько ещё раскручивается маршевый; роторы (0 — раскручены); выравнивание из кувырка, с. */
+  private pusherSpin: number | null = null;
+  private rotorSpin: number | null = null;
+  private levelLeft: number | null = null;
+  /** Моторы запускаются в падении: куда вернуться, с какой высоты начали; сказано ли, что одним маршевым не выйти. */
+  private restart: { to: Resume; up: number; told: boolean } | null = null;
+  /** В каком режиме остановились моторы — туда и вернуться после запуска в воздухе. */
+  private stoppedFrom: Resume = 'auto';
+  /** Выход из падения на роторах: высота, на которой подана команда запуска. */
+  private catching: { up: number } | null = null;
+  /** Переход: время разгона (идёт, пока маршевый тянет), с какой приборной; МАРШРУТ после него — с ближайшего участка. */
+  private trT = 0;
+  private trFromIas = 0;
+  private resumeAuto = false;
 
   /** События среды для инструктора и разбора — по истинному месту: вход и выход из зон, подмена. */
   readonly envEvents: { t: number; text: string }[] = [];
@@ -551,6 +637,7 @@ export class LiveFlight {
       iasReadingMs: 0,
       gustMs: 0,
       failsafePhase: null,
+      pusherState: 'off',
       ew: emptyEw(),
     };
     if (setup.zones) this.setZones(setup.zones, true);
@@ -582,6 +669,7 @@ export class LiveFlight {
     const s = this.state;
     const leg = s.routeLeg;
     this.path = this.buildPath(plan);
+    this.landing = this.local(plan.landing, plan.landing.elevationM - this.site.elevationM);
     if (['ground', 'spool', 'climb', 'transition'].includes(s.mode) || leg === null) {
       s.wp = 1;
       return;
@@ -714,8 +802,17 @@ export class LiveFlight {
     return { ids, near: ids.length ? null : near };
   }
 
-  /** Команда оператора. Возвращает причину отказа или null. */
+  /**
+   * Команда оператора. Возвращает причину отказа или null — команда принята; ход и итог
+   * (раскрутка, «Маршевый запущен», «не удался») — в events.
+   */
   command(c: Command): string | null {
+    const err = this.exec(c);
+    this.syncMotors();
+    return err;
+  }
+
+  private exec(c: Command): string | null {
     const s = this.state;
     // На земле АРМ, ДИЗАРМ и взлёт даёт расчёт на площадке с ПДУ — и без связи с НСУ.
     const padCommand = (s.mode === 'ground' || s.mode === 'landed') && (c === 'arm' || c === 'disarm' || c === 'takeoff');
@@ -728,6 +825,7 @@ export class LiveFlight {
         if (s.armed) return 'Уже заармлен';
         if (this.dead()) return 'Борт не отвечает — АРМ невозможен';
         s.armed = true;
+        this.pusherOff = false;
         this.events.push({ t: s.t, text: 'АРМ: моторы на холостых' });
         return null;
       case 'disarm':
@@ -755,7 +853,7 @@ export class LiveFlight {
           this.afterTransition = c;
           return null;
         }
-        if (fs && s.failsafePhase === 'copter') return this.resumeFromCopter(c);
+        if (fs) return this.leaveFailsafe(c);
         if (!airborne) return 'Режим доступен только в самолётном полёте';
         this.setMode(c);
         return null;
@@ -768,7 +866,7 @@ export class LiveFlight {
           this.afterTransition = 'rtl';
           return null;
         }
-        if (fs && s.failsafePhase === 'copter') return this.resumeFromCopter('rtl');
+        if (fs) return this.leaveFailsafe('rtl');
         if (!airborne) return 'Возврат — только в полёте';
         this.startRtl();
         return null;
@@ -800,6 +898,10 @@ export class LiveFlight {
         if (s.failsafePhase === 'plane') this.toCopter();
         return null;
       }
+      case 'pusherStart':
+        return this.pusherStartCmd();
+      case 'armAir':
+        return this.armAirCmd();
     }
   }
 
@@ -1139,6 +1241,10 @@ export class LiveFlight {
   }
 
   private disarm(text: string) {
+    this.pusherSpin = null;
+    this.rotorSpin = null;
+    this.levelLeft = null;
+    this.restart = null;
     this.state.armed = false;
     this.state.lift = 0;
     this.state.pusher = 0;
@@ -1257,7 +1363,20 @@ export class LiveFlight {
   }
 
   private setMode(m: LiveMode, text?: string) {
-    if (m !== 'failsafe') this.state.failsafePhase = null;
+    // Моторы встали в воздухе: запомнить, откуда, — туда и вернуться после запуска; маршевый стоит.
+    if (m === 'falling' && this.state.mode !== 'falling') {
+      this.stoppedFrom = this.resumeTarget();
+      this.pusherOff = true;
+    }
+    if (m === 'transition') {
+      this.trT = 0;
+      this.trFromIas = 0;
+      this.resumeAuto = false;
+    }
+    if (m !== 'failsafe') {
+      this.state.failsafePhase = null;
+      this.catching = null;
+    }
     if (m === 'rtl' && this.state.mode !== 'rtl' && this.rtlApproach.length === 0) {
       // На ВОЗВРАТ из перехода — посадочный маршрут строим при входе.
       this.state.mode = m;
@@ -1280,18 +1399,27 @@ export class LiveFlight {
     if (!auto && !this.rcInRange()) return `ПДУ не достаёт: борт дальше ${fmtKm(this.rcRangeM)} км от пилота`;
     const rho = this.rho(s.up);
     const plane = AIRBORNE.includes(s.mode) || ((s.mode === 'transition' || s.mode === 'backtransition') && s.tasMs > this.stallTas(rho));
+    this.toFailsafe(plane ? 'plane' : 'copter', text);
+    if (!plane) {
+      s.iasMs = 0;
+      s.pusher = 0;
+      // «Квадрокоптер» по РЛЭ — маршевый выключен.
+      this.pusherOff = true;
+      this.pusherSpin = null;
+    }
+    return null;
+  }
+
+  /** Управление — пилоту с ПДУ, в стабилизированном самолёте или коптере. */
+  private toFailsafe(phase: 'plane' | 'copter', text: string) {
+    const s = this.state;
     const w = windVec(this.windNow());
     this.vAir = { e: this.lastVel.e - w.e, n: this.lastVel.n - w.n };
     this.iasHold = s.iasMs;
     this.rcLostS = 0;
     this.landAt = null;
     this.setMode('failsafe', text);
-    s.failsafePhase = plane ? 'plane' : 'copter';
-    if (!plane) {
-      s.iasMs = 0;
-      s.pusher = 0;
-    }
-    return null;
+    s.failsafePhase = phase;
   }
 
   /** «Квадрокоптер» из ручного самолёта: маршевый выключен, роторы гасят скорость, крыло пока держит. */
@@ -1301,17 +1429,235 @@ export class LiveFlight {
     this.vAir = { e: s.tasMs * Math.sin(psi), n: s.tasMs * Math.cos(psi) };
     s.failsafePhase = 'copter';
     s.pusher = 0;
+    this.pusherOff = true;
+    this.pusherSpin = null;
     this.events.push({ t: s.t, text: '«Квадрокоптер»: маршевый выключен, роторы на висение' });
   }
 
-  /** Из ручного коптера автопилоту: разгон и дальше заданный режим. */
-  private resumeFromCopter(c: LiveMode): string | null {
+  /**
+   * Из «Фэйлсейфа» автопилоту, в самолётный режим. Из коптера — переходом: маршевый раскручивается
+   * (в «квадрокоптере» он выключен), роторы держат высоту, затем разгон до скорости перехода. Из
+   * самолёта — сразу; если скорость ниже начала перехода — тоже переходом: роторы помогают крылу,
+   * пока маршевый разгоняет. Без маршевого самолётом нельзя. МАРШРУТ — с ближайшего непройденного участка.
+   */
+  private leaveFailsafe(c: PlaneMode): string | null {
     const s = this.state;
-    if (this.failed.has('pusher')) return 'Маршевый не работает: из коптера — только посадка';
-    if (s.aglM < 20) return 'Разгон — не ниже 20 м над землёй';
-    this.afterTransition = c;
-    this.setMode('transition');
+    const copter = s.failsafePhase === 'copter';
+    if (this.failed.has('pusher'))
+      return copter ? 'Маршевый не работает: из коптера — только посадка' : 'Маршевый не работает: самолётом высоту не удержать — посадка коптером или на брюхо с ПДУ';
+    if (copter) {
+      if (s.aglM < TRANSITION_MIN_AGL_M) return `Разгон — не ниже ${TRANSITION_MIN_AGL_M} м над землёй`;
+      return this.startTransition(c);
+    }
+    // Скорость автопилот знает только по ПВД.
+    if (s.iasReadingMs < AIRCRAFT.transitionLowIasMs) {
+      if (this.failed.has('vtol')) return `Скорость мала, подъёмные роторы не работают — разгонитесь с ПДУ до ${Math.round(AIRCRAFT.transitionLowIasMs)} м/с`;
+      return this.startTransition(c);
+    }
+    this.enterPlane(c);
     return null;
+  }
+
+  /** Переход в самолётный режим в полёте: разгон с той воздушной скорости, что есть вдоль курса. */
+  private startTransition(c: PlaneMode): null {
+    const s = this.state;
+    const psi = s.headingDeg * RAD;
+    const fromIas =
+      s.failsafePhase === 'copter' ? Math.max(0, this.vAir.e * Math.sin(psi) + this.vAir.n * Math.cos(psi)) * Math.sqrt(this.rho(s.up) / RHO0) : s.iasMs;
+    if (this.pusherOff && this.pusherSpin === null) this.startPusher();
+    this.afterTransition = c;
+    this.setMode('transition', 'ПЕРЕХОД в самолётный режим: разгон на маршевом');
+    this.trFromIas = fromIas;
+    this.resumeAuto = true;
+    return null;
+  }
+
+  /** В самолётный режим автопилота из ручного управления: ВОЗВРАТ — с посадочным маршрутом, МАРШРУТ — с ближайшего участка. */
+  private enterPlane(c: PlaneMode) {
+    if (c === 'rtl') return this.startRtl();
+    if (c === 'auto') {
+      this.resumeRoute();
+      return this.setMode('auto', 'МАРШРУТ — продолжаю с ближайшего участка');
+    }
+    this.setMode(c);
+  }
+
+  /**
+   * МАРШРУТ после «Фэйлсейфа» или запуска моторов в воздухе: к той точке, к которой шли, а точки,
+   * пройденные за это время (впереди по своему участку их уже нет), пропускаем — как в replacePlan().
+   */
+  private resumeRoute() {
+    const s = this.state;
+    const p = this.navPos();
+    const last = this.path.length - 1;
+    const ahead = (i: number) => {
+      const a = this.path[i]!;
+      const q = this.path[i - 1]!;
+      return (a.east - q.east) * (a.east - p.east) + (a.north - q.north) * (a.north - p.north) > 0;
+    };
+    let wp = clamp(s.wp, 1, last);
+    while (wp < last && !ahead(wp)) wp++;
+    s.wp = wp;
+  }
+
+  /** Куда вернуться после запуска моторов в воздухе — по режиму, в котором они остановились. */
+  private resumeTarget(): Resume {
+    const s = this.state;
+    if (AIRBORNE.includes(s.mode)) return s.mode as PlaneMode;
+    if (s.mode === 'transition') return this.afterTransition;
+    if (s.mode === 'failsafe') return 'failsafe';
+    return 'land';
+  }
+
+  /** Тянет ли маршевый: винт на месте, мотор работает и раскручен. */
+  private pusherThrust(): boolean {
+    return !this.failed.has('pusher') && !this.pusherOff && this.pusherSpin === null;
+  }
+
+  private startPusher(quiet = false) {
+    this.pusherSpin = PUSHER_START_S;
+    if (!quiet) this.events.push({ t: this.state.t, text: `ЗАПУСК МАРШЕВОГО: раскрутка ${PUSHER_START_S} с` });
+  }
+
+  private syncMotors() {
+    const s = this.state;
+    s.pusherState = this.pusherSpin !== null ? 'starting' : !s.armed || this.pusherOff ? 'off' : 'run';
+  }
+
+  /**
+   * ЗАПУСК МАРШЕВОГО. Остановлен он в «квадрокоптере» (по РЛЭ), после остановки моторов в воздухе
+   * и после неудачного запуска. Исправный раскручивается за PUSHER_START_S и тянет. При отказе
+   * «pusher» (по РЛЭ — отрыв винта) мотор крутится, а тяги нет: запуск не удаётся, и повторный
+   * не поможет — винта нет, поэтому восстановления «с вероятностью» здесь нет. После ДИЗАРМ
+   * в полёте — АРМ и только маршевый: из планирования выйти можно, из кувырка — нет («АРМ В ВОЗДУХЕ»).
+   */
+  private pusherStartCmd(): string | null {
+    const s = this.state;
+    const falling = s.mode === 'falling';
+    if (!falling && s.mode !== 'failsafe' && !AIRBORNE.includes(s.mode)) return 'Запуск маршевого — в самолётном режиме, в «Фэйлсейфе» или при остановленных моторах';
+    if (this.dead()) return 'Аппарат неуправляем — запуск невозможен';
+    if (s.energyWh >= this.capacityWh) return 'Батарея разряжена — запуск невозможен';
+    if (this.pusherSpin !== null) return 'Маршевый уже раскручивается';
+    if (!this.pusherOff && !this.failed.has('pusher')) return 'Маршевый работает';
+    if (falling) {
+      if (!s.armed) this.events.push({ t: s.t, text: 'ЗАПУСК МАРШЕВОГО в воздухе: АРМ, роторы не запускаются' });
+      s.armed = true;
+      this.beginRestart();
+    }
+    this.startPusher();
+    return null;
+  }
+
+  /**
+   * АРМ В ВОЗДУХЕ — аварийный запуск моторов, остановленных в полёте (ДИЗАРМ, одного маршевого не
+   * хватило). Роторы раскручиваются за AIR_START_ROTORS_S, маршевый — за PUSHER_START_S; всё это
+   * время аппарат падает. Дальше restartTick(): планирует — самолётом, кувыркается — на роторах.
+   */
+  private armAirCmd(): string | null {
+    const s = this.state;
+    if (s.mode === 'ground' || s.mode === 'landed') return 'На земле — обычный АРМ';
+    if (s.mode === 'crashed') return 'Авария — АРМ невозможен';
+    if (s.mode !== 'falling') return 'Моторы работают — АРМ в воздухе не нужен';
+    if (this.dead()) return 'Аппарат неуправляем — АРМ невозможен';
+    if (s.energyWh >= this.capacityWh) return 'Батарея разряжена — моторы не запустить';
+    if (this.failed.has('vtol')) return 'Отказ СВВП: подъёмные роторы не запустить — только «ЗАПУСК МАРШЕВОГО»';
+    if (this.rotorSpin !== null) return 'Моторы уже запускаются';
+    s.armed = true;
+    this.beginRestart();
+    this.rotorSpin = AIR_START_ROTORS_S;
+    const what = this.failed.has('pusher') ? 'маршевый неисправен — только роторы' : 'роторы и маршевый';
+    this.events.push({ t: s.t, text: `АРМ В ВОЗДУХЕ: аварийный запуск моторов — ${what}, раскрутка` });
+    if (!this.failed.has('pusher') && this.pusherOff && this.pusherSpin === null) this.startPusher(true);
+    return null;
+  }
+
+  private beginRestart() {
+    this.restart ??= { to: this.stoppedFrom, up: this.state.up, told: false };
+    this.levelLeft = null;
+  }
+
+  /** Раскрутка моторов, запущенных в полёте; выход из падения. */
+  private motorsTick(h: number, rho: number) {
+    const s = this.state;
+    if (this.pusherSpin !== null) {
+      this.pusherSpin -= h;
+      s.pusher = Math.max(s.pusher, PUSHER_IDLE * clamp(1 - this.pusherSpin / PUSHER_START_S, 0, 1));
+      if (this.pusherSpin <= 0) {
+        this.pusherSpin = null;
+        // Без винта мотор раскручивается, но тяги нет: автопилот видит это по оборотам и току и выключает его.
+        this.pusherOff = this.failed.has('pusher');
+        this.events.push({ t: s.t, text: this.pusherOff ? 'Запуск маршевого не удался: тяги нет — винт силовой установки оторван' : 'Маршевый запущен' });
+      }
+    }
+    if (this.rotorSpin !== null && this.rotorSpin > 0) this.rotorSpin = Math.max(0, this.rotorSpin - h);
+    if (this.restart) {
+      if (s.mode === 'falling') this.restartTick(h, rho);
+      else this.restart = null;
+    }
+    if (this.catching && s.vzMs > -0.5) {
+      this.events.push({ t: s.t, text: `Падение остановлено: высота потеряна ${Math.max(0, Math.round(this.catching.up - s.up))} м с команды запуска` });
+      this.catching = null;
+    }
+  }
+
+  /**
+   * Моторы запускаются в падении. Крыло держит и маршевый тянет — снова самолёт. Иначе — на роторах,
+   * как только раскрутятся (из кувырка — ещё и после выравнивания): стабилизированный коптер гасит
+   * падение тягой сверх веса и сопротивлением плашмя — как в manualCopter(), без поблажек.
+   */
+  private restartTick(h: number, rho: number) {
+    const s = this.state;
+    const r = this.restart!;
+    const rotors = this.rotorSpin;
+    if (rotors !== null) s.lift = ARMED_IDLE_LIFT * (1 - rotors / AIR_START_ROTORS_S);
+    const flying = s.tasMs > this.stallTas(rho) && !this.noGlide;
+    const pusherReady = this.pusherSpin === null && !this.pusherOff;
+    if (flying && pusherReady) return this.recoverPlane(r);
+    if (rotors === null) {
+      if (pusherReady && !r.told) {
+        r.told = true;
+        this.events.push({ t: s.t, text: 'Маршевый работает, но крыло не держит — из кувырка одним маршевым не выйти: «АРМ В ВОЗДУХЕ»' });
+      }
+      return;
+    }
+    if (rotors > 0) return;
+    // Крыло держит, маршевый ещё раскручивается — планируем дальше.
+    if (flying && this.pusherSpin !== null) return;
+    if (!flying) {
+      this.levelLeft ??= TUMBLE_LEVEL_S;
+      this.levelLeft -= h;
+      if (this.levelLeft > 0) return;
+    }
+    this.catchOnRotors(r);
+  }
+
+  /** Запуск в воздухе удался, крыло держит — самолётом, в тот режим, в каком остановились моторы. */
+  private recoverPlane(r: { to: Resume; up: number }) {
+    const s = this.state;
+    this.restart = null;
+    this.rotorSpin = null;
+    this.levelLeft = null;
+    s.lift = 0;
+    this.events.push({ t: s.t, text: `Запуск в воздухе: крыло держит, маршевый тянет — самолётный режим; высота потеряна ${Math.max(0, Math.round(r.up - s.up))} м` });
+    if (r.to === 'failsafe') return this.toFailsafe('plane', 'ФЭЙЛСЕЙФ: самолётом, управление с ПДУ');
+    if (r.to === 'land') {
+      if (this.failed.has('vtol')) return this.startRtl();
+      // Моторы встали на взлёте или посадке — садимся на месте, как по команде ПОСАДКА.
+      this.landAt = null;
+      this.hoverHeadingDeg = s.wind.fromDeg;
+      return this.setMode('backtransition');
+    }
+    this.enterPlane(r.to);
+  }
+
+  /** Роторы раскручены, аппарат выровнен — выход из падения стабилизированным коптером («Фэйлсейф»). */
+  private catchOnRotors(r: { up: number }) {
+    this.restart = null;
+    this.rotorSpin = null;
+    this.levelLeft = null;
+    this.state.bankDeg = 0;
+    this.toFailsafe('copter', 'АРМ В ВОЗДУХЕ: роторы запущены — выход из падения, «Фэйлсейф» коптером');
+    this.catching = { up: r.up };
   }
 
   /** Ветер у борта: с полем рельефа — местный (посчитан в начале шага), без него — ветер погоды на высоте над землёй. */
@@ -1437,14 +1783,25 @@ export class LiveFlight {
 
       case 'transition': {
         power = VT.transitionFactor * hover;
-        const f = Math.min(1, s.modeT / VT.transitionS);
-        s.lift = 1 - f * f;
-        s.pusher = 1;
-        s.iasMs = c.iasMs * f;
-        this.fly(h, s.headingDeg, s.up, rho, f);
+        // Разгон — когда маршевый тянет; пока он раскручивается (из коптера), роторы держат высоту.
+        const pushing = !this.pusherOff && this.pusherSpin === null;
+        if (pushing) this.trT += h;
+        const f = Math.min(1, this.trT / VT.transitionS);
+        s.iasMs = this.trFromIas + (c.iasMs - this.trFromIas) * f;
+        // Доля скорости перехода: столько веса уже на крыле, столько ветра уже сносит.
+        const k = this.trFromIas === 0 ? f : c.iasMs > 0 ? clamp(s.iasMs / c.iasMs, 0, 1) : f;
+        s.lift = 1 - k * k;
+        if (pushing) s.pusher = 1;
+        this.fly(h, s.headingDeg, s.up, rho, k);
         if (f >= 1) {
-          if (this.afterTransition === 'rtl') this.startRtl();
-          else this.setMode(this.afterTransition);
+          const after = this.afterTransition;
+          const resume = this.resumeAuto;
+          this.resumeAuto = false;
+          if (after === 'rtl') this.startRtl();
+          else {
+            if (after === 'auto' && resume) this.resumeRoute();
+            this.setMode(after);
+          }
         }
         break;
       }
@@ -1456,7 +1813,8 @@ export class LiveFlight {
         break;
 
       case 'falling':
-        power = 0;
+        // Моторы запускаются в воздухе — регуляторы и раскрутка берут немного.
+        power = this.restart ? this.idlePowerW() : 0;
         this.fall(h, rho);
         break;
 
@@ -1513,6 +1871,7 @@ export class LiveFlight {
         break;
     }
 
+    this.motorsTick(h, rho);
     power = this.applyDisturbance(h, power);
     if (this.failed.has('fire') && s.armed && s.mode !== 'falling') power += FIRE_DRAIN_W;
     s.powerW = s.mode === 'landed' ? 0 : power + this.payloadNow();
@@ -1534,6 +1893,7 @@ export class LiveFlight {
       }
     } else if ((AIRBORNE.includes(s.mode) || s.mode === 'backtransition') && s.aglM < 0.5) this.crash('Столкновение с рельефом');
     else if (AIRBORNE.includes(s.mode)) this.checkAttitudeLimits();
+    this.syncMotors();
   }
 
   /** Ручки ПДУ доходят до борта только в зоне действия пульта. */
@@ -1712,7 +2072,7 @@ export class LiveFlight {
         s.bankDeg = 0;
         this.setMode('landed', 'Жёсткая посадка без моторов');
       } else {
-        this.crash(`Удар о землю на ${Math.round(impact)} м/с — ${this.fallCause}`);
+        this.crash(`Удар о землю на ${Math.round(impact)} м/с — ${this.fallCause}${this.restart ? '; запуск моторов в воздухе не успел' : ''}`);
       }
     }
   }
@@ -1972,7 +2332,7 @@ export class LiveFlight {
     const iasBefore = s.iasMs;
     s.iasMs += clamp(iasTarget - s.iasMs, -1.2 * h, 1.0 * h);
     const accel = (tasFromIas(s.iasMs, rho) - tasFromIas(iasBefore, rho)) / h;
-    const glide = this.failed.has('pusher');
+    const glide = !this.pusherThrust();
     this.fly(h, track, alt, rho, 1, true, glide, true);
     if (s.iasMs > AIRCRAFT.limits.maxIasMs && !this.overspeedWarned) {
       this.overspeedWarned = true;
@@ -2105,7 +2465,7 @@ export class LiveFlight {
     }
     // Тяга — сколько нужно на уставку (сопротивление, набор, разгон ~1 м/с²), в пределах маршевого.
     const want = drag + (this.mass * G * s.vzMs) / tas + this.mass * clamp(tasFromIas(this.iasHold, rho) - tas, -1, 1);
-    const thrust = this.failed.has('pusher') ? 0 : clamp(want, 0, this.maxThrustN(rho));
+    const thrust = this.pusherThrust() ? clamp(want, 0, this.maxThrustN(rho)) : 0;
     const tasNew = Math.max(1, tas + ((thrust - drag) / this.mass - (G * s.vzMs) / tas) * h);
     s.tasMs = tasNew;
     s.iasMs = tasNew * Math.sqrt(rho / RHO0);
@@ -2203,7 +2563,7 @@ export class LiveFlight {
     s.up += s.vzMs * h;
     const rotorFrac = clamp(1 - wing + acc / G, 0, auth);
     s.lift = Math.min(1, rotorFrac);
-    s.pusher = 0;
+    s.pusher = this.pusherOff ? 0 : PUSHER_IDLE;
     s.tasMs = Math.hypot(this.vAir.e, this.vAir.n);
     s.iasMs = s.tasMs * Math.sqrt(rho / RHO0);
     s.groundSpeedMs = Math.hypot(ve, vn);
@@ -2212,7 +2572,8 @@ export class LiveFlight {
     s.distanceM += s.groundSpeedMs * h;
     const aux = AIRCRAFT.auxPowerHoverW;
     const power = aux + (hover - aux) * rotorFrac ** 1.5 * (1 + ((VT.climbFactor - 1) * Math.max(0, s.vzMs - this.upflowMs)) / VT.climbRateMs);
-    if (s.up <= this.groundUp(s.east, s.north)) this.touchdown(rotorLost ? 'ручная посадка без подъёмного винта' : 'ручная посадка');
+    if (s.up <= this.groundUp(s.east, s.north))
+      this.touchdown(this.catching ? 'не хватило высоты на выход из падения' : rotorLost ? 'ручная посадка без подъёмного винта' : 'ручная посадка');
     return power;
   }
 }

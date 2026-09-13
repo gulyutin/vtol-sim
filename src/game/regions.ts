@@ -1,24 +1,17 @@
 import { PROFILE } from '@profile';
-import type { LocationSpec } from '../sim/profile';
+import type { LocationSpec, RegionSpec } from '../sim/profile';
 import baikalOsm from '../regions/baikal.osm.bin?url';
 import elbrusOsm from '../regions/elbrus.osm.bin?url';
 import khibinyOsm from '../regions/khibiny.osm.bin?url';
 
 /*
- * Районы заданий: «домашний» из профиля и готовые районы с разным рельефом. Рельеф и снимки
- * грузятся для любого места; к району привязаны площадка, задания и файл OSM.
+ * Районы заданий: «домашний» из профиля, дополнительные районы профиля (PROFILE.regions) и
+ * готовые районы с разным рельефом. Рельеф и снимки грузятся для любого места; к району
+ * привязаны площадка, задания и файл OSM.
  * Выбор района — ?region=<id> в адресе или последний выбор (localStorage); смена — перезагрузкой.
  */
 
-export interface RegionPreset {
-  id: string;
-  title: string;
-  /** Одна строка для выбора: рельеф и высота площадки. */
-  hint: string;
-  location: LocationSpec;
-  /** Дома, леса, дороги и вода района (src/sim/osm.ts). */
-  osmUrl?: string;
-}
+export type RegionPreset = RegionSpec;
 
 const HOME: RegionPreset = {
   id: 'home',
@@ -185,9 +178,10 @@ const BAIKAL: LocationSpec = {
   },
 };
 
-/** Все районы; первый — домашний. */
+/** Все районы; первый — домашний, за ним — дополнительные районы профиля. */
 export const REGION_PRESETS: readonly RegionPreset[] = [
   HOME,
+  ...(PROFILE.regions ?? []),
   { id: 'elbrus', title: 'Приэльбрусье', hint: 'Высокогорье: узкая долина Баксана под Эльбрусом, площадка на 1880 м', location: ELBRUS, osmUrl: elbrusOsm },
   { id: 'khibiny', title: 'Хибины', hint: 'Горы до 1200 м за Полярным кругом, полярный день; площадка на 230 м', location: KHIBINY, osmUrl: khibinyOsm },
   { id: 'baikal', title: 'Байкал — Малое Море', hint: 'Ольхон: вода, скалистые берега, степь; площадка на 490 м', location: BAIKAL, osmUrl: baikalOsm },

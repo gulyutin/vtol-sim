@@ -2,37 +2,64 @@ import * as THREE from 'three';
 import { fromLocal, toLocal } from '../sim/mission';
 import { mercatorPixel, mercatorToGeo } from '../sim/terrain';
 import type { Site, Terrain } from '../sim/types';
-import { fetchWithRetry, type Bounds } from './terrainData';
+import type { Bounds } from './terrainData';
+import {
+  ancestorUv,
+  hostIndex,
+  isPlaceholderPixels,
+  mayBePlaceholder,
+  pickRequests,
+  REQUESTS_PER_HOST,
+  retryDelayMs,
+  shouldSplit,
+  tilePriority,
+  type Candidate,
+} from './tileSchedule';
 
 export const IMAGERY_ATTRIBUTION =
   'Снимки © Esri, Maxar, Earthstar Geographics · Рельеф: AWS Terrain Tiles (SRTM и др.) · Дома, дороги, вода и лес: © участники OpenStreetMap';
-const imageryUrl = (z: number, x: number, y: number) =>
-  `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+/** Оба сервера отдают одни и те же снимки; по HTTP/1.1 у каждого свои шесть соединений браузера. */
+const IMAGERY_HOSTS = ['server.arcgisonline.com', 'services.arcgisonline.com'];
+const imageryUrl = (host: number, z: number, x: number, y: number) =>
+  `https://${IMAGERY_HOSTS[host]}/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
 
 /** Узлов сетки на сторону тайла. */
 const GRID = 24;
-const MAX_LOADS = 8;
-const MAX_READY = 450;
-/** Попыток загрузить снимок, дальше тайл считается недоступным и рисуется родитель. */
-const MAX_TRIES = 3;
-/**
- * На масштабах, где снимков нет, сервер отдаёт заглушку «Map data not yet available» —
- * маленький однотонный JPEG. Настоящие тайлы крупнее.
- */
-const PLACEHOLDER_MAX_BYTES = 3500;
+/** Снимков в памяти сверх нужных сейчас — на случай разворота. */
+const CACHE_TEXTURES = 250;
+/** Сеток рельефа сверх нужных сейчас. */
+const CACHE_MESHES = 400;
+/** Время на построение сеток рельефа за кадр, мс: иначе при быстром полёте рывки. */
+const MESH_BUDGET_MS = 4;
+/** Запрос дольше — обрываем и повторяем: зависшее соединение не должно держать место. */
+const REQUEST_TIMEOUT_MS = 10_000;
+/** Подгрузка вперёд по курсу: куда камера придёт за это время, с. */
+const LOOKAHEAD_S = 8;
+/** Ветви дерева, не нужные столько кадров, забываются. */
+const PRUNE_FRAMES = 1800;
 
-type State = 'idle' | 'queued' | 'loading' | 'ready' | 'failed';
+/** idle — своего снимка нет (можно запросить); absent — у сервера нет снимков этого масштаба. */
+type State = 'idle' | 'loading' | 'ready' | 'absent';
 
 interface TileNode {
   z: number;
   x: number;
   y: number;
+  parent: TileNode | null;
   center: THREE.Vector3;
   sizeM: number;
   state: State;
+  /** Материал со своим снимком, когда тот загружен. */
+  material: THREE.MeshLambertMaterial | null;
+  /** Сетка рельефа тайла. Снимок на ней — свой или участок снимка предка (source). */
   mesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshLambertMaterial> | null;
+  source: TileNode | null;
+  /** Тайлы, на сетках которых сейчас лежит снимок этого. */
+  borrowers: Set<TileNode>;
   children: TileNode[] | null;
   lastUsed: number;
+  /** Кадр, в котором тайл последний раз попал в список нужных, и его очерёдность. */
+  wanted: number;
   priority: number;
   tries: number;
   retryAt: number;
@@ -89,21 +116,55 @@ if (tSunDir.y > 0.05) {
 #endif
 `;
 
+/** Пиксели четырёх угловых квадратов 8×8 снимка, RGBA подряд. */
+function cornerPixels(bitmap: ImageBitmap): Uint8ClampedArray {
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+  ctx.drawImage(bitmap, 0, 0);
+  const s = 8;
+  const corners = [
+    [0, 0],
+    [bitmap.width - s, 0],
+    [0, bitmap.height - s],
+    [bitmap.width - s, bitmap.height - s],
+  ] as const;
+  const out = new Uint8ClampedArray(corners.length * s * s * 4);
+  corners.forEach(([x, y], i) => out.set(ctx.getImageData(x, y, s, s).data, i * s * s * 4));
+  return out;
+}
+
 /**
- * Рельеф со спутниковыми снимками: квадродерево тайлов Web Mercator. Рядом с камерой —
- * мелкие тайлы, дальше — крупные; пока дети грузятся, рисуется родитель.
- * Высоты вершин и нормали — из той же сетки высот, по которой считается физика.
+ * Рельеф со спутниковыми снимками: квадродерево тайлов Web Mercator. Рядом с камерой — мелкие
+ * тайлы, дальше — крупные. Тайл делится сразу, как готовы сетки детей; пока их снимки грузятся,
+ * на сетках лежит участок снимка ближайшего загруженного предка — та же картинка, только грубее.
+ * Загрузка — очередью: что на экране, впереди и грубее всего показано — раньше; не больше шести
+ * запросов на сервер; при ошибке — повтор с паузой. Высоты вершин и нормали — из той же сетки
+ * высот, по которой считается физика.
  */
 export class TerrainLod {
   readonly group = new THREE.Group();
   private readonly roots: TileNode[] = [];
-  private readonly all: TileNode[] = [];
-  private queue: TileNode[] = [];
-  private loading = 0;
+  private readonly all = new Set<TileNode>();
+  /** Тайлы, нарисованные в прошлом кадре. */
+  private shown: TileNode[] = [];
+  /** Тайлы без своего снимка, нужные в этом кадре. */
+  private wantList: TileNode[] = [];
+  private readonly inflight = IMAGERY_HOSTS.map(() => 0);
   private frame = 0;
   private split = 2.6;
   private detail = true;
   private cloudShadows = true;
+  private disposed = false;
+  private meshBudgetEnd = 0;
+  private look: THREE.Vector3 | null = null;
+  private readonly lookDir = new THREE.Vector3();
+  private readonly velocity = new THREE.Vector3();
+  private readonly lastCamera = new THREE.Vector3();
+  private lastTime = 0;
+  private readonly ahead = new THREE.Vector3();
+  private readonly tmp = new THREE.Vector3();
+  /** На сетке, пока ни у тайла, ни у предков нет снимка; такая сетка не рисуется. */
+  private readonly blank = new THREE.MeshLambertMaterial();
   private readonly uniforms = {
     tCamera: { value: new THREE.Vector3() },
     tCloudOffset: { value: new THREE.Vector2() },
@@ -123,7 +184,7 @@ export class TerrainLod {
     const nw = mercatorPixel({ lat: bounds.north, lon: bounds.west }, rootZoom);
     const se = mercatorPixel({ lat: bounds.south, lon: bounds.east }, rootZoom);
     for (let y = Math.floor(nw.y / 256); y <= Math.floor(se.y / 256); y++) {
-      for (let x = Math.floor(nw.x / 256); x <= Math.floor(se.x / 256); x++) this.roots.push(this.node(rootZoom, x, y));
+      for (let x = Math.floor(nw.x / 256); x <= Math.floor(se.x / 256); x++) this.roots.push(this.node(rootZoom, x, y, null));
     }
   }
 
@@ -134,13 +195,17 @@ export class TerrainLod {
     if (detail !== this.detail || cloudShadows !== this.cloudShadows) {
       this.detail = detail;
       this.cloudShadows = cloudShadows;
-      for (const n of this.all) if (n.mesh) this.applyDefines(n.mesh.material);
+      for (const n of this.all) if (n.material) this.applyDefines(n.material);
     }
   }
 
-  /** Вызывать каждый кадр: положение камеры в координатах сцены и параметры затенения. */
-  update(camera: THREE.Vector3, shading?: TerrainShading) {
+  /**
+   * Вызывать каждый кадр: положение камеры в координатах сцены, параметры затенения и направление
+   * взгляда — что впереди, грузится раньше.
+   */
+  update(camera: THREE.Vector3, shading?: TerrainShading, look?: THREE.Vector3) {
     this.frame++;
+    const now = performance.now();
     if (shading) {
       this.uniforms.tCamera.value.copy(shading.camera);
       this.uniforms.tCloudOffset.value.copy(shading.cloudOffset);
@@ -148,15 +213,47 @@ export class TerrainLod {
       this.uniforms.tCloudBase.value = shading.cloudBaseY;
       this.uniforms.tSunDir.value.copy(shading.sunDir);
     }
-    for (const n of this.all) if (n.mesh) n.mesh.visible = false;
+    this.trackVelocity(camera, now);
+    this.look = look && look.lengthSq() > 0 ? this.lookDir.copy(look).normalize() : null;
+    for (const n of this.shown) if (n.mesh) n.mesh.visible = false;
+    this.shown = [];
+    this.wantList = [];
+    this.meshBudgetEnd = now + MESH_BUDGET_MS;
     for (const r of this.roots) this.select(r, camera);
-    this.queue = this.queue.filter((n) => n.state === 'queued' && n.lastUsed >= this.frame - 1);
-    this.queue.sort((a, b) => a.priority - b.priority);
-    while (this.loading < MAX_LOADS && this.queue.length > 0) void this.load(this.queue.shift()!);
-    this.evict();
+    // Вперёд по курсу: что понадобится через несколько секунд — в очередь после нужного сейчас.
+    if (this.velocity.lengthSq() > 25) {
+      this.ahead.copy(camera).addScaledVector(this.velocity, LOOKAHEAD_S);
+      for (const r of this.roots) this.prefetch(r, this.ahead);
+    }
+    this.startLoads(now);
+    if (this.frame % 30 === 0) this.evict();
   }
 
-  private node(z: number, x: number, y: number): TileNode {
+  /** Освободить всё; загрузки, что ещё идут, свой результат выбросят. */
+  dispose() {
+    this.disposed = true;
+    for (const n of this.all) {
+      if (n.mesh) this.dropMesh(n);
+      if (n.material) this.dropTexture(n);
+    }
+    this.blank.dispose();
+  }
+
+  /** Скорость камеры, сглаженная, — для подгрузки вперёд. Скачок (смена ракурса) — не движение. */
+  private trackVelocity(camera: THREE.Vector3, now: number) {
+    const dt = (now - this.lastTime) / 1000;
+    if (this.lastTime > 0 && dt > 0 && dt < 0.5) {
+      this.tmp.subVectors(camera, this.lastCamera).divideScalar(dt);
+      if (this.tmp.lengthSq() > 400 ** 2) this.velocity.set(0, 0, 0);
+      else this.velocity.lerp(this.tmp, Math.min(1, dt * 2));
+    } else {
+      this.velocity.set(0, 0, 0);
+    }
+    this.lastCamera.copy(camera);
+    this.lastTime = now;
+  }
+
+  private node(z: number, x: number, y: number, parent: TileNode | null): TileNode {
     const c = mercatorToGeo((x + 0.5) * 256, (y + 0.5) * 256, z);
     const w = toLocal(this.site, mercatorToGeo(x * 256, (y + 0.5) * 256, z));
     const e = toLocal(this.site, mercatorToGeo((x + 1) * 256, (y + 0.5) * 256, z));
@@ -165,86 +262,149 @@ export class TerrainLod {
       z,
       x,
       y,
+      parent,
       center: new THREE.Vector3(l.east, this.terrain.elevationM(c) - this.site.elevationM, -l.north),
       sizeM: e.east - w.east,
       state: 'idle',
+      material: null,
       mesh: null,
+      source: null,
+      borrowers: new Set(),
       children: null,
-      lastUsed: 0,
+      lastUsed: this.frame,
+      wanted: 0,
       priority: 0,
       tries: 0,
       retryAt: 0,
     };
-    this.all.push(n);
+    this.all.add(n);
     return n;
   }
 
-  /** true — участок тайла покрыт (им самим или потомками). */
-  private select(n: TileNode, camera: THREE.Vector3): boolean {
+  private createChildren(n: TileNode): TileNode[] {
+    return [0, 1, 2, 3].map((k) => this.node(n.z + 1, n.x * 2 + (k % 2), n.y * 2 + (k >> 1), n));
+  }
+
+  private select(n: TileNode, camera: THREE.Vector3) {
     n.lastUsed = this.frame;
     const d = camera.distanceTo(n.center);
-    if (n.z < this.maxZoom && d < this.split * n.sizeM) {
-      n.children ??= [0, 1, 2, 3].map((k) => this.node(n.z + 1, n.x * 2 + (k % 2), n.y * 2 + (k >> 1)));
-      for (const c of n.children) {
-        c.lastUsed = this.frame;
-        if (c.state !== 'ready') this.request(c, camera.distanceTo(c.center));
-      }
-      if (n.children.every((c) => c.state === 'ready')) {
-        for (const c of n.children) this.select(c, camera);
-        return true;
+    if (n.state !== 'absent' && shouldSplit(d, n.sizeM, n.z, this.maxZoom, this.split)) {
+      const children = (n.children ??= this.createChildren(n));
+      // Делим, как только у детей готовы сетки: снимок им пока даст предок — та же картинка.
+      if (children.every((c) => this.ensureMesh(c))) {
+        for (const c of children) this.select(c, camera);
+        return;
       }
     }
-    if (n.state === 'ready') {
+    this.draw(n, camera, d);
+  }
+
+  private draw(n: TileNode, camera: THREE.Vector3, d: number) {
+    const src = n.state === 'ready' ? n : this.readyAncestor(n);
+    if (src && this.ensureMesh(n)) {
+      if (n.source !== src) this.setSource(n, src);
+      src.lastUsed = this.frame;
       n.mesh!.visible = true;
-      return true;
+      this.shown.push(n);
     }
-    this.request(n, d);
-    return false;
+    if (n.state === 'ready') return;
+    // Нужен свой снимок, и промежуточные уровни между показанным и нужным — картинка уточняется по шагам.
+    const shownZ = src ? src.z : n.z - 10;
+    this.want(n, camera, d, n.z - shownZ, false);
+    for (let a = n.parent; a && a !== src; a = a.parent) this.want(a, camera, camera.distanceTo(a.center), a.z - shownZ, false);
   }
 
-  private request(n: TileNode, distance: number) {
-    // Ближние и крупные тайлы — в первую очередь.
-    n.priority = distance / n.sizeM - n.z * 0.01;
-    if (n.state === 'idle' && performance.now() >= n.retryAt) {
-      n.state = 'queued';
-      this.queue.push(n);
+  /** Спуск по дереву из будущего положения камеры: недостающие снимки — в очередь, без сеток и показа. */
+  private prefetch(n: TileNode, at: THREE.Vector3) {
+    const d = at.distanceTo(n.center);
+    if (n.state !== 'absent' && shouldSplit(d, n.sizeM, n.z, this.maxZoom, this.split)) {
+      n.lastUsed = this.frame;
+      for (const c of (n.children ??= this.createChildren(n))) this.prefetch(c, at);
+      return;
+    }
+    if (n.state !== 'idle') return;
+    const src = this.readyAncestor(n);
+    this.want(n, at, d, src ? n.z - src.z : 10, true);
+  }
+
+  private readyAncestor(n: TileNode): TileNode | null {
+    for (let a = n.parent; a; a = a.parent) if (a.state === 'ready') return a;
+    return null;
+  }
+
+  private want(n: TileNode, from: THREE.Vector3, d: number, deficit: number, prefetch: boolean) {
+    if (n.state !== 'idle') return;
+    n.lastUsed = this.frame;
+    const facing = this.look && d > 1 ? this.tmp.subVectors(n.center, from).dot(this.look) / d : 1;
+    const p = tilePriority({ distanceM: d, sizeM: n.sizeM, facing, deficit, prefetch });
+    if (n.wanted !== this.frame) {
+      n.wanted = this.frame;
+      n.priority = p;
+      this.wantList.push(n);
+    } else if (p < n.priority) {
+      n.priority = p;
     }
   }
 
-  private async load(n: TileNode) {
+  private startLoads(now: number) {
+    if (this.wantList.length === 0 || this.inflight.every((k) => k >= REQUESTS_PER_HOST)) return;
+    const candidates: Candidate<TileNode>[] = this.wantList.map((n) => ({
+      item: n,
+      priority: n.priority,
+      host: hostIndex(n.x, n.y, IMAGERY_HOSTS.length),
+      notBefore: n.retryAt,
+    }));
+    for (const c of pickRequests(candidates, this.inflight, REQUESTS_PER_HOST, now)) void this.load(c.item, c.host);
+  }
+
+  private async load(n: TileNode, host: number) {
     n.state = 'loading';
-    this.loading++;
+    this.inflight[host]!++;
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const res = await fetchWithRetry(imageryUrl(n.z, n.x, n.y), 2);
+      const res = await fetch(imageryUrl(host, n.z, n.x, n.y), { signal: abort.signal });
+      if (res.status === 404) {
+        n.state = 'absent';
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const blob = await res.blob();
-      if (blob.size < PLACEHOLDER_MAX_BYTES && n.z > 15) throw new Error('нет снимков на этом масштабе');
       // Растр переворачивается при декодировании: у ImageBitmap WebGL не делает flipY.
       const bitmap = await createImageBitmap(blob, { imageOrientation: 'flipY' });
-      const tex = new THREE.Texture(bitmap);
-      tex.flipY = false;
-      tex.colorSpace = THREE.SRGBColorSpace;
-      tex.anisotropy = this.anisotropy;
-      tex.needsUpdate = true;
-      const material = new THREE.MeshLambertMaterial({ map: tex });
-      material.onBeforeCompile = (shader) => {
-        Object.assign(shader.uniforms, this.uniforms);
-        shader.vertexShader = 'varying vec3 vTerrainWorld;\n' + shader.vertexShader.replace('#include <project_vertex>', '#include <project_vertex>\n  vTerrainWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;');
-        shader.fragmentShader = SHADER_HEAD + shader.fragmentShader.replace('#include <map_fragment>', SHADER_FRAGMENT);
-      };
-      this.applyDefines(material);
-      n.mesh = new THREE.Mesh(this.geometry(n), material);
-      n.mesh.receiveShadow = true;
-      n.mesh.visible = false;
-      this.group.add(n.mesh);
+      if (this.disposed || (mayBePlaceholder(blob.size) && isPlaceholderPixels(cornerPixels(bitmap)))) {
+        bitmap.close();
+        n.state = this.disposed ? 'idle' : 'absent';
+        return;
+      }
+      n.material = this.createMaterial(bitmap);
       n.state = 'ready';
+      n.tries = 0;
     } catch {
-      // Повтор позже; после MAX_TRIES — недоступен, остаётся родитель.
+      // Сеть, сервер или обрыв по времени — повтор с растущей паузой; место в очереди свободно сразу.
       n.tries++;
-      n.state = n.tries >= MAX_TRIES ? 'failed' : 'idle';
-      n.retryAt = performance.now() + 2000 * 2 ** n.tries;
+      n.retryAt = performance.now() + retryDelayMs(n.tries, Math.random());
+      n.state = 'idle';
     } finally {
-      this.loading--;
+      clearTimeout(timer);
+      this.inflight[host]!--;
     }
+  }
+
+  private createMaterial(bitmap: ImageBitmap): THREE.MeshLambertMaterial {
+    const tex = new THREE.Texture(bitmap);
+    tex.flipY = false;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = this.anisotropy;
+    tex.needsUpdate = true;
+    const material = new THREE.MeshLambertMaterial({ map: tex });
+    material.onBeforeCompile = (shader) => {
+      Object.assign(shader.uniforms, this.uniforms);
+      shader.vertexShader = 'varying vec3 vTerrainWorld;\n' + shader.vertexShader.replace('#include <project_vertex>', '#include <project_vertex>\n  vTerrainWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+      shader.fragmentShader = SHADER_HEAD + shader.fragmentShader.replace('#include <map_fragment>', SHADER_FRAGMENT);
+    };
+    this.applyDefines(material);
+    return material;
   }
 
   private applyDefines(m: THREE.MeshLambertMaterial) {
@@ -256,21 +416,98 @@ export class TerrainLod {
     m.needsUpdate = true;
   }
 
-  /** Освободить давно не нужные тайлы, когда их слишком много. */
+  /** Сетка рельефа тайла; false — время на сетки в этом кадре вышло, тайл пока не делится. */
+  private ensureMesh(n: TileNode): boolean {
+    if (n.mesh) return true;
+    if (n.parent && performance.now() > this.meshBudgetEnd) return false;
+    n.mesh = new THREE.Mesh(this.geometry(n), this.blank);
+    n.mesh.receiveShadow = true;
+    n.mesh.visible = false;
+    this.group.add(n.mesh);
+    return true;
+  }
+
+  /** Положить на сетку тайла снимок src — свой или предка, тем участком, что приходится на тайл. */
+  private setSource(n: TileNode, src: TileNode) {
+    n.source?.borrowers.delete(n);
+    n.source = src;
+    if (src !== n) src.borrowers.add(n);
+    const mesh = n.mesh!;
+    mesh.material = src.material!;
+    const t = ancestorUv(n.z, n.x, n.y, src.z, src.x, src.y);
+    const uv = mesh.geometry.getAttribute('uv') as THREE.BufferAttribute;
+    const base = mesh.geometry.userData['uv0'] as Float32Array;
+    const out = uv.array as Float32Array;
+    for (let i = 0; i < base.length; i += 2) {
+      out[i] = t.offsetU + base[i]! * t.scale;
+      out[i + 1] = t.offsetV + base[i + 1]! * t.scale;
+    }
+    uv.needsUpdate = true;
+  }
+
+  private unsetSource(n: TileNode) {
+    if (n.source && n.source !== n) n.source.borrowers.delete(n);
+    n.source = null;
+    if (n.mesh) {
+      n.mesh.material = this.blank;
+      n.mesh.visible = false;
+    }
+  }
+
+  /** Освободить давно не нужное: снимки и сетки сверх запаса, забытые ветви дерева. */
   private evict() {
-    const ready = this.all.filter((n) => n.state === 'ready' && !this.roots.includes(n));
-    if (ready.length <= MAX_READY) return;
-    ready.sort((a, b) => a.lastUsed - b.lastUsed);
-    for (const n of ready.slice(0, ready.length - MAX_READY)) {
-      if (n.lastUsed >= this.frame - 2) break;
-      this.group.remove(n.mesh!);
-      n.mesh!.geometry.dispose();
-      const map = n.mesh!.material.map;
-      (map?.image as ImageBitmap | undefined)?.close?.();
-      map?.dispose();
-      n.mesh!.material.dispose();
-      n.mesh = null;
-      n.state = 'idle';
+    const recent = this.frame - 2;
+    const ready: TileNode[] = [];
+    const meshed: TileNode[] = [];
+    for (const n of this.all) {
+      if (!n.parent) continue;
+      if (n.material) ready.push(n);
+      if (n.mesh) meshed.push(n);
+    }
+    this.trim(ready, CACHE_TEXTURES, recent, (n) => this.dropTexture(n));
+    this.trim(meshed, CACHE_MESHES, recent, (n) => this.dropMesh(n));
+    for (const r of this.roots) this.prune(r);
+  }
+
+  /** Из давно не нужных оставить cache последних, остальные — drop. */
+  private trim(list: TileNode[], cache: number, recent: number, drop: (n: TileNode) => void) {
+    const idle = list.filter((n) => n.lastUsed < recent);
+    let excess = idle.length - cache;
+    if (excess <= 0) return;
+    idle.sort((a, b) => a.lastUsed - b.lastUsed);
+    for (const n of idle) {
+      if (excess-- <= 0) break;
+      drop(n);
+    }
+  }
+
+  private dropTexture(n: TileNode) {
+    for (const b of [...n.borrowers]) this.unsetSource(b);
+    if (n.source === n) this.unsetSource(n);
+    const m = n.material!;
+    (m.map?.image as ImageBitmap | undefined)?.close?.();
+    m.map?.dispose();
+    m.dispose();
+    n.material = null;
+    n.state = 'idle';
+  }
+
+  private dropMesh(n: TileNode) {
+    const mesh = n.mesh!;
+    this.unsetSource(n);
+    this.group.remove(mesh);
+    mesh.geometry.dispose();
+    n.mesh = null;
+  }
+
+  /** Забыть ветви, давно не нужные: без снимков, сеток и загрузок. */
+  private prune(n: TileNode) {
+    if (!n.children) return;
+    for (const c of n.children) this.prune(c);
+    const old = this.frame - PRUNE_FRAMES;
+    if (n.children.every((c) => !c.children && !c.mesh && c.state === 'idle' && c.lastUsed < old)) {
+      for (const c of n.children) this.all.delete(c);
+      n.children = null;
     }
   }
 
@@ -328,6 +565,8 @@ export class TerrainLod {
     geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     geo.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
     geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+    // Свои UV тайла; на сетке — они же или пересчитанные на снимок предка (setSource).
+    geo.userData['uv0'] = new Float32Array(uv);
     geo.setIndex(index);
     geo.computeBoundingSphere();
     return geo;

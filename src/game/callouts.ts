@@ -5,10 +5,11 @@ import type { LiveMode } from '../sim/flight';
 /*
  * Голос НСУ: что сказать оператору по потоку телеметрии — коротко, как речевой информатор,
  * чтобы глаза оставались на карте. Здесь только решение «что и когда»: пороги с гистерезисом,
- * выдержки, по одному разу на событие. Произносит ui/voice.ts.
+ * выдержки, по одному разу на событие. Произносит ui/voice.ts — записью (public/voice) или синтезом.
  *
  * Время — симуляционное (t = flight.state.t), состояние — то, что видит НСУ (flight.telemetry):
  * без связи оно замирает, и всё, что случилось за это время, говорится после восстановления.
+ * Все тексты — в PHRASES и функциях ниже; calloutCatalog() перечисляет их для записанной озвучки.
  */
 
 export type CalloutPriority = 'critical' | 'warning' | 'info';
@@ -50,6 +51,8 @@ export interface CalloutState {
   ew?: EwState | null;
   /** Качество радиоканала 0…1, если его считает модель связи. */
   linkQuality?: number | null;
+  /** Маршевый (LiveState.pusherState): для «Маршевый запущен» и «Запуск не удался». */
+  pusherState?: 'run' | 'off' | 'starting' | null;
 }
 
 export interface CalloutContext {
@@ -77,6 +80,94 @@ export interface RouteInfo {
 
 /** С такого ускорения говорим только критическое. */
 export const FAST_RATE = 10;
+
+/** Постоянные фразы. Сокращения — как говорят операторы; как их произносить, знают запись и voice.ts. */
+export const PHRASES = {
+  linkLost: 'Потеря связи',
+  linkBack: 'Связь восстановлена',
+  weakLink: 'Слабый сигнал связи',
+  gnssLost: 'Потеря ГНСС',
+  gnssBack: 'ГНСС восстановлена',
+  spoof: 'Подмена ГНСС',
+  ewIn: 'Вход в зону РЭБ',
+  ewOut: 'Выход из зоны РЭБ',
+  noflyIn: 'Вход в запретную зону',
+  noflyOut: 'Выход из запретной зоны',
+  batteryEmpty: 'Батарея разряжена',
+  lowAlt: 'Малая высота',
+  stall: 'Сваливание',
+  overspeed: 'Превышение скорости',
+  bank: 'Большой крен',
+  rc: 'ПДУ не достаёт',
+  arm: 'Арм',
+  disarm: 'Дизарм',
+  takeoff: 'Взлёт',
+  takeoffAborted: 'Взлёт прекращён',
+  transition: 'Переход в самолётный режим',
+  auto: 'Маршрут',
+  guided: 'Оперативная точка',
+  hold: 'Ожидание',
+  manual: 'Ручной режим',
+  rtl: 'Возврат',
+  landing: 'Посадка',
+  failsafeAuto: 'Фэйлсейф, управление с пульта',
+  failsafePlane: 'Фэйлсейф, самолёт',
+  failsafeCopter: 'Фэйлсейф, коптер',
+  copter: 'Режим коптера',
+  motorsOff: 'Моторы остановлены',
+  touchdown: 'Касание',
+  crash: 'Авария',
+  lastLine: 'Последний галс',
+  failureUnknown: 'Отказ на борту',
+  pusherStarted: 'Маршевый запущен',
+  pusherFailed: 'Запуск не удался',
+  planeMode: 'Самолётный режим',
+} as const;
+
+type PhraseId = keyof typeof PHRASES;
+
+/** Самый высокий приоритет, с которым фраза звучит (для каталога: критические загружаются заранее). */
+const PHRASE_PRIORITY: Record<PhraseId, CalloutPriority> = {
+  linkLost: 'critical',
+  linkBack: 'warning',
+  weakLink: 'warning',
+  gnssLost: 'critical',
+  gnssBack: 'warning',
+  spoof: 'critical',
+  ewIn: 'warning',
+  ewOut: 'info',
+  noflyIn: 'critical',
+  noflyOut: 'info',
+  batteryEmpty: 'critical',
+  lowAlt: 'critical',
+  stall: 'critical',
+  overspeed: 'warning',
+  bank: 'warning',
+  rc: 'warning',
+  arm: 'info',
+  disarm: 'info',
+  takeoff: 'info',
+  takeoffAborted: 'warning',
+  transition: 'info',
+  auto: 'info',
+  guided: 'info',
+  hold: 'info',
+  manual: 'info',
+  rtl: 'warning',
+  landing: 'info',
+  failsafeAuto: 'critical',
+  failsafePlane: 'warning',
+  failsafeCopter: 'warning',
+  copter: 'info',
+  motorsOff: 'critical',
+  touchdown: 'info',
+  crash: 'critical',
+  lastLine: 'info',
+  failureUnknown: 'critical',
+  pusherStarted: 'info',
+  pusherFailed: 'warning',
+  planeMode: 'info',
+};
 
 /** Пороги заряда: доля, приоритет. */
 const BATTERY: readonly (readonly [number, CalloutPriority])[] = [
@@ -120,7 +211,7 @@ const RC_BACK_S = 3;
 const PLANE: readonly LiveMode[] = ['auto', 'guided', 'hold', 'manual', 'rtl'];
 const ON_GROUND: readonly LiveMode[] = ['ground', 'landed', 'crashed'];
 
-/** Отказы — коротко, без сокращений, которые синтезатор читает по буквам. Нет в списке — название из РЛЭ. */
+/** Отказы — коротко и без сокращений. Нет в списке — название из РЛЭ. */
 const FAILURE_SPEECH: Record<string, string> = {
   airspeed: 'Отказ датчика скорости',
   compass: 'Отказ компаса',
@@ -169,8 +260,39 @@ export function plural(n: number, one: string, few: string, many: string): strin
   return many;
 }
 
-const percent = (p: number) => `${numberWords(p)} ${plural(p, 'процент', 'процента', 'процентов')}`;
-const seconds = (s: number) => `${numberWords(s, true)} ${plural(s, 'секунду', 'секунды', 'секунд')}`;
+/** «Заряд тридцать процентов». */
+export const batteryText = (percent: number) => `Заряд ${numberWords(percent)} ${plural(percent, 'процент', 'процента', 'процентов')}`;
+/** «Нет связи тридцать секунд». */
+export const linkReminderText = (s = LINK_TIMEOUT_S) => `Нет связи ${numberWords(s, true)} ${plural(s, 'секунду', 'секунды', 'секунд')}`;
+/** «Пройдена точка двенадцать». */
+export const pointText = (n: number) => `Пройдена точка ${numberWords(n)}`;
+/** «Галс три». */
+export const lineText = (n: number) => `Галс ${numberWords(n)}`;
+/** Отказ по id: короткая форма, иначе название из РЛЭ. */
+export const failureText = (id: string) => FAILURE_SPEECH[id] ?? FAILURES.find((f) => f.id === id)?.title ?? PHRASES.failureUnknown;
+
+export interface CatalogPhrase {
+  text: string;
+  priority: CalloutPriority;
+}
+
+/** Всё, что может сказать Callouts; номера точек и галсов — до maxN. Для записанной озвучки и проверок. */
+export function calloutCatalog(maxN = 60): CatalogPhrase[] {
+  const out = new Map<string, CalloutPriority>();
+  const add = (text: string, p: CalloutPriority) => {
+    const q = out.get(text);
+    if (!q || PRIORITY_RANK[p] < PRIORITY_RANK[q]) out.set(text, p);
+  };
+  for (const id of Object.keys(PHRASES) as PhraseId[]) add(PHRASES[id], PHRASE_PRIORITY[id]);
+  for (const [level, p] of BATTERY) add(batteryText(Math.round(level * 100)), p);
+  add(linkReminderText(), 'warning');
+  for (const f of FAILURES) if (f.id !== 'link' && f.id !== 'gnss') add(failureText(f.id), 'critical');
+  for (let n = 1; n <= maxN; n++) {
+    add(pointText(n), 'info');
+    add(lineText(n), 'info');
+  }
+  return [...out].map(([text, priority]) => ({ text, priority }));
+}
 
 export class Callouts {
   private started = false;
@@ -182,6 +304,9 @@ export class Callouts {
   private emptySaid = false;
   private failuresSaid = new Set<string>();
   private lastCommand: { c: string; t: number } | null = null;
+  private pusher: string | null = null;
+  /** Переход начался из «Фэйлсейфа» или после остановки моторов — в конце «Самолётный режим». */
+  private resuming = false;
 
   private linkLostSince: number | null = null;
   private linkOkSince: number | null = null;
@@ -275,6 +400,7 @@ export class Callouts {
     this.mode = s.mode;
     this.phase = s.failsafePhase;
     this.armed = s.armed;
+    this.pusher = s.pusherState ?? null;
     for (const [level] of BATTERY) if (s.soc <= level) this.batteryDone.add(level);
     for (const id of s.failures) this.failuresSaid.add(id);
     if (s.linkLost) {
@@ -291,12 +417,12 @@ export class Callouts {
       if (!this.linkAnnounced && t - this.linkLostSince >= LINK_LOST_S) {
         this.linkAnnounced = true;
         this.linkReminded = false;
-        say('Потеря связи', 'critical', 'link');
+        say(PHRASES.linkLost, 'critical', 'link');
       }
       // Автопилот без связи через LINK_TIMEOUT_S уходит на ВОЗВРАТ — напомнить, если борт был в воздухе.
       if (this.linkAnnounced && !this.linkReminded && t - this.linkLostSince >= LINK_TIMEOUT_S && !ON_GROUND.includes(s.mode)) {
         this.linkReminded = true;
-        say(`Нет связи ${seconds(LINK_TIMEOUT_S)}`, 'warning', 'link');
+        say(linkReminderText(), 'warning', 'link');
       }
       return;
     }
@@ -306,7 +432,7 @@ export class Callouts {
     if (t - this.linkOkSince >= LINK_BACK_S) {
       this.linkAnnounced = false;
       this.linkOkSince = null;
-      say('Связь восстановлена', 'warning', 'link');
+      say(PHRASES.linkBack, 'warning', 'link');
     }
   }
 
@@ -317,7 +443,7 @@ export class Callouts {
       this.weakSince ??= t;
       if (!this.weakSaid && t - this.weakSince >= WEAK_LINK_S) {
         this.weakSaid = true;
-        say('Слабый сигнал связи', 'warning', 'linkq');
+        say(PHRASES.weakLink, 'warning', 'linkq');
       }
     } else {
       this.weakSince = null;
@@ -336,14 +462,14 @@ export class Callouts {
       if (t - this.gnssSince >= (gnss ? GNSS_LOST_S : GNSS_BACK_S)) {
         this.gnssAnnounced = gnss;
         this.gnssSince = null;
-        say(gnss ? 'Потеря спутниковой навигации' : 'Навигация восстановлена', gnss ? 'critical' : 'warning', 'gnss');
+        say(gnss ? PHRASES.gnssLost : PHRASES.gnssBack, gnss ? 'critical' : 'warning', 'gnss');
       }
     } else this.gnssSince = null;
 
     for (const id of s.failures) {
       if (id === 'link' || id === 'gnss' || this.failuresSaid.has(id)) continue;
       this.failuresSaid.add(id);
-      say(FAILURE_SPEECH[id] ?? FAILURES.find((f) => f.id === id)?.title ?? 'Отказ на борту', 'critical', `fail:${id}`);
+      say(failureText(id), 'critical', `fail:${id}`);
     }
   }
 
@@ -362,48 +488,62 @@ export class Callouts {
     // АРМ — на земле; ДИЗАРМ — на земле после посадки (в воздухе и при аварии говорят о другом).
     if (s.armed !== this.armed) {
       this.armed = s.armed;
-      if (s.armed && m === 'ground') say('Арм', 'info', 'arm');
-      else if (!s.armed && (m === 'ground' || m === 'landed') && prev === m) say('Дизарм', 'info', 'arm');
+      if (s.armed && m === 'ground') say(PHRASES.arm, 'info', 'arm');
+      else if (!s.armed && (m === 'ground' || m === 'landed') && prev === m) say(PHRASES.disarm, 'info', 'arm');
+    }
+
+    // Маршевый, запущенный в полёте: запустился или нет. На земле и в переходе о нём не говорим.
+    const pz = s.pusherState ?? null;
+    const prevPz = this.pusher;
+    this.pusher = pz;
+    if (pz !== prevPz && prevPz !== null && !ON_GROUND.includes(m) && m !== 'spool' && m !== 'transition') {
+      if (pz === 'run') say(PHRASES.pusherStarted, 'info', 'pusher');
+      else if (prevPz === 'starting' && pz === 'off') say(PHRASES.pusherFailed, 'warning', 'pusher');
+    }
+    // Из «Фэйлсейфа» или после остановки моторов — снова автопилот самолётом: сразу или в конце перехода.
+    if (m !== prev) {
+      const back = prev === 'failsafe' || prev === 'falling';
+      if (PLANE.includes(m) && (back || (prev === 'transition' && this.resuming))) say(PHRASES.planeMode, 'info', 'plane');
+      this.resuming = m === 'transition' && back;
     }
 
     if (m === prev) {
-      if (m === 'failsafe' && prevPhase === 'plane' && s.failsafePhase === 'copter') say('Режим коптера', 'info', 'mode');
+      if (m === 'failsafe' && prevPhase === 'plane' && s.failsafePhase === 'copter') say(PHRASES.copter, 'info', 'mode');
       return;
     }
     switch (m) {
       case 'spool':
-        return say('Взлёт', 'info', 'mode');
+        return say(PHRASES.takeoff, 'info', 'mode');
       case 'transition':
-        return say('Переход в самолётный режим', 'info', 'mode');
+        return say(PHRASES.transition, 'info', 'mode');
       case 'auto':
-        return say('Маршрут', 'info', 'mode');
+        return say(PHRASES.auto, 'info', 'mode');
       case 'guided':
-        return say('Оперативная точка', 'info', 'mode');
+        return say(PHRASES.guided, 'info', 'mode');
       case 'hold':
-        return say('Ожидание', 'info', 'mode');
+        return say(PHRASES.hold, 'info', 'mode');
       case 'manual':
-        return say('Ручной режим', 'info', 'mode');
+        return say(PHRASES.manual, 'info', 'mode');
       case 'rtl':
-        return say('Возврат', this.commanded(t, 'rtl') ? 'info' : 'warning', 'mode');
+        return say(PHRASES.rtl, this.commanded(t, 'rtl') ? 'info' : 'warning', 'mode');
       case 'backtransition':
-        return say('Посадка', 'info', 'mode');
+        return say(PHRASES.landing, 'info', 'mode');
       case 'descent':
         // После торможения «Посадка» уже сказана; сюда же — посадка на месте со взлёта.
-        if (prev !== 'backtransition') say('Посадка', 'info', 'mode');
+        if (prev !== 'backtransition') say(PHRASES.landing, 'info', 'mode');
         return;
-      case 'failsafe': {
-        const how = s.failsafePhase === 'copter' ? 'коптер' : 'самолёт';
-        if (this.commanded(t, 'failsafe', 'copter')) return say(`Фэйлсейф, ${how}`, 'warning', 'mode');
-        return say('Фэйлсейф, управление с пульта', 'critical', 'mode');
-      }
+      case 'failsafe':
+        // После запуска моторов в воздухе автопилот сам ставит «Фэйлсейф» — это ожидаемо, не тревога.
+        if (prev === 'falling' || this.commanded(t, 'failsafe', 'copter')) return say(s.failsafePhase === 'copter' ? PHRASES.failsafeCopter : PHRASES.failsafePlane, 'warning', 'mode');
+        return say(PHRASES.failsafeAuto, 'critical', 'mode');
       case 'falling':
-        return say('Моторы остановлены', 'critical', 'mode');
+        return say(PHRASES.motorsOff, 'critical', 'mode');
       case 'landed':
-        return say('Касание', 'info', 'mode');
+        return say(PHRASES.touchdown, 'info', 'mode');
       case 'crashed':
-        return say('Авария', 'critical', 'mode');
+        return say(PHRASES.crash, 'critical', 'mode');
       case 'ground':
-        if (prev === 'spool') say('Взлёт прекращён', 'warning', 'mode');
+        if (prev === 'spool') say(PHRASES.takeoffAborted, 'warning', 'mode');
         return;
       default:
         return;
@@ -421,9 +561,9 @@ export class Callouts {
     }
     if (s.soc <= 0.005 && !this.emptySaid) {
       this.emptySaid = true;
-      return say('Батарея разряжена', 'critical', 'battery');
+      return say(PHRASES.batteryEmpty, 'critical', 'battery');
     }
-    if (hit) say(`Заряд ${percent(Math.round(hit[0] * 100))}`, hit[1], 'battery');
+    if (hit) say(batteryText(Math.round(hit[0] * 100)), hit[1], 'battery');
   }
 
   /** Самолётный режим: малая высота, сваливание, скорость, крен. */
@@ -443,7 +583,7 @@ export class Callouts {
     [this.lowSince, fire] = held(s.aglM < LOW_AGL_M, this.lowSince, LOW_AGL_S);
     if (fire && !this.lowSaid) {
       this.lowSaid = true;
-      say('Малая высота', 'critical', 'agl');
+      say(PHRASES.lowAlt, 'critical', 'agl');
     }
     if (s.aglM > LOW_AGL_REARM_M) this.lowSaid = false;
 
@@ -452,21 +592,21 @@ export class Callouts {
     [this.stallSince, fire] = held(airdata && s.iasMs < STALL_IAS, this.stallSince, STALL_S);
     if (fire && !this.stallSaid) {
       this.stallSaid = true;
-      say('Сваливание', 'critical', 'stall');
+      say(PHRASES.stall, 'critical', 'stall');
     }
     if (s.iasMs > AIRCRAFT.transitionLowIasMs) this.stallSaid = false;
 
     [this.overSince, fire] = held(airdata && s.iasMs > AIRCRAFT.limits.maxIasMs, this.overSince, OVERSPEED_S);
     if (fire && !this.overSaid) {
       this.overSaid = true;
-      say('Превышение скорости', 'warning', 'speed');
+      say(PHRASES.overspeed, 'warning', 'speed');
     }
     if (s.iasMs < 0.95 * AIRCRAFT.limits.maxIasMs) this.overSaid = false;
 
     [this.bankSince, fire] = held(Math.abs(s.bankDeg) > BANK_WARN_DEG, this.bankSince, BANK_S);
     if (fire && !this.bankSaid) {
       this.bankSaid = true;
-      say('Большой крен', 'warning', 'bank');
+      say(PHRASES.bank, 'warning', 'bank');
     }
     if (Math.abs(s.bankDeg) < AIRCRAFT.maxBankDeg) this.bankSaid = false;
   }
@@ -482,12 +622,12 @@ export class Callouts {
     const rank = this.lineRank.get(leg);
     if (rank !== undefined) {
       const last = rank === this.lineRank.size;
-      return say(last && rank > 1 ? 'Последний галс' : `Галс ${numberWords(rank)}`, 'info', 'route');
+      return say(last && rank > 1 ? PHRASES.lastLine : lineText(rank), 'info', 'route');
     }
     // Закончены участки prev…leg−1: участок j кончается точкой оператора j. Говорим последнюю.
     const n = r.points ?? 0;
     const k = Math.min(leg - 1, n);
-    if (k >= Math.max(1, prev)) say(`Пройдена точка ${numberWords(r.reversed ? n - k + 1 : k)}`, 'info', 'route');
+    if (k >= Math.max(1, prev)) say(pointText(r.reversed ? n - k + 1 : k), 'info', 'route');
   }
 
   private rc(t: number, s: CalloutState, inRange: boolean | undefined, say: Say) {
@@ -500,7 +640,7 @@ export class Callouts {
       this.rcOkSince = null;
       if (!this.rcSaid) {
         this.rcSaid = true;
-        say('Пульт не достаёт', 'warning', 'rc');
+        say(PHRASES.rc, 'warning', 'rc');
       }
     } else if (this.rcSaid) {
       this.rcOkSince ??= t;
@@ -514,20 +654,20 @@ export class Callouts {
     if (!this.ewIn && level >= EW_IN) {
       this.ewIn = true;
       this.ewLowSince = null;
-      say('Вход в зону РЭБ', 'warning', 'ew');
+      say(PHRASES.ewIn, 'warning', 'ew');
     } else if (this.ewIn) {
       if (level <= EW_OUT) {
         this.ewLowSince ??= t;
         if (t - this.ewLowSince >= EW_OUT_S) {
           this.ewIn = false;
-          say('Выход из зоны РЭБ', 'info', 'ew');
+          say(PHRASES.ewOut, 'info', 'ew');
         }
       } else this.ewLowSince = null;
     }
     const spoof = ew.gnssSpoof ?? 0;
     if (!this.spoofSaid && spoof >= SPOOF_IN) {
       this.spoofSaid = true;
-      say('Подмена навигации', 'critical', 'spoof');
+      say(PHRASES.spoof, 'critical', 'spoof');
     } else if (spoof <= SPOOF_OUT) this.spoofSaid = false;
 
     // Зоны, о которых сказано, забываются только после выхода из всех: дрожь на границе не повторяется.
@@ -536,13 +676,13 @@ export class Callouts {
     for (const id of fresh) this.nofly.add(id);
     if (fresh.length > 0) {
       this.noflyEmptySince = null;
-      say('Вход в запретную зону', 'critical', 'nofly');
+      say(PHRASES.noflyIn, 'critical', 'nofly');
     } else if (this.nofly.size > 0 && ids.length === 0) {
       this.noflyEmptySince ??= t;
       if (t - this.noflyEmptySince >= NOFLY_OUT_S) {
         this.nofly.clear();
         this.noflyEmptySince = null;
-        say('Выход из запретной зоны', 'info', 'nofly');
+        say(PHRASES.noflyOut, 'info', 'nofly');
       }
     } else this.noflyEmptySince = null;
   }

@@ -270,6 +270,8 @@ export function addBuilding(b: OsmBuilding, groundAt: GroundAt, out: MeshBuf) {
     bay = style === STYLE_APARTMENTS ? 3.4 : 6;
     windows = !small;
   }
+  // Трубы, мачты, башни: тонкое и высокое — глухое.
+  if (b.heightM > 20 && b.heightM > 5 * Math.sqrt(area)) windows = false;
   tmpWall.setHex(wall).multiplyScalar(0.94 + 0.12 * h3);
 
   // Этажи: по тегу или по высоте; высота этажа — в разумных пределах, выше последнего — глухая стена.

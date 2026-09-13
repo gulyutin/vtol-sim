@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { Callouts, numberWords, plural, type Callout, type CalloutContext, type CalloutState } from '../src/game/callouts';
+import manifest from '../public/voice/xenia/index.json';
+import { calloutCatalog, Callouts, numberWords, plural, type Callout, type CalloutContext, type CalloutState } from '../src/game/callouts';
 import { buildMission, forecastWeather, SCENARIOS, type RouteScenario } from '../src/game/scenarios';
 import { LiveFlight, type Controls } from '../src/sim/flight';
 import { flatTerrain } from '../src/sim/terrain';
@@ -23,6 +24,9 @@ const base = (over: Partial<CalloutState> = {}): CalloutState => ({
   ...over,
 });
 
+/** Всё, что прозвучало в проверках, — потом сверяется с каталогом фраз. */
+const heard = new Set<string>();
+
 /** Кадры с шагом dt от from до to; st(t) — состояние в момент t. */
 function run(c: Callouts, from: number, to: number, st: (t: number) => CalloutState, ctx: CalloutContext = {}, dt = 0.1): Callout[] {
   const out: Callout[] = [];
@@ -33,7 +37,7 @@ function run(c: Callouts, from: number, to: number, st: (t: number) => CalloutSt
   }
   return out;
 }
-const texts = (l: Callout[]) => l.map((c) => c.text);
+const texts = (l: Callout[]) => l.map((c) => (heard.add(c.text), c.text));
 const between = (t: number, a: number, b: number) => t >= a && t < b;
 
 describe('числа словами', () => {
@@ -138,19 +142,21 @@ describe('режимы, отказы, ограничения', () => {
     const a = new Callouts();
     a.update(0, base());
     expect(a.update(1, base({ mode: 'failsafe', failsafePhase: 'plane' }))).toEqual([{ text: 'Фэйлсейф, управление с пульта', priority: 'critical', key: 'mode', t: 1 }]);
+    heard.add('Фэйлсейф, управление с пульта');
 
     const b = new Callouts();
     b.update(0, base());
     b.command('failsafe', 1);
-    expect(b.update(1.2, base({ mode: 'failsafe', failsafePhase: 'plane' }))[0]).toMatchObject({ text: 'Фэйлсейф, самолёт', priority: 'warning' });
+    expect(texts(b.update(1.2, base({ mode: 'failsafe', failsafePhase: 'plane' })))).toEqual(['Фэйлсейф, самолёт']);
     expect(texts(b.update(2, base({ mode: 'failsafe', failsafePhase: 'copter' })))).toEqual(['Режим коптера']);
+    expect(texts(b.update(3, base({ mode: 'failsafe', failsafePhase: 'copter' }), { rcInRange: false }))).toEqual(['ПДУ не достаёт']);
   });
 
   it('отказы — по одному разу, ГНСС — с потерей и восстановлением', () => {
     const c = new Callouts();
     const f = (t: number): string[] => [...(t >= 5 ? ['gnss'] : []), ...(t >= 8 ? ['compass', 'rotor'] : [])].filter((id) => !(id === 'gnss' && t >= 20));
     const said = run(c, 0, 30, (t) => base({ failures: f(t) }));
-    expect(texts(said)).toEqual(['Потеря спутниковой навигации', 'Отказ компаса', 'Отрыв подъёмного винта', 'Навигация восстановлена']);
+    expect(texts(said)).toEqual(['Потеря ГНСС', 'Отказ компаса', 'Отрыв подъёмного винта', 'ГНСС восстановлена']);
   });
 
   it('малая высота, сваливание, крен, скорость — в самолётном режиме, с гистерезисом', () => {
@@ -208,7 +214,7 @@ describe('РЭБ и запретные зоны — необязательные
     const c = new Callouts();
     const jam = (t: number) => (between(t, 5, 20) || between(t, 21, 30) ? 0.8 : between(t, 20, 21) ? 0.03 : 0);
     const said = run(c, 0, 40, (t) => base({ ew: { gnssJam: jam(t), gnssSpoof: between(t, 25, 28) ? 0.7 : 0, linkJam: 0.1 * jam(t), noflyIds: [] } }));
-    expect(texts(said)).toEqual(['Вход в зону РЭБ', 'Подмена навигации', 'Выход из зоны РЭБ']);
+    expect(texts(said)).toEqual(['Вход в зону РЭБ', 'Подмена ГНСС', 'Выход из зоны РЭБ']);
     expect(said.map((x) => x.priority)).toEqual(['warning', 'critical', 'info']);
     expect(said[2]!.t).toBeCloseTo(33, 5);
   });
@@ -288,5 +294,26 @@ describe('живой полёт', () => {
       tick();
     }
     expect(notBattery(said.slice(n0))).toEqual(['Потеря связи', 'Нет связи тридцать секунд', 'Связь восстановлена', 'Возврат']);
+    texts(said);
+  });
+});
+
+describe('каталог фраз и записанная озвучка', () => {
+  const catalog = calloutCatalog(60);
+  const all = new Set(catalog.map((p) => p.text));
+
+  it('каталог без повторов; всё, что прозвучало в проверках выше, в нём есть', () => {
+    expect(all.size).toBe(catalog.length);
+    expect(heard.size).toBeGreaterThan(30);
+    expect([...heard].filter((t) => !all.has(t))).toEqual([]);
+    for (const t of ['Пройдена точка шестьдесят', 'Галс шестьдесят', 'Нет связи тридцать секунд', 'Заряд десять процентов', 'Отказ на борту']) expect(all.has(t)).toBe(true);
+  });
+
+  it('манифест записи покрывает весь каталог при номерах до 60; критические — в предзагрузке', () => {
+    const files: Record<string, string> = manifest.files;
+    expect(catalog.filter((p) => !files[p.text]).map((p) => p.text)).toEqual([]);
+    for (const f of Object.values(files)) expect(f).toMatch(/^[a-z0-9-]+\.mp3$/);
+    expect(new Set(Object.values(files)).size).toBe(Object.keys(files).length);
+    expect(new Set(manifest.preload)).toEqual(new Set(catalog.filter((p) => p.priority === 'critical').map((p) => p.text)));
   });
 });

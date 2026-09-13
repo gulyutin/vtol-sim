@@ -124,8 +124,11 @@ interface ZoneDraw {
   dblZoom: boolean;
 }
 
-const IMAGERY = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
-const LABELS = 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
+// Снимки — с двух серверов Esri: по HTTP/1.1 браузер держит 6 соединений на сервер, и с одним
+// сервером карта отнимала бы их у рельефа 3D-вида (terrainLod.ts грузит с тех же двух).
+const IMAGERY = 'https://{s}.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+const LABELS = 'https://{s}.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
+const ESRI_HOSTS = ['server', 'services'];
 const ll = (p: GeoPoint) => L.latLng(p.lat, p.lon);
 
 /** Точка маршрута с подписью высоты — как в НСУ. */
@@ -197,8 +200,8 @@ export class Map2D {
 
   constructor(el: HTMLElement, site: Site) {
     this.map = L.map(el, { zoomControl: false, preferCanvas: true, maxZoom: 19 }).setView(ll(site), 13);
-    L.tileLayer(IMAGERY, { maxZoom: 19, maxNativeZoom: 19, attribution: 'Снимки © Esri, Maxar, Earthstar Geographics' }).addTo(this.map);
-    L.tileLayer(LABELS, { maxZoom: 19, maxNativeZoom: 19 }).addTo(this.map);
+    L.tileLayer(IMAGERY, { maxZoom: 19, maxNativeZoom: 19, subdomains: ESRI_HOSTS, attribution: 'Снимки © Esri, Maxar, Earthstar Geographics' }).addTo(this.map);
+    L.tileLayer(LABELS, { maxZoom: 19, maxNativeZoom: 19, subdomains: ESRI_HOSTS }).addTo(this.map);
     L.control.scale({ imperial: false, position: 'bottomright' }).addTo(this.map);
     this.map.createPane('zones').style.zIndex = '350';
     this.zoneRenderer = L.svg({ pane: 'zones', padding: 0.5 });

@@ -1,11 +1,14 @@
 import * as THREE from 'three';
-import type { OsmBuilding, OsmRoad } from '../sim/osm';
+import { bridgeDeckEnds, type OsmBuilding, type OsmRoad } from '../sim/osm';
 import { hash3, LazyChunks, Polyline, type ChunkPart, type GroundAt, type OsmUniforms } from './osmShared';
 
 /*
  * Дороги и железные дороги: ленты по рельефу. Узлы — в изломах осевой и через ROAD_STEP_M
- * между ними, высота каждого края — по рельефу плюс ROAD_LIFT_M; мосты — прямой пролёт между
- * концами. Дороги рисуются после рельефа и воды без записи глубины и со смещением полигонов:
+ * между ними, высота каждого края — по рельефу плюс ROAD_LIFT_M. Мост — прямой настил между
+ * береговыми концами своей цепочки (bridgeDeckEnds: стык линий над руслом не тянет настил к
+ * воде); борта и опоры — отдельной бетонной сеткой с записью глубины: настил, нарисованный
+ * позже, закрывает опоры сверху, а опоры — то, что за ними. Дороги рисуются после рельефа и
+ * воды без записи глубины и со смещением полигонов:
  * не мерцают ни на рельефе, ни друг на друге (в местах пересечения — порядок отрисовки:
  * грунтовые, потом асфальт, главные поверх второстепенных).
  *
@@ -27,6 +30,11 @@ const LAMP_HEIGHT_M = 7;
 const MINOR_RANGE = 0.5;
 /** Клетка карты плотности домов, м. */
 const TOWN_CELL_M = 100;
+/** Опоры моста: шаг от начала линии, м, и просвет под настилом, с которого они ставятся, м. */
+const PIER_STEP_M = 45;
+const PIER_MIN_CLEARANCE_M = 4;
+/** Борт пролёта — на столько ниже настила, м. */
+const BRIDGE_SIDE_M = 1.2;
 
 const CLASS_RANK: Record<OsmRoad['cls'], number> = {
   motorway: 9, trunk: 8, primary: 7, secondary: 6, tertiary: 5, unclassified: 4, residential: 3, service: 2, track: 1, rail: 0,
@@ -170,9 +178,13 @@ export class OsmRoads {
   private readonly lines: Polyline[];
   private readonly atlas = roadAtlas();
   private readonly material: THREE.MeshLambertMaterial;
+  /** Борта и опоры мостов: бетон, с записью глубины. */
+  private readonly structureMaterial = new THREE.MeshLambertMaterial({ color: 0x8e8b85, side: THREE.DoubleSide });
   private readonly lampMaterial: THREE.ShaderMaterial;
   private readonly lampScale = { value: 500 };
   private readonly inTown: (e: number, n: number) => boolean;
+  /** Высоты концов настила у мостов (bridgeDeckEnds). */
+  private readonly deckEnds: ([number, number] | null)[];
 
   constructor(
     private readonly roads: OsmRoad[],
@@ -181,6 +193,7 @@ export class OsmRoads {
     uniforms: OsmUniforms,
   ) {
     this.material = new THREE.MeshLambertMaterial({ map: this.atlas, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 });
+    this.deckEnds = bridgeDeckEnds(roads, groundAt);
     this.lampMaterial = new THREE.ShaderMaterial({
       vertexShader: LAMP_VERTEX,
       fragmentShader: LAMP_FRAGMENT,
@@ -212,6 +225,7 @@ export class OsmRoads {
   dispose(): void {
     this.chunks.dispose();
     this.material.dispose();
+    this.structureMaterial.dispose();
     this.lampMaterial.dispose();
     this.atlas.dispose();
   }
@@ -220,6 +234,7 @@ export class OsmRoads {
     const sorted = [...items].sort((p, q) => drawOrder(this.roads[p.road]!) - drawOrder(this.roads[q.road]!));
     const major = new Ribbon();
     const minor = new Ribbon();
+    const structure = new Ribbon();
     const lamps: number[] = [];
     const st: number[] = [];
     const tmp: number[] = [0, 0, 0, 0, 0];
@@ -227,7 +242,8 @@ export class OsmRoads {
       const road = this.roads[p.road]!;
       const pl = this.lines[p.road]!;
       pl.stations(p.a0, p.a1, ROAD_STEP_M, st);
-      this.ribbon(road, pl, st, isMajor(road) ? major : minor);
+      this.ribbon(p.road, pl, st, isMajor(road) ? major : minor);
+      if (road.bridge) this.bridgeStructure(p, pl, st, structure, tmp);
       // Фонари: освещённые дороги и асфальт в посёлках; шаг — от начала дороги, без повторов на стыках.
       if (road.cls !== 'rail' && (road.lit || (road.paved && CLASS_RANK[road.cls] >= 3))) {
         for (let s = Math.ceil(p.a0 / LAMP_STEP_M) * LAMP_STEP_M; s < p.a1; s += LAMP_STEP_M) {
@@ -254,6 +270,16 @@ export class OsmRoads {
     };
     add(minor, 2, MINOR_RANGE, `osm-roads-minor ${ix},${iy}`);
     add(major, 3, 1, `osm-roads ${ix},${iy}`);
+    const sgeo = structure.geometry();
+    if (sgeo) {
+      const mesh = new THREE.Mesh(sgeo, this.structureMaterial);
+      mesh.name = `osm-bridges ${ix},${iy}`;
+      // Раньше настила: настил без записи глубины ложится поверх опор под собой.
+      mesh.renderOrder = 1;
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      parts.push({ object: mesh, range: 1 });
+    }
     if (lamps.length) {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.Float32BufferAttribute(lamps, 3));
@@ -272,18 +298,26 @@ export class OsmRoads {
     return parts;
   }
 
-  /** Лента по станциям: край по рельефу; у моста — прямой пролёт и борта. */
-  private ribbon(road: OsmRoad, pl: Polyline, st: number[], out: Ribbon) {
+  private lift(road: OsmRoad): number {
+    return ROAD_LIFT_M + (road.cls === 'rail' ? 0 : CLASS_RANK[road.cls] * 0.01);
+  }
+
+  /** Высота настила моста ri на расстоянии s от начала линии: прямая между концами цепочки. */
+  private deckY(ri: number, pl: Polyline, s: number): number {
+    const road = this.roads[ri]!;
+    const L = road.line;
+    const [y0, y1] = this.deckEnds[ri] ?? [this.groundAt(L[0]!, L[1]!), this.groundAt(L[L.length - 2]!, L[L.length - 1]!)];
+    const t = pl.total > 0 ? s / pl.total : 0;
+    return y0 + (y1 - y0) * t + this.lift(road) + 0.4;
+  }
+
+  /** Лента дороги ri по станциям: край по рельефу; у моста — прямой настил. */
+  private ribbon(ri: number, pl: Polyline, st: number[], out: Ribbon) {
+    const road = this.roads[ri]!;
     const hw = road.widthM / 2;
     const col = column(road);
     const u0 = (col + 0.04) / 4, u1 = (col + 0.96) / 4;
-    const lift = ROAD_LIFT_M + (road.cls === 'rail' ? 0 : CLASS_RANK[road.cls] * 0.01);
-    let bridgeY0 = 0, bridgeY1 = 0;
-    if (road.bridge) {
-      const L = road.line;
-      bridgeY0 = this.groundAt(L[0]!, L[1]!);
-      bridgeY1 = this.groundAt(L[L.length - 2]!, L[L.length - 1]!);
-    }
+    const lift = this.lift(road);
     const k = st.length / 6;
     const first = out.nv;
     for (let i = 0; i < k; i++) {
@@ -292,8 +326,7 @@ export class OsmRoads {
       const le = e + nx, ln = n + ny, re = e - nx, rn = n - ny;
       let yl: number, yr: number;
       if (road.bridge) {
-        const t = pl.total > 0 ? s / pl.total : 0;
-        const y = bridgeY0 + (bridgeY1 - bridgeY0) * t + lift + 0.4;
+        const y = this.deckY(ri, pl, s);
         yl = Math.max(y, this.groundAt(le, ln) + lift);
         yr = Math.max(y, this.groundAt(re, rn) + lift);
       } else {
@@ -308,24 +341,52 @@ export class OsmRoads {
       const r0 = first + 2 * i, l0 = r0 + 1, r1 = r0 + 2, l1 = r0 + 3;
       out.quad(r0, r1, l1, l0);
     }
-    if (road.bridge) {
-      // Борта пролёта — полосы вниз от краёв настила.
-      const uc = (1 + 0.5) / 4;
-      for (const side of [0, 1]) {
-        const top = out.nv;
-        for (let i = 0; i < k; i++) {
-          const p = out.pos;
-          const vi = (first + 2 * i + side) * 3;
-          const x = p[vi]!, y = p[vi + 1]!, z = p[vi + 2]!;
-          const v = st[6 * i]! / TILE_M;
-          out.vert(x, y, z, uc, v);
-          out.vert(x, y - 1.2, z, uc, v);
-        }
-        for (let i = 0; i + 1 < k; i++) {
-          const t0 = top + 2 * i, b0 = t0 + 1, t1 = t0 + 2, b1 = t0 + 3;
-          if (side === 0) out.quad(t0, b0, b1, t1);
-          else out.quad(t0, t1, b1, b0);
-        }
+  }
+
+  /**
+   * Борта пролёта — полосы вниз от краёв настила; опоры — через PIER_STEP_M от начала линии
+   * (у куска квадрата — только свои, без повторов на стыках), где под настилом выше
+   * PIER_MIN_CLEARANCE_M: над водой и оврагами, не на подходах.
+   */
+  private bridgeStructure(p: Piece, pl: Polyline, st: number[], out: Ribbon, tmp: number[]) {
+    const road = this.roads[p.road]!;
+    const hw = road.widthM / 2;
+    const lift = this.lift(road);
+    const k = st.length / 6;
+    for (const side of [1, -1]) {
+      const top = out.nv;
+      for (let i = 0; i < k; i++) {
+        const s = st[6 * i]!;
+        const w = side * hw * st[6 * i + 5]!;
+        const e = st[6 * i + 1]! + st[6 * i + 3]! * w, n = st[6 * i + 2]! + st[6 * i + 4]! * w;
+        const y = Math.max(this.deckY(p.road, pl, s), this.groundAt(e, n) + lift);
+        out.vert(e, y, -n, 0, 0);
+        out.vert(e, y - BRIDGE_SIDE_M, -n, 0, 0);
+      }
+      for (let i = 0; i + 1 < k; i++) {
+        const t0 = top + 2 * i, b0 = t0 + 1, t1 = t0 + 2, b1 = t0 + 3;
+        out.quad(t0, b0, b1, t1);
+      }
+    }
+    const pw = Math.min(hw * 0.7, 6);
+    const pt = 1.2;
+    const end = pl.total - 8;
+    for (let s = Math.ceil(Math.max(p.a0, 8) / PIER_STEP_M) * PIER_STEP_M; s < Math.min(p.a1, end); s += PIER_STEP_M) {
+      pl.at(s, tmp);
+      const e = tmp[0]!, n = tmp[1]!, nx = tmp[2]!, ny = tmp[3]!;
+      const g = this.groundAt(e, n);
+      const topY = this.deckY(p.road, pl, s) - BRIDGE_SIDE_M;
+      if (topY - g < PIER_MIN_CLEARANCE_M) continue;
+      // Поперёк оси — на ширину настила, вдоль — толщина опоры.
+      const tx = ny, ty = -nx;
+      const corner = (a: number, b: number): [number, number] => [e + nx * pw * a + tx * pt * b, n + ny * pw * a + ty * pt * b];
+      const cs = [corner(1, 1), corner(-1, 1), corner(-1, -1), corner(1, -1)];
+      for (let c = 0; c < 4; c++) {
+        const [ae, an] = cs[c]!;
+        const [be, bn] = cs[(c + 1) % 4]!;
+        const a0 = out.vert(ae, g - 1, -an, 0, 0), b0 = out.vert(be, g - 1, -bn, 0, 0);
+        const b1 = out.vert(be, topY, -bn, 0, 0), a1 = out.vert(ae, topY, -an, 0, 0);
+        out.quad(a0, b0, b1, a1);
       }
     }
   }

@@ -54,3 +54,5 @@ npm run dev
 ## Данные
 
 Спутниковые снимки — Esri World Imagery. Рельеф — Terrain Tiles (Terrarium) из AWS Open Data. Дома, дороги, вода, леса и полосы — © участники OpenStreetMap, лицензия ODbL. Фактическая погода — Open-Meteo.com. 3D-модель аппарата условная.
+
+Озвучка НСУ — голос Silero TTS v5.5 (диктор xenia), лицензия CC BY-NC-SA 4.0: файлы в `public/voice` (там же `LICENSE.txt`), пересборка — `scripts/voice-pack.ts`. Фраз, которых нет в записи, говорит синтез речи браузера.
