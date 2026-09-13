@@ -772,11 +772,19 @@ export class World {
     });
   }
 
-  /** Равнина вокруг загруженного рельефа — чтобы до горизонта не было пустоты. */
+  /**
+   * Равнина вокруг загруженного рельефа — чтобы до горизонта не было пустоты. Лежит ниже самой
+   * низкой точки всего района (сетка ~500 м): по одним углам мало — если углы на сопках, равнина
+   * встала бы выше дна долины и накрыла реку, снимки и город.
+   */
   private createGroundFill(bounds: Bounds): THREE.Mesh {
-    let min = Infinity;
-    for (const lat of [bounds.south, bounds.north]) {
-      for (const lon of [bounds.west, bounds.east]) min = Math.min(min, this.terrain.elevationM({ lat, lon }));
+    const N = 64;
+    let min = this.site.elevationM;
+    for (let i = 0; i <= N; i++) {
+      for (let j = 0; j <= N; j++) {
+        const h = this.terrain.elevationM({ lat: bounds.south + ((bounds.north - bounds.south) * i) / N, lon: bounds.west + ((bounds.east - bounds.west) * j) / N });
+        if (h > -500) min = Math.min(min, h);
+      }
     }
     const ground = new THREE.Mesh(new THREE.PlaneGeometry(200000, 200000), new THREE.MeshLambertMaterial({ color: 0x5f6b45 }));
     ground.rotation.x = -Math.PI / 2;
