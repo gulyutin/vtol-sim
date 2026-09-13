@@ -24,6 +24,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+        env:
+          # Сайту Electron не нужен — только настольной сборке (desktop.yml).
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       - run: npm run typecheck
       - run: npm test
       - run: npm run build

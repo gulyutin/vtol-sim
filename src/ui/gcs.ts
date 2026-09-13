@@ -48,6 +48,12 @@ export interface GcsHandlers {
   onRouteEdit(points: RoutePoint[]): void;
   /** Район полётов. Переключение — перезагрузка страницы (делает main.ts). */
   onRegion?(id: string): void;
+  /** Окно «Районы и карты»: пакеты районов для работы без сети. */
+  onPacks?(): void;
+  /** Окно «Прогноз вылета»: задание по часам на реальный прогноз. */
+  onForecast?(): void;
+  /** Слой «Досягаемость» на карте: куда долетит и вернётся. */
+  onReach?(on: boolean): void;
   /** Инструмент рисования зоны на карте; null — отмена. */
   onZoneTool?(kind: ZoneKind | null): void;
   onZonesImport?(text: string, fileName: string): void;
@@ -213,6 +219,8 @@ const ICON: Record<string, string> = {
   console: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/>',
   horizon: '<circle cx="12" cy="12" r="9"/><path d="M3 13h18M8 9h8"/>',
   control: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
+  forecast: '<path d="M7 15a4 4 0 0 1-.6-8A5 5 0 0 1 16 7a3.5 3.5 0 0 1 1 7H7z"/><path d="M8 18l-1 2M12 18l-1 2M16 18l-1 2"/>',
+  reach: '<circle cx="12" cy="12" r="9" stroke-dasharray="3 3"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5"/>',
   zones: '<path d="M4 7l7-4 9 4-2 11-8 3-6-6z"/><path d="M9 9l6 6M15 9l-6 6"/>',
   clear: '<path d="M3 18c2-5 5-1 7-5s4-5 7-6" stroke-dasharray="2 3"/><path d="M15 14l6 6M21 14l-6 6"/>',
 };
@@ -221,6 +229,7 @@ const icon = (k: string) => `<svg viewBox="0 0 24 24">${ICON[k]}</svg>`;
 const WEATHER_SOURCES: [string, string][] = [
   ['scenario', 'По заданию — ползунки ниже'],
   ['live', 'Сейчас на площадке — Open-Meteo'],
+  ['forecast', 'Прогноз на час вылета — Open-Meteo'],
   ['calm', 'Штиль'],
   ['breezy', 'Ветрено'],
   ['gusty', 'Порывистый ветер'],
@@ -289,6 +298,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     <div class="tb-group tb-mission">
       <select class="tb scen" title="Задание">${scenarios.map((s) => `<option value="${s.id}">${s.title}</option>`).join('')}</select>
       <select class="tb region" hidden></select>
+      <button class="tb" data-a="packs" title="Районы и карты: пакеты для работы без сети" ${h.onPacks ? '' : 'hidden'}>🗺</button>
       <button class="tb" data-a="restart" title="Сбросить полёт и начать это задание сначала">⟲<span class="lbl">Начать заново</span></button>
     </div>
     <div class="tb-group tb-sim">
@@ -325,6 +335,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           'План',
           button('task', 'Задача', icon('task'), 'title="Задание, маршрут, погода, бюджет энергии"'),
           button('profile', 'Рельеф', icon('terrain'), 'title="Профиль рельефа вдоль маршрута"'),
+          button('forecast', 'Прогноз', icon('forecast'), `title="Прогноз на реальный вылет: задание по часам на погоду Open-Meteo" ${h.onForecast ? '' : 'hidden'}`),
         )}
         ${group(
           'flight',
@@ -350,6 +361,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           'Карта',
           button('follow', 'Навигация', icon('nav'), 'title="Карта следует за аппаратом"'),
           button('target', 'Цель', icon('target'), 'title="Оперативная точка: указать на карте"'),
+          button('reach', 'Досягаемость', icon('reach'), `title="Куда долетит и вернётся: запас 25 %, 10 %, впритык, в один конец" ${h.onReach ? '' : 'hidden'}`),
           button('zoomIn', 'Зум +', icon('zoomIn')),
           button('zoomOut', 'Зум −', icon('zoomOut')),
           button('clear', 'Очистить', icon('clear'), 'title="Очистить траекторию на карте и в 3D"'),
@@ -574,6 +586,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   let voiceOn = false;
   const showVoice = () => (q<HTMLButtonElement>('[data-a="voice"]').textContent = `🗣 Голос: ${voiceOn ? 'вкл' : 'выкл'}`);
   let follow = false;
+  let reach = false;
   let weatherSource = 'scenario';
   let weatherSummary = '';
   let difficulty = 'train';
@@ -586,6 +599,13 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       else if (a === 'takeoff') h.onCommand('takeoff');
       else if (a === 'unload') h.onCommand('unload');
       else if (a === 'mode' || a === 'emergency' || a === 'settings') openMenu(a, b);
+      else if (a === 'packs') h.onPacks?.();
+      else if (a === 'forecast') h.onForecast?.();
+      else if (a === 'reach') {
+        reach = !reach;
+        b.classList.toggle('on', reach);
+        h.onReach?.(reach);
+      }
       else if (WINDOWS.includes(a)) toggle(a);
       else if (a === 'follow') {
         follow = !follow;

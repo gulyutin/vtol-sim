@@ -2,7 +2,9 @@ import * as THREE from 'three';
 import { fromLocal, toLocal } from '../sim/mission';
 import { mercatorPixel, mercatorToGeo } from '../sim/terrain';
 import type { Site, Terrain } from '../sim/types';
+import { reliefRgb } from './reliefTint';
 import type { Bounds } from './terrainData';
+import { imageryFallback, imagerySource, packImageryUrl } from './tileSource';
 import {
   ancestorUv,
   hostIndex,
@@ -20,8 +22,10 @@ export const IMAGERY_ATTRIBUTION =
   'Снимки © Esri, Maxar, Earthstar Geographics · Рельеф: AWS Terrain Tiles (SRTM и др.) · Дома, дороги, вода и лес: © участники OpenStreetMap';
 /** Оба сервера отдают одни и те же снимки; по HTTP/1.1 у каждого свои шесть соединений браузера. */
 const IMAGERY_HOSTS = ['server.arcgisonline.com', 'services.arcgisonline.com'];
+/** Снимки из пакета района — ещё один «сервер» очереди, со своими местами (tileSource.ts). */
+const PACK_HOST = IMAGERY_HOSTS.length;
 const imageryUrl = (host: number, z: number, x: number, y: number) =>
-  `https://${IMAGERY_HOSTS[host]}/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+  host === PACK_HOST ? packImageryUrl(z, x, y) : `https://${IMAGERY_HOSTS[host]}/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
 
 /** Узлов сетки на сторону тайла. */
 const GRID = 24;
@@ -38,13 +42,19 @@ const LOOKAHEAD_S = 8;
 /** Ветви дерева, не нужные столько кадров, забываются. */
 const PRUNE_FRAMES = 1800;
 
-/** idle — своего снимка нет (можно запросить); absent — у сервера нет снимков этого масштаба. */
-type State = 'idle' | 'loading' | 'ready' | 'absent';
+/**
+ * idle — своего снимка нет (можно запросить); absent — у сервера нет снимков этого масштаба
+ * (глубже не делим); nodata — снимка взять неоткуда: без сети и не в пакете. Такой тайл не
+ * запрашивается и не повторяется, но делится — сетка рельефа уточняется и без снимков.
+ */
+type State = 'idle' | 'loading' | 'ready' | 'absent' | 'nodata';
 
 interface TileNode {
   z: number;
   x: number;
   y: number;
+  /** Откуда брать снимок: пакет или сеть. */
+  origin: 'pack' | 'net' | null;
   parent: TileNode | null;
   center: THREE.Vector3;
   sizeM: number;
@@ -149,7 +159,7 @@ export class TerrainLod {
   private shown: TileNode[] = [];
   /** Тайлы без своего снимка, нужные в этом кадре. */
   private wantList: TileNode[] = [];
-  private readonly inflight = IMAGERY_HOSTS.map(() => 0);
+  private readonly inflight = [...IMAGERY_HOSTS, 'pack'].map(() => 0);
   private frame = 0;
   private split = 2.6;
   private detail = true;
@@ -165,6 +175,11 @@ export class TerrainLod {
   private readonly tmp = new THREE.Vector3();
   /** На сетке, пока ни у тайла, ни у предков нет снимка; такая сетка не рисуется. */
   private readonly blank = new THREE.MeshLambertMaterial();
+  /**
+   * Рельеф без снимка — окраска по высоте и склону (цвета вершин, reliefTint.ts): пока снимок
+   * грузится и там, где его взять неоткуда (без сети, вне пакета).
+   */
+  private readonly relief = new THREE.MeshLambertMaterial({ vertexColors: true });
   private readonly uniforms = {
     tCamera: { value: new THREE.Vector3() },
     tCloudOffset: { value: new THREE.Vector2() },
@@ -186,6 +201,7 @@ export class TerrainLod {
     for (let y = Math.floor(nw.y / 256); y <= Math.floor(se.y / 256); y++) {
       for (let x = Math.floor(nw.x / 256); x <= Math.floor(se.x / 256); x++) this.roots.push(this.node(rootZoom, x, y, null));
     }
+    this.shade(this.relief);
   }
 
   /** Детальность: делить тайл, если камера ближе split его размеров; наибольший уровень снимков; эффекты земли. */
@@ -196,6 +212,7 @@ export class TerrainLod {
       this.detail = detail;
       this.cloudShadows = cloudShadows;
       for (const n of this.all) if (n.material) this.applyDefines(n.material);
+      this.applyDefines(this.relief);
     }
   }
 
@@ -237,6 +254,7 @@ export class TerrainLod {
       if (n.material) this.dropTexture(n);
     }
     this.blank.dispose();
+    this.relief.dispose();
   }
 
   /** Скорость камеры, сглаженная, — для подгрузки вперёд. Скачок (смена ракурса) — не движение. */
@@ -258,14 +276,16 @@ export class TerrainLod {
     const w = toLocal(this.site, mercatorToGeo(x * 256, (y + 0.5) * 256, z));
     const e = toLocal(this.site, mercatorToGeo((x + 1) * 256, (y + 0.5) * 256, z));
     const l = toLocal(this.site, c);
+    const origin = imagerySource(z, x, y);
     const n: TileNode = {
       z,
       x,
       y,
+      origin,
       parent,
       center: new THREE.Vector3(l.east, this.terrain.elevationM(c) - this.site.elevationM, -l.north),
       sizeM: e.east - w.east,
-      state: 'idle',
+      state: origin ? 'idle' : 'nodata',
       material: null,
       mesh: null,
       source: null,
@@ -301,9 +321,15 @@ export class TerrainLod {
 
   private draw(n: TileNode, camera: THREE.Vector3, d: number) {
     const src = n.state === 'ready' ? n : this.readyAncestor(n);
-    if (src && this.ensureMesh(n)) {
-      if (n.source !== src) this.setSource(n, src);
-      src.lastUsed = this.frame;
+    if (this.ensureMesh(n)) {
+      if (src) {
+        if (n.source !== src) this.setSource(n, src);
+        src.lastUsed = this.frame;
+      } else if (n.mesh!.material !== this.relief) {
+        // Снимка нет ни у тайла, ни у предков — рельеф в цветах высоты и склона.
+        this.unsetSource(n);
+        n.mesh!.material = this.relief;
+      }
       n.mesh!.visible = true;
       this.shown.push(n);
     }
@@ -351,7 +377,7 @@ export class TerrainLod {
     const candidates: Candidate<TileNode>[] = this.wantList.map((n) => ({
       item: n,
       priority: n.priority,
-      host: hostIndex(n.x, n.y, IMAGERY_HOSTS.length),
+      host: n.origin === 'pack' ? PACK_HOST : hostIndex(n.x, n.y, IMAGERY_HOSTS.length),
       notBefore: n.retryAt,
     }));
     for (const c of pickRequests(candidates, this.inflight, REQUESTS_PER_HOST, now)) void this.load(c.item, c.host);
@@ -362,8 +388,19 @@ export class TerrainLod {
     this.inflight[host]!++;
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), REQUEST_TIMEOUT_MS);
+    const fromPack = host === PACK_HOST;
+    // Тайла не оказалось в пакете (или он испорчен): в сеть, если она есть, иначе «нет данных» —
+    // без повторов: локальный файл от повтора не появится.
+    const packMiss = () => {
+      n.origin = imageryFallback();
+      n.state = n.origin ? 'idle' : 'nodata';
+    };
     try {
       const res = await fetch(imageryUrl(host, n.z, n.x, n.y), { signal: abort.signal });
+      if (fromPack && !res.ok) {
+        packMiss();
+        return;
+      }
       if (res.status === 404) {
         n.state = 'absent';
         return;
@@ -381,6 +418,10 @@ export class TerrainLod {
       n.state = 'ready';
       n.tries = 0;
     } catch {
+      if (fromPack) {
+        packMiss();
+        return;
+      }
       // Сеть, сервер или обрыв по времени — повтор с растущей паузой; место в очереди свободно сразу.
       n.tries++;
       n.retryAt = performance.now() + retryDelayMs(n.tries, Math.random());
@@ -398,13 +439,18 @@ export class TerrainLod {
     tex.anisotropy = this.anisotropy;
     tex.needsUpdate = true;
     const material = new THREE.MeshLambertMaterial({ map: tex });
+    this.shade(material);
+    return material;
+  }
+
+  /** Затенение земли — трава вблизи и тени облаков — у материала со снимком и у окраски рельефа. */
+  private shade(material: THREE.MeshLambertMaterial) {
     material.onBeforeCompile = (shader) => {
       Object.assign(shader.uniforms, this.uniforms);
       shader.vertexShader = 'varying vec3 vTerrainWorld;\n' + shader.vertexShader.replace('#include <project_vertex>', '#include <project_vertex>\n  vTerrainWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;');
       shader.fragmentShader = SHADER_HEAD + shader.fragmentShader.replace('#include <map_fragment>', SHADER_FRAGMENT);
     };
     this.applyDefines(material);
-    return material;
   }
 
   private applyDefines(m: THREE.MeshLambertMaterial) {
@@ -505,7 +551,7 @@ export class TerrainLod {
     if (!n.children) return;
     for (const c of n.children) this.prune(c);
     const old = this.frame - PRUNE_FRAMES;
-    if (n.children.every((c) => !c.children && !c.mesh && c.state === 'idle' && c.lastUsed < old)) {
+    if (n.children.every((c) => !c.children && !c.mesh && (c.state === 'idle' || c.state === 'nodata') && c.lastUsed < old)) {
       for (const c of n.children) this.all.delete(c);
       n.children = null;
     }
@@ -516,20 +562,27 @@ export class TerrainLod {
     const pos: number[] = [];
     const nrm: number[] = [];
     const uv: number[] = [];
+    const col: number[] = [];
     const index: number[] = [];
     const delta = Math.max(5, n.sizeM / N);
     const h = (east: number, north: number) => this.terrain.elevationM(fromLocal(this.site, east, north));
+    const rgb: [number, number, number] = [0, 0, 0];
+    // Цвета вершин — в линейном пространстве, как ждёт three.js.
+    const lin = (c: number) => (c / 255) ** 2.2;
     for (let j = 0; j <= N; j++) {
       for (let i = 0; i <= N; i++) {
         const g = mercatorToGeo((n.x + i / N) * 256, (n.y + j / N) * 256, n.z);
         const l = toLocal(this.site, g);
-        pos.push(l.east, this.terrain.elevationM(g) - this.site.elevationM, -l.north);
+        const elev = this.terrain.elevationM(g);
+        pos.push(l.east, elev - this.site.elevationM, -l.north);
         // Нормаль из уклона рельефа: y = f(x, z), x — восток, z — юг.
         const dhde = (h(l.east + delta, l.north) - h(l.east - delta, l.north)) / (2 * delta);
         const dhdn = (h(l.east, l.north + delta) - h(l.east, l.north - delta)) / (2 * delta);
         const len = Math.hypot(dhde, 1, dhdn);
         nrm.push(-dhde / len, 1 / len, dhdn / len);
         uv.push(i / N, 1 - j / N);
+        reliefRgb(elev, Math.hypot(dhde, dhdn), rgb);
+        col.push(lin(rgb[0]), lin(rgb[1]), lin(rgb[2]));
       }
     }
     for (let j = 0; j < N; j++) {
@@ -552,6 +605,7 @@ export class TerrainLod {
         pos.push(pos[v * 3]!, pos[v * 3 + 1]! - depth, pos[v * 3 + 2]!);
         nrm.push(nrm[v * 3]!, nrm[v * 3 + 1]!, nrm[v * 3 + 2]!);
         uv.push(uv[v * 2]!, uv[v * 2 + 1]!);
+        col.push(col[v * 3]!, col[v * 3 + 1]!, col[v * 3 + 2]!);
       }
       for (let k = 0; k < edge.length - 1; k++) {
         const t0 = edge[k]!;
@@ -565,6 +619,7 @@ export class TerrainLod {
     geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     geo.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
     geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
     // Свои UV тайла; на сетке — они же или пересчитанные на снимок предка (setSource).
     geo.userData['uv0'] = new Float32Array(uv);
     geo.setIndex(index);

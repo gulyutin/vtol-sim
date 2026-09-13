@@ -5,11 +5,16 @@ import { PROFILE } from '@profile';
 import { parseOsm } from './sim/osm';
 import { loadQuality, QUALITY, saveQuality } from './ui/quality';
 import { Preparation, PREP_STEPS, type GroundTest, type PrepStepId } from './game/preparation';
-import { ACTIVE_OSM_URL, ACTIVE_REGION, buildMission, departure, forecastWeather, REGION, SCENARIOS, type Mission, type Scenario, type Settings } from './game/scenarios';
+import { ACTIVE_REGION, buildMission, departure, forecastWeather, REGION, SCENARIOS, type Mission, type Scenario, type Settings } from './game/scenarios';
 import { REGIONS, setRegion } from './game/regions';
+import { osmUrlFor } from './ui/tileSource';
+import { createPacksPanel } from './ui/packsPanel';
 import { blocked, preflightChecks, type Check } from './game/preflight';
 import { actualWeather, PRECIPITATION_NAME, weatherPreset, type WeatherPresetKind } from './game/weather';
-import { fetchLiveWeather, type LiveWeather } from './game/liveWeather';
+import { fetchForecast, fetchLiveWeather, type LiveWeather } from './game/liveWeather';
+import { applyForecastHour, FORECAST_LOOKAHEAD_H, planForecastAsync, type ForecastHour } from './game/forecastPlan';
+import { ForecastPanel } from './ui/forecastPanel';
+import { planReach, pointOfNoReturn, reachFrom, weatherWithMeasuredWind, type ReachOptions } from './sim/reach';
 import { Sound, type SoundState } from './ui/audio';
 import { FlightRecorder, poseOf, stateAt, type Recording } from './game/recorder';
 import { assessFlight, FAILURE_TITLES, findDifficulty, planFailures, saveResult, type Assessment, type DifficultyId, type FailureEvent } from './game/scoring';
@@ -30,7 +35,7 @@ import { loadAircraft } from './ui/aircraftModel';
 import { createGcs, fmt, fmtTime, fmtWind, type GcsCommand, type SurveyInfo } from './ui/gcs';
 import type { ProfileData } from './ui/instruments';
 import { Map2D, type LegLabel, type Pin, type WindSiteMark } from './ui/map2d';
-import { World } from './ui/scene';
+import { World, type CameraMode } from './ui/scene';
 import { expandBounds, loadTerrain, type Bounds } from './ui/terrainData';
 import type { ConclusionContext } from './game/flightSummary';
 import { Callouts, type RouteInfo } from './game/callouts';
@@ -208,6 +213,45 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   const prepNeeded = () => prepRequired || findDifficulty(difficultyId).prepRequired;
   // Разбор: пока открыт, живой полёт стоит, а 3D показывает запись в момент replayT.
   const debrief = new Debrief(app);
+
+  // Прогноз на реальный вылет: окно, расчёт задания по часам, применённый час.
+  const forecastPanel = new ForecastPanel(app, { utcOffsetH: scenario.utcOffsetH });
+  let applied: { hour: ForecastHour; weather: Weather; summary: string } | null = null;
+  let forecastRun: AbortController | null = null;
+  forecastPanel.onRequest((r) => {
+    forecastRun?.abort();
+    const ctrl = new AbortController();
+    forecastRun = ctrl;
+    const sc = scenario;
+    const s = settings;
+    fetchForecast(siteA, r.from, r.hours + FORECAST_LOOKAHEAD_H, ctrl.signal)
+      .then((hours) =>
+        planForecastAsync(
+          { scenario: sc, settings: s, terrain, relief, zones, relays, gcs: siteA, hours, window: r },
+          { signal: ctrl.signal, onProgress: (d, n) => void (forecastRun === ctrl && forecastPanel.setProgress(d, n)) },
+        ),
+      )
+      .then((plan) => {
+        if (forecastRun === ctrl) forecastPanel.setResult(plan);
+      })
+      .catch((e: unknown) => {
+        if (forecastRun !== ctrl) return;
+        forecastPanel.setBusy(false);
+        forecastPanel.setStatus(e instanceof Error ? e.message : String(e), 'bad');
+      });
+  });
+  forecastPanel.onApply((h) => {
+    if (started) return gcs.log(0, 'В полёте погоду не меняют — сначала «Начать заново»', 'warn');
+    const a = applyForecastHour(scenario, settings, h);
+    scenario = a.scenario;
+    settings = a.settings;
+    applied = { hour: h, weather: a.weather, summary: a.summary };
+    weatherSource = 'forecast';
+    gcs.setWeatherSource('forecast');
+    gcs.loadScenario(scenario, settings, forecastError);
+    gcs.log(0, a.summary);
+    replan();
+  });
   let replayT = 0;
   let pausedBeforeDebrief = false;
   debrief.onSeek = (t) => (replayT = t);
@@ -315,6 +359,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       if (src === 'live') return loadLiveWeather();
       liveFetch?.abort();
       liveFetch = null;
+      if (src === 'forecast' && !applied) forecastPanel.show();
       replan();
     },
     onSound() {
@@ -408,6 +453,19 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     onRegion(id) {
       if (id !== ACTIVE_REGION.id && !started) setRegion(id);
     },
+    onPacks() {
+      packsPanel.toggle();
+    },
+    onForecast() {
+      if (forecastPanel.visible) forecastPanel.hide();
+      else forecastPanel.show();
+    },
+    onReach(on) {
+      reachOn = on;
+      reachAt = -Infinity;
+      if (on && started && airborne()) drawReachFlight();
+      else drawReachPlan();
+    },
   }, { regions: [...REGIONS], regionId: ACTIVE_REGION.id });
 
   document.title = PROFILE.title;
@@ -415,22 +473,48 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   const world = new World(gcs.viewEl, { terrain, site: siteA, bounds, area: [], maxImageryZoom: quality.maxImageryZoom, cloudBaseM: 1500, cloudCover: 0.3, quality });
   // По умолчанию камера за хвостом: аппарат на экране смотрит туда же, куда летит.
   world.setCameraMode('chase');
+
+  // Видео полёта из разбора: на время записи основной цикл стоит, кадры рисует запись.
+  let videoBusy = false;
+  let videoDt = 0;
+  let cameraBeforeVideo: CameraMode = 'chase';
+  debrief.setVideoHost({
+    region: ACTIVE_REGION.title,
+    begin(camera) {
+      videoBusy = true;
+      cameraBeforeVideo = world.currentCameraMode;
+      world.setCameraMode(camera);
+    },
+    seek(t, dt) {
+      replayT = t;
+      videoDt = dt;
+      step(dt); // ветка повтора: Солнце, поза, винты, пыль, камера
+    },
+    renderFrame: (w, h) => world.renderTo(w, h, videoDt),
+    busy: () => world.tilesLoading() > 0,
+    end() {
+      world.setCameraMode(cameraBeforeVideo);
+      world.endRenderTo();
+      videoBusy = false;
+    },
+  });
   // Модель аппарата — из профиля; ?model=… в адресе или VITE_MODEL при сборке её заменяют.
   const modelName = new URLSearchParams(location.search).get('model') ?? import.meta.env.VITE_MODEL ?? PROFILE.modelName;
   loadAircraft(`${import.meta.env.BASE_URL}models/${modelName.replace(/[^a-z0-9-]/gi, '')}.glb`)
     .then((model) => world.setAircraft(model))
     .catch((e) => console.warn('CAD-модель аппарата не загрузилась, остаётся упрощённая:', e));
-  // Дома, леса и полосы из OpenStreetMap — если они есть в профиле.
-  if (ACTIVE_OSM_URL) {
-    fetch(ACTIVE_OSM_URL)
-      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((buf) => world.setOsm(parseOsm(buf)))
-      .catch((e) => console.warn('Дома и лес не загрузились:', e));
-  }
+  // Дома, леса и полосы из OpenStreetMap — из пакета района (работа без сети) или файл района.
+  void osmUrlFor(ACTIVE_REGION)
+    .then((url) => (url ? fetch(url) : null))
+    .then((r) => (r === null ? null : r.ok ? r.arrayBuffer() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then((buf) => buf && world.setOsm(parseOsm(buf)))
+    .catch((e) => console.warn('Дома и лес не загрузились:', e));
 
   const map = new Map2D(gcs.mapEl, siteA);
   map.onZoneContext = (id) => applyZones(zones.filter((z) => z.id !== id));
   map.onRelayContext = (i) => applyRelays(relays.filter((_, k) => k !== i));
+  // Окно «Районы и карты»: пакеты для работы без сети.
+  const packsPanel = createPacksPanel();
   map.setZones(zones);
   world.setZones(zones);
   gcs.setZones(zoneItems());
@@ -537,6 +621,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     prep.reset();
     scenario = cloneScenario(sc);
     settings = { ...scenario.defaults };
+    if (weatherSource === 'forecast' && applied) ({ scenario, settings } = applyForecastHour(scenario, settings, applied.hour));
     relays = [...scenario.relays];
     gcs.loadScenario(scenario, settings, forecastError);
     world.setArea(scenario.kind === 'survey' ? scenario.area : []);
@@ -551,13 +636,24 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     if (started) return;
     forecast = forecastWeather(scenario, settings);
     if (weatherSource === 'live' && live) forecast = { ...live.weather };
-    else if (weatherSource !== 'scenario' && weatherSource !== 'live') forecast = weatherPreset(weatherSource as WeatherPresetKind, forecast);
+    else if (weatherSource === 'forecast') {
+      // Прогноз на час вылета — из окна «Прогноз вылета»; пока час не выбран — погода задания.
+      if (applied) forecast = { ...applied.weather };
+    } else if (weatherSource !== 'scenario' && weatherSource !== 'live') forecast = weatherPreset(weatherSource as WeatherPresetKind, forecast);
     actual = forecastError ? actualWeather(forecast, daySeed) : forecast;
     windForecast = new TerrainWind(relief, forecast, { sun: sunAt });
     windActual = new TerrainWind(relief, actual, { sun: sunAt, seed: daySeed });
     world.setWeather(actual);
     gcs.setWeatherSummary(
-      weatherSource === 'scenario' ? '' : weatherSource === 'live' ? (live ? `${live.summary} · ${live.attribution}` : 'Загружаю погоду…') : `Факт: ${weatherText(actual)}`,
+      weatherSource === 'scenario'
+        ? ''
+        : weatherSource === 'live'
+          ? live
+            ? `${live.summary} · ${live.attribution}`
+            : 'Загружаю погоду…'
+          : weatherSource === 'forecast'
+            ? (applied?.summary ?? 'Выберите час в окне «Прогноз вылета»')
+            : `Факт: ${weatherText(actual)}`,
     );
     try {
       mission = buildMission(scenario, settings, terrain, forecast);
@@ -570,6 +666,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     checks = preflightChecks({ stages: mission.stages, weather: forecast, procedures: mission.procedures, cloudBaseM: scenario.cloudBaseM, terrain, gcs: siteA, zones, relays, terrainWind: windForecast ?? undefined });
     gcs.showPreflight(checks);
     drawWind();
+    drawReachPlan();
 
     let survey: SurveyInfo | null = null;
     if (scenario.kind === 'survey' && mission.survey && mission.camera && mission.params) {
@@ -836,6 +933,28 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       title: r.name ?? (r.kind === 'air' ? 'аппарат-ретранслятор' : 'мачта'),
       detail: r.kind === 'air' ? `аппарат на ${fmt(r.altitudeM)} м над морем` : `мачта ${fmt(r.antennaM ?? 10)} м`,
     }));
+  }
+
+  // Досягаемость: куда долетит и вернётся. На планировании — от площадки с полной АКБ,
+  // в полёте — от борта по телеметрии, раз в 5 с реального времени.
+  let reachOn = false;
+  let reachAt = -Infinity;
+  const cruiseAgl = () => (mission.survey ? mission.survey.heightAglM : scenario.kind === 'survey' ? 150 : (scenario.route[0]?.heightAglM ?? 150));
+
+  function drawReachPlan() {
+    if (!reachOn) return map.setReach(null);
+    const o: ReachOptions = { weather: forecast, terrain, iasMs: settings.iasMs, payload: mission.stages[0]!.payload, cruiseHeightAglM: cruiseAgl() };
+    map.setReach(planReach(siteA, { ...o, usableWh: planned.usableWh }));
+  }
+
+  function drawReachFlight() {
+    const tele = flight.telemetry;
+    // Ветер — измеренный у борта; энергия — сверх резерва АКБ.
+    const weather = tele.aglM > 20 ? weatherWithMeasuredWind(forecast, tele.wind, tele.aglM) : forecast;
+    const o: ReachOptions = { weather, terrain, iasMs: controls.iasMs, payload: mission.stages[stage]!.payload, cruiseHeightAglM: cruiseAgl() };
+    const pos = { ...fromLocal(siteA, tele.east, tele.north), altitudeM: tele.up + siteA.elevationM };
+    const energyWh = flight.usableWh - tele.energyWh;
+    map.setReach(reachFrom(pos, energyWh, siteA, o), undefined, pointOfNoReturn(pos, tele.trackDeg, energyWh, siteA, o));
   }
 
   /** Поле ветра на карте на плановой высоте и опасность у площадок — по прогнозу. */
@@ -1210,6 +1329,10 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     hudTimer += dt;
     if (hudTimer > 0.1) {
       hudTimer = 0;
+      if (reachOn && airborne() && performance.now() - reachAt > 5000) {
+        reachAt = performance.now();
+        drawReachFlight();
+      }
       // Вектор путевой скорости на 30 с вперёд: нос по курсу, линия — куда реально летит.
       // НСУ видит телеметрию: при отказе ГНСС — оценку места, без связи — последний принятый кадр.
       const tele = flight.telemetry;
@@ -1314,10 +1437,12 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   function frame(now: number) {
     const dt = Math.min(0.1, (now - last) / 1000);
     last = now;
-    step(dt);
-    updateSound(dt);
-    updateVoice();
-    draw(dt);
+    if (!videoBusy) {
+      step(dt);
+      updateSound(dt);
+      updateVoice();
+      draw(dt);
+    }
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);

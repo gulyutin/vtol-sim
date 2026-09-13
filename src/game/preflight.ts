@@ -48,6 +48,8 @@ export interface PreflightInput {
   relays?: readonly Relay[];
   /** Ветер у рельефа по прогнозной погоде (terrainWind.ts) — см. terrainWindChecks. */
   terrainWind?: TerrainWind;
+  /** Проверка связи, посчитанная заранее (linkCheck): от погоды не зависит. Нет — считается здесь. */
+  link?: Check;
 }
 
 /** Меньше — полёт запрещён (туман); меньше SURVEY_VISIBILITY_M — не видно, что снимать. */
@@ -124,7 +126,7 @@ export function preflightChecks(o: PreflightInput): Check[] {
     `Взлётный маршрут: первая точка в ${fmt(Math.min(...dep))} м, зависание на ${AIRCRAFT.vtol.transitionHeightM} м — не ближе ${AIRCRAFT.procedures.departureDistanceM} м и не ниже ${AIRCRAFT.procedures.minHoverHeightM} м`,
   );
 
-  checks.push(linkCheck(o));
+  checks.push(o.link ?? linkCheck(o));
   if (o.zones?.length) checks.push(...zoneChecks(o.stages, o.zones, o.gcs));
   if (o.terrainWind) checks.push(...terrainWindChecks(o.stages, o.terrainWind));
   return checks;

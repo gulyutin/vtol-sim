@@ -368,6 +368,12 @@ export interface TerrainWindOptions {
   seed?: number;
   /** Солнце — постоянное или по времени; без него нет ни термиков, ни ночного стока. */
   sun?: SunDirection | ((t: number) => SunDirection);
+  /**
+   * Поле над тем же рельефом с тем же направлением ветра: сетки тени и усиления, которые зависят
+   * только от направления, берутся у него, а не считаются заново (прогноз по часам). Направление
+   * другое — сетки считаются как обычно.
+   */
+  grid?: TerrainWind;
 }
 
 export interface WindHazardOptions {
@@ -464,6 +470,17 @@ export class TerrainWind {
     const drift = windAt(weather, 300).speedMs;
     this.driftE = drift * this.toE;
     this.driftN = drift * this.toN;
+    const g = o.grid;
+    if (g && g.relief === relief && g.toE === this.toE && g.toN === this.toN) {
+      this.speedUp = g.speedUp;
+      this.gapUp = g.gapUp;
+      this.leeWA = g.leeWA;
+      this.leeHA = g.leeHA;
+      this.leeWB = g.leeWB;
+      this.leeHB = g.leeHB;
+      this.leeDB = g.leeDB;
+      return;
+    }
     const N = relief.flat ? 0 : relief.nx * relief.ny;
     this.speedUp = new Float64Array(N);
     this.gapUp = new Float64Array(N);

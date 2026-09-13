@@ -211,3 +211,126 @@ ul.db-events li.cmd {
   color: var(--bad);
   font-size: 12px;
 }
+
+.db-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.db-btn:disabled:hover {
+  background: var(--btn);
+}
+
+/* Запись видео (videoExport.ts): параметры, прогресс, итог. */
+.db-video {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--btn-line);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.55);
+  font-size: 12px;
+}
+
+.dv-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 5px 8px;
+  align-items: center;
+}
+
+.dv-k {
+  color: var(--muted);
+}
+
+.dv-seg {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-self: start;
+  border: 1px solid var(--btn-line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.dv-seg button {
+  border: 0;
+  border-left: 1px solid var(--btn-line);
+  background: var(--btn);
+  color: var(--text);
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.dv-seg button:first-child {
+  border-left: 0;
+}
+
+.dv-seg button:hover {
+  background: #fff3e6;
+}
+
+.dv-seg button.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+.dv-info {
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.dv-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 7px;
+}
+
+.dv-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: #e2e2e2;
+  overflow: hidden;
+}
+
+.dv-bar i {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--accent);
+}
+
+.dv-pct {
+  min-width: 112px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.dv-buttons {
+  display: flex;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.dv-go {
+  font-weight: 600;
+}
+
+.dv-status {
+  margin-top: 6px;
+  font-size: 11.5px;
+  user-select: text;
+}
+
+.dv-status.bad {
+  color: var(--bad);
+}
+
+/* Пока пишется видео, плеер и прочие кнопки окна не трогаются. */
+.win.debrief.db-rec :is(.db-player, .db-slider, .db-chart, .db-events, .db-actions, .dv-grid) {
+  pointer-events: none;
+  opacity: 0.55;
+}

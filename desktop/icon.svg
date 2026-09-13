@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <title>VTOL-симулятор — значок приложения</title>
+  <!--
+    Собственный значок: вид сверху на условный VTOL схемы «4 + 1» над кругом горизонта.
+    desktop/make-icons.mjs растрирует этот файл в PNG / ICO / ICNS. Поддерживается только
+    подмножество SVG: rect, circle, ellipse, polygon; fill, fill-opacity, stroke, stroke-width,
+    stroke-opacity (у circle и ellipse), opacity. Без transform и градиентов.
+  -->
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="#10283d"/>
+  <circle cx="512" cy="512" r="360" fill="#143450"/>
+  <circle cx="512" cy="512" r="360" fill="none" stroke="#2a5d86" stroke-width="12"/>
+
+  <!-- балки винтов -->
+  <rect x="318" y="296" width="34" height="408" rx="17" fill="#d6e4ef"/>
+  <rect x="672" y="296" width="34" height="408" rx="17" fill="#d6e4ef"/>
+  <!-- крыло, стабилизатор, фюзеляж -->
+  <rect x="168" y="440" width="688" height="80" rx="40" fill="#eef4f9"/>
+  <rect x="404" y="742" width="216" height="44" rx="22" fill="#eef4f9"/>
+  <rect x="480" y="236" width="64" height="560" rx="32" fill="#eef4f9"/>
+
+  <!-- диски подъёмных винтов -->
+  <circle cx="335" cy="296" r="96" fill="#6cc7ff" fill-opacity="0.26" stroke="#9fdcff" stroke-width="10"/>
+  <circle cx="689" cy="296" r="96" fill="#6cc7ff" fill-opacity="0.26" stroke="#9fdcff" stroke-width="10"/>
+  <circle cx="335" cy="704" r="96" fill="#6cc7ff" fill-opacity="0.26" stroke="#9fdcff" stroke-width="10"/>
+  <circle cx="689" cy="704" r="96" fill="#6cc7ff" fill-opacity="0.26" stroke="#9fdcff" stroke-width="10"/>
+  <circle cx="335" cy="296" r="20" fill="#eef4f9"/>
+  <circle cx="689" cy="296" r="20" fill="#eef4f9"/>
+  <circle cx="335" cy="704" r="20" fill="#eef4f9"/>
+  <circle cx="689" cy="704" r="20" fill="#eef4f9"/>
+
+  <!-- маршевый винт -->
+  <ellipse cx="512" cy="810" rx="70" ry="12" fill="#ff8a3d"/>
+  <polygon points="512,214 530,248 494,248" fill="#ff8a3d"/>
+</svg>

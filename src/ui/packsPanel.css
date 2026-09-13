@@ -1,0 +1,88 @@
+/* Окно «Районы и карты» (packsPanel.ts): поверх всего, по центру сверху. */
+.win.packs-win {
+  position: fixed;
+  left: 50%;
+  top: 56px;
+  transform: translateX(-50%);
+  width: min(760px, calc(100% - 16px));
+  z-index: 1100;
+  font-size: 13px;
+}
+
+.win.packs-win[hidden] {
+  display: none;
+}
+
+.packs-win h4 {
+  margin: 12px 0 6px;
+  font-size: 13px;
+}
+
+.packs-win h4:first-child {
+  margin-top: 0;
+}
+
+.packs-win dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 12px;
+  margin: 0;
+}
+
+.packs-win dt {
+  color: var(--muted);
+}
+
+.packs-win dd {
+  margin: 0;
+}
+
+.packs-win .tbl {
+  overflow-x: auto;
+}
+
+.packs-win table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.packs-win th,
+.packs-win td {
+  padding: 4px 6px;
+  border-bottom: 1px solid #d6d6d6;
+  text-align: left;
+  vertical-align: top;
+}
+
+.packs-win th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.packs-win tr.active td {
+  background: #fff4e8;
+}
+
+.packs-win .ok {
+  color: var(--good);
+}
+
+.packs-win .warn {
+  color: var(--warn);
+}
+
+.packs-win .bad {
+  color: var(--bad);
+}
+
+.packs-win .note {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.packs-win code {
+  font-size: 11px;
+  word-break: break-all;
+}

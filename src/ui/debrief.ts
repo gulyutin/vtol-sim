@@ -3,6 +3,20 @@ import { parseRecording, serialize, stateAt, summarize, type Recording, type Sam
 import type { Assessment } from '../game/scoring';
 import { flightConclusion, type ConclusionContext } from '../game/flightSummary';
 import { MODE_NAMES } from '../sim/flight';
+import { downloadBlob, isAbortError, probeEncoder, recordVideo, type VideoHost, type VideoResult } from './videoExport';
+import {
+  clock,
+  OUTRO_S,
+  pickSpeed,
+  planFrames,
+  REPLAY_SPEEDS,
+  VIDEO_CAMERAS,
+  VIDEO_FPS,
+  VIDEO_SIZES,
+  type EncoderChoice,
+  type VideoCamera,
+  type VideoSizeId,
+} from './videoPlan';
 import './debrief.css';
 
 /*
@@ -148,6 +162,8 @@ export class Debrief {
   onExport?: () => void;
   /** Не задан — файл открывается здесь же (openRecordingFile) и показывается без оценки. */
   onImport?: (file: File) => void;
+  /** Готовое видео. Не задан — скачивается файлом (downloadBlob). */
+  onVideo?: (video: VideoResult) => void;
 
   private readonly el: HTMLDivElement;
   private readonly canvas: HTMLCanvasElement;
@@ -165,6 +181,12 @@ export class Debrief {
   private layerKey = '';
   private ranges: { min: number; max: number; y0: number; y1: number }[] = [];
   private nowEvent = -1;
+  private assessment: Assessment | undefined;
+  // Видео: хозяин 3D-повтора, параметры, проверенные кодировщики по размеру кадра, текущая запись.
+  private videoHost: VideoHost | null = null;
+  private readonly video = { size: '720p' as VideoSizeId, speed: 1, speedAuto: true, camera: 'chase' as VideoCamera, range: 'all' as 'all' | 'cursor' };
+  private readonly encoders = new Map<VideoSizeId, EncoderChoice>();
+  private videoAbort: AbortController | null = null;
 
   constructor(root: HTMLElement) {
     const el = document.createElement('div');
@@ -192,8 +214,26 @@ export class Debrief {
         <details class="db-sec"><summary>События <span class="db-evn"></span></summary><ul class="log db-events"></ul></details>
         <div class="db-actions">
           <button class="db-btn" data-db="export">Сохранить запись</button>
+          <button class="db-btn" data-db="video" hidden>Сохранить видео…</button>
           <button class="db-btn" data-db="import">${importTitle}</button>
           <input type="file" class="db-file" hidden>
+        </div>
+        <div class="db-video" hidden>
+          <div class="dv-grid">
+            <span class="dv-k">Кадр</span><span class="dv-seg" data-group="size">${(Object.keys(VIDEO_SIZES) as VideoSizeId[])
+              .map((id) => `<button data-v="${id}" title="${VIDEO_SIZES[id].width}×${VIDEO_SIZES[id].height}">${VIDEO_SIZES[id].title}</button>`)
+              .join('')}</span>
+            <span class="dv-k">Скорость</span><span class="dv-seg" data-group="speed">${REPLAY_SPEEDS.map((s) => `<button data-v="${s}">${s}×</button>`).join('')}</span>
+            <span class="dv-k">Ракурс</span><span class="dv-seg" data-group="camera">${VIDEO_CAMERAS.map((c) => `<button data-v="${c.id}">${c.title}</button>`).join('')}</span>
+            <span class="dv-k">Участок</span><span class="dv-seg" data-group="range"><button data-v="all">Весь полёт</button><button data-v="cursor">От ползунка до конца</button></span>
+          </div>
+          <div class="dv-info"></div>
+          <div class="dv-progress" hidden><div class="dv-bar"><i></i></div><span class="dv-pct"></span></div>
+          <div class="dv-buttons">
+            <button class="db-btn dv-go" data-db="video-go">Записать</button>
+            <button class="db-btn" data-db="video-cancel" hidden>Отмена</button>
+          </div>
+          <div class="dv-status" hidden></div>
         </div>
         <div class="db-error" hidden></div>
       </div>`;
@@ -203,6 +243,8 @@ export class Debrief {
     this.fileInput = this.q<HTMLInputElement>('.db-file');
 
     el.addEventListener('click', (e) => {
+      const opt = (e.target as HTMLElement).closest<HTMLElement>('.dv-seg > [data-v]');
+      if (opt) return this.setVideoOption(opt.parentElement!.dataset.group!, opt.dataset.v!);
       const b = (e.target as HTMLElement).closest<HTMLElement>('[data-db],[data-rate]');
       if (!b) return;
       if (b.dataset.rate) return this.setRate(Number(b.dataset.rate));
@@ -221,6 +263,18 @@ export class Debrief {
           break;
         case 'import':
           this.fileInput.click();
+          break;
+        case 'video': {
+          const p = this.q<HTMLElement>('.db-video');
+          p.hidden = !p.hidden;
+          if (!p.hidden) this.updateVideoPanel();
+          break;
+        }
+        case 'video-go':
+          void this.saveVideo();
+          break;
+        case 'video-cancel':
+          this.videoAbort?.abort();
           break;
       }
     });
@@ -258,7 +312,7 @@ export class Debrief {
 
     el.addEventListener('keydown', (e) => {
       const tag = (e.target as HTMLElement).tagName;
-      if (e.key === ' ' && tag !== 'BUTTON' && tag !== 'INPUT') {
+      if (e.key === ' ' && tag !== 'BUTTON' && tag !== 'INPUT' && !this.videoAbort) {
         e.preventDefault();
         if (this.isPlaying) this.pause();
         else this.play();
@@ -310,8 +364,10 @@ export class Debrief {
   /** Показать запись (и оценку). Время — в начало записи, onSeek сообщает его хозяину. ctx — план и ёмкость для вывода. */
   show(rec: Recording, assessment?: Assessment, ctx?: ConclusionContext): void {
     if (!rec.samples.length) throw new Error('Запись пуста');
+    this.videoAbort?.abort();
     this.pause();
     this.rec = rec;
+    this.assessment = assessment;
     this.t0 = rec.samples[0]!.t;
     this.t1 = Math.max(this.t0 + 1e-3, rec.samples[rec.samples.length - 1]!.t);
     this.slider.min = String(this.t0);
@@ -322,11 +378,150 @@ export class Debrief {
     this.renderText(rec, assessment, ctx);
     this.el.hidden = false;
     this.seek(this.t0);
+    this.video.speedAuto = true;
+    this.videoStatus(null);
+    this.updateVideoPanel();
   }
 
   hide(): void {
+    this.videoAbort?.abort();
     this.pause();
     this.el.hidden = true;
+  }
+
+  /**
+   * Хозяин 3D-повтора для «Сохранить видео…» (videoExport.ts): seek ставит повтор на момент t,
+   * renderFrame рисует кадр нужного размера, begin / end отдают сцену на время записи.
+   * null — кнопки видео нет.
+   */
+  setVideoHost(host: VideoHost | null): void {
+    this.videoHost = host;
+    this.q<HTMLElement>('[data-db="video"]').hidden = !host;
+    if (!host) {
+      this.videoAbort?.abort();
+      this.q<HTMLElement>('.db-video').hidden = true;
+    }
+  }
+
+  /** Идёт запись видео. */
+  get recordingVideo(): boolean {
+    return !!this.videoAbort;
+  }
+
+  private setVideoOption(group: string, v: string) {
+    if (this.videoAbort) return;
+    const o = this.video;
+    if (group === 'size' && v in VIDEO_SIZES) o.size = v as VideoSizeId;
+    else if (group === 'speed') {
+      o.speed = Number(v);
+      o.speedAuto = false;
+    } else if (group === 'camera') o.camera = v as VideoCamera;
+    else if (group === 'range') {
+      o.range = v === 'cursor' ? 'cursor' : 'all';
+      o.speedAuto = true;
+    }
+    this.updateVideoPanel();
+  }
+
+  /** Участок для видео: весь полёт или от ползунка до конца. */
+  private videoRange(): { from: number; to: number } {
+    return { from: this.video.range === 'cursor' ? this.t : this.t0, to: this.t1 };
+  }
+
+  /** Отметки выбранного, скорость по длительности, формат и длина видео. Кодировщик проверяется один раз на размер. */
+  private updateVideoPanel() {
+    const p = this.q<HTMLElement>('.db-video');
+    if (p.hidden || !this.rec) return;
+    const o = this.video;
+    const { from, to } = this.videoRange();
+    if (o.speedAuto) o.speed = pickSpeed(to - from);
+    const chosen: Record<string, string> = { size: o.size, speed: String(o.speed), camera: o.camera, range: o.range };
+    p.querySelectorAll<HTMLElement>('.dv-seg').forEach((seg) =>
+      seg.querySelectorAll<HTMLElement>('[data-v]').forEach((b) => b.classList.toggle('on', b.dataset.v === chosen[seg.dataset.group!])),
+    );
+    const size = VIDEO_SIZES[o.size];
+    const enc = this.encoders.get(o.size);
+    if (!enc) {
+      void probeEncoder(size.width, size.height).then(
+        (c) => {
+          this.encoders.set(o.size, c);
+          this.updateVideoPanel();
+        },
+        () => {
+          this.encoders.set(o.size, { kind: 'none', label: 'Запись видео в этом браузере недоступна' });
+          this.updateVideoPanel();
+        },
+      );
+    }
+    const plan = planFrames(from, to, o.speed, VIDEO_FPS, this.assessment ? OUTRO_S : 0);
+    const empty = to - from < 0.5;
+    this.q<HTMLElement>('.dv-info').textContent = empty
+      ? 'Ползунок в конце записи — видео не из чего'
+      : `${enc?.label ?? 'Проверяю кодировщик…'} · ${size.width}×${size.height} · ${VIDEO_FPS} к/с · видео ${clock(plan.durationS)}`;
+    this.q<HTMLButtonElement>('.dv-go').disabled = !enc || enc.kind === 'none' || empty || !!this.videoAbort;
+  }
+
+  private videoStatus(text: string | null, bad = false) {
+    const s = this.q<HTMLElement>('.dv-status');
+    s.hidden = !text;
+    s.textContent = text ?? '';
+    s.classList.toggle('bad', bad);
+  }
+
+  /** Записать видео по выбранным параметрам. Плеер на паузе; по окончании повтор возвращается на прежний момент. */
+  private async saveVideo() {
+    const host = this.videoHost;
+    const rec = this.rec;
+    if (!host || !rec || this.videoAbort) return;
+    const o = this.video;
+    const { from, to } = this.videoRange();
+    const back = this.t;
+    this.pause();
+    const ctrl = new AbortController();
+    this.videoAbort = ctrl;
+    const enc = this.encoders.get(o.size);
+    const verb = enc?.kind === 'webm' ? 'Записываю' : 'Кодирую';
+    const bar = this.q<HTMLElement>('.dv-bar > i');
+    const pct = this.q<HTMLElement>('.dv-pct');
+    this.el.classList.add('db-rec');
+    this.q<HTMLElement>('.dv-progress').hidden = false;
+    this.q<HTMLElement>('[data-db="video-cancel"]').hidden = false;
+    this.q<HTMLButtonElement>('.dv-go').disabled = true;
+    this.videoStatus(null);
+    try {
+      const v = await recordVideo(
+        rec,
+        host,
+        { size: o.size, speed: o.speed, camera: o.camera, from, to },
+        {
+          assessment: this.assessment,
+          signal: ctrl.signal,
+          encoder: enc,
+          onProgress: (p) => {
+            const n = Math.floor(p.fraction * 100);
+            bar.style.width = `${n}%`;
+            pct.textContent = p.phase === 'prepare' ? 'Готовлю сцену…' : p.phase === 'finish' ? 'Собираю файл…' : `${verb}… ${n} %`;
+            this.setTime(p.t);
+          },
+        },
+      );
+      if (this.onVideo) this.onVideo(v);
+      else downloadBlob(v.blob, v.fileName);
+      const mb = fmt(v.blob.size / 1048576, 1);
+      this.videoStatus(`Готово: ${v.fileName} · ${mb} МБ · ${clock(v.durationS)} видео · записано за ${clock(v.elapsedMs / 1000)}`);
+    } catch (e) {
+      if (isAbortError(e)) this.videoStatus('Запись видео отменена');
+      else this.videoStatus(`Видео не записалось: ${e instanceof Error ? e.message : String(e)}`, true);
+    } finally {
+      this.videoAbort = null;
+      this.el.classList.remove('db-rec');
+      this.q<HTMLElement>('.dv-progress').hidden = true;
+      this.q<HTMLElement>('[data-db="video-cancel"]').hidden = true;
+      bar.style.width = '0';
+      // Повтор — на прежний момент (хозяин узнаёт его через onSeek).
+      if (this.rec === rec && !this.el.hidden) this.seek(back);
+      this.updateVideoPanel();
+    }
   }
 
   /** Время снаружи (например, хозяин сам ведёт повтор). onSeek не вызывается. */

@@ -625,7 +625,54 @@ export class World {
     this.sun.target.position.copy(this.target);
   }
 
-  render(dt = 0) {
+  /** Текущий режим камеры — чтобы вернуть его после записи видео. */
+  get currentCameraMode(): CameraMode {
+    return this.cameraMode;
+  }
+
+  /**
+   * Кадр ровно width × height для записи видео (videoExport.ts): буфер холста без devicePixelRatio,
+   * аспект камеры по кадру, постобработка со свечением при любом качестве. Размер кадра держится до
+   * endRenderTo() — при записи подряд буферы композитора не пересоздаются на каждый кадр.
+   * Возвращает холст рендерера: снять с него кадр (drawImage, VideoFrame) нужно сразу, до следующего рендера.
+   */
+  renderTo(width: number, height: number, dt = 0): HTMLCanvasElement {
+    const r = this.renderer;
+    const c = r.domElement;
+    if (c.width !== width || c.height !== height || r.getPixelRatio() !== 1) {
+      r.setPixelRatio(1);
+      this.composer.setPixelRatio(1);
+      // Размер холста на странице не меняется: там на время записи просто виден кадр.
+      r.setSize(width, height, false);
+      this.composer.setSize(width, height);
+    }
+    if (this.camera.aspect !== width / height) {
+      this.camera.aspect = width / height;
+      this.camera.updateProjectionMatrix();
+    }
+    const bloom = this.bloom.enabled;
+    this.bloom.enabled = true;
+    this.render(dt, true);
+    this.bloom.enabled = bloom;
+    return c;
+  }
+
+  /** После renderTo: вернуть разрешение и аспект окна. */
+  endRenderTo() {
+    const ratio = Math.min(window.devicePixelRatio, this.q.pixelRatio);
+    this.renderer.setPixelRatio(ratio);
+    this.composer.setPixelRatio(ratio);
+    this.resize();
+  }
+
+  /** Сколько тайлов рельефа и снимков сейчас грузится: запись видео ждёт их, чтобы кадр не был мыльным. */
+  tilesLoading(): number {
+    // Счётчик загрузок по хостам — внутреннее поле TerrainLod; нет его — считаем, что всё загружено.
+    const inflight = (this.lod as unknown as { inflight?: unknown }).inflight;
+    return Array.isArray(inflight) ? inflight.reduce((a: number, k: unknown) => a + (typeof k === 'number' ? k : 0), 0) : 0;
+  }
+
+  render(dt = 0, post = this.q.postprocess) {
     this.sky.follow(this.camera.position);
     this.windOffset.addScaledVector(this.cloudWind, -dt);
     const cu = this.clouds.material.uniforms;
@@ -648,7 +695,7 @@ export class World {
     this.osm?.update(this.camera.position, { time: this.clock, nightFactor: this.nightFactor, wind: this.groundWind });
     this.landmarks?.update(this.nightFactor);
     this.precip.update(dt, this.camera);
-    if (this.q.postprocess) this.composer.render(dt);
+    if (post) this.composer.render(dt);
     else this.renderer.render(this.scene, this.camera);
   }
 

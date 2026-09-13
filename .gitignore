@@ -1,9 +1,19 @@
 node_modules/
 dist/
 
+# Настольное приложение: установщики и промежуточные файлы (desktop/README.md)
+release/
+desktop/out/
+desktop/build/
+desktop/.stage/
+
 # Свой профиль аппарата и данные — не публикуются
 private/
 logs/
 
 .DS_Store
 *.log
+
+# Пакеты районов для работы без сети
+public/packs/
+/packs/

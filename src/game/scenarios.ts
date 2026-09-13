@@ -217,6 +217,18 @@ export function departure(sc: Scenario, s: Settings): Date {
   return new Date(Date.parse(`${sc.date}T00:00:00Z`) + minutes * 60_000);
 }
 
+/**
+ * То же задание с вылетом в момент utc: дата и местный час — по часовому поясу района, так что
+ * departure() даёт utc, а Солнце, термики и освещённость — на этот момент. Исходные не меняются.
+ */
+export function atDeparture<S extends Scenario>(sc: S, s: Settings, utc: Date): { scenario: S; settings: Settings } {
+  const local = new Date(utc.getTime() + sc.utcOffsetH * 3_600_000);
+  return {
+    scenario: { ...sc, date: local.toISOString().slice(0, 10) },
+    settings: { ...s, localHour: local.getUTCHours() + local.getUTCMinutes() / 60 },
+  };
+}
+
 export interface Mission {
   kind: ScenarioKind;
   /** Полёты задания по порядку; у доставки — туда и обратно. */

@@ -1,0 +1,49 @@
+# Установщики настольного приложения (демо-профиль) для macOS, Windows и Linux.
+# Запускается только вручную (Actions → «Настольное приложение» → Run workflow).
+# Ничего не публикует: установщики остаются артефактами запуска на 14 дней. Без секретов —
+# установщики не подписаны (см. desktop/README.md).
+name: Настольное приложение
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS, os: macos-latest, flag: --mac }
+          - { name: Windows, os: windows-latest, flag: --win }
+          - { name: Linux, os: ubuntu-latest, flag: --linux }
+    env:
+      # Не искать сертификаты в связке ключей раннера: сборка без подписи.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Сборка установщиков
+        run: npm run desktop:build:demo -- ${{ matrix.flag }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vtol-sim-demo-${{ matrix.name }}
+          path: |
+            release/demo/*.dmg
+            release/demo/*.exe
+            release/demo/*.AppImage
+            release/demo/*.deb
+          if-no-files-found: error
+          retention-days: 14

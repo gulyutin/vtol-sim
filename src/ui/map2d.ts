@@ -6,6 +6,13 @@ import type { GeoPoint, Site } from '../sim/types';
 import { makeZoneId, prepareZones, ZONE_TITLE, zoneContour, zoneLabel, type Zone, type ZoneKind } from '../sim/zones';
 import { LINK_GOOD_DB, LINK_LOST_DB, RADIO, type LinkStatus, type RadioCoverage, type Relay } from '../sim/radio';
 import type { WindFieldGrid, WindHazard } from '../sim/terrainWind';
+import { mercatorToGeo } from '../sim/terrain';
+import { layerCovers } from './packFormat';
+import { contourStepM, hillshade, reliefRgb } from './reliefTint';
+import { decodeTerrarium } from './terrainData';
+import { activePack, activePackNow, attribution, imageryFallback, imagerySource, packImageryUrl, packImageryZooms, terrainTile, tileEnv } from './tileSource';
+import type { NoReturn, ReachResult } from '../sim/reach';
+import { ReachLayer } from './reachLayer';
 
 /** Площадка с оценкой ветра у рельефа (terrainWind.ts windHazardAt) — кружок по уровню опасности. */
 export interface WindSiteMark {
@@ -131,6 +138,178 @@ const LABELS = 'https://{s}.arcgisonline.com/ArcGIS/rest/services/Reference/Worl
 const ESRI_HOSTS = ['server', 'services'];
 const ll = (p: GeoPoint) => L.latLng(p.lat, p.lon);
 
+/**
+ * Подложка-снимки: тайл из пакета района, если пакет его покрывает, иначе Esri по сети. Без сети —
+ * тайлы только из пакета; где своего нет — участок ближайшего предка из пакета, а где нет и его —
+ * прозрачно (под ним тонированный рельеф).
+ */
+class ImageryLayer extends L.TileLayer {
+  constructor(options: L.TileLayerOptions) {
+    super(IMAGERY, { ...options, subdomains: ESRI_HOSTS });
+    // Тайла в пакете не оказалось — один раз в сеть, если она есть.
+    this.on('tileerror', (e: L.TileErrorEvent) => {
+      const img = e.tile as HTMLImageElement;
+      if (img.dataset['pack'] && imageryFallback()) {
+        delete img.dataset['pack'];
+        img.src = L.Util.template(IMAGERY, { s: ESRI_HOSTS[hostOf(e.coords)], x: e.coords.x, y: e.coords.y, z: e.coords.z });
+      }
+    });
+  }
+
+  override getTileUrl(c: L.Coords): string {
+    return imagerySource(c.z, c.x, c.y) === 'pack' ? packImageryUrl(c.z, c.x, c.y) : super.getTileUrl(c);
+  }
+
+  override createTile(c: L.Coords, done: L.DoneCallback): HTMLElement {
+    const src = imagerySource(c.z, c.x, c.y);
+    if (src) {
+      const img = super.createTile(c, done) as HTMLImageElement;
+      if (src === 'pack') img.dataset['pack'] = '1';
+      return img;
+    }
+    return ancestorTile(c, done);
+  }
+}
+
+const hostOf = (c: L.Coords) => (c.x + c.y) % ESRI_HOSTS.length;
+
+/** Без сети, тайла в пакете нет: участок снимка ближайшего предка из пакета или пусто. */
+function ancestorTile(c: L.Coords, done: L.DoneCallback): HTMLElement {
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = 256;
+  const zs = packImageryZooms();
+  let found: { z: number; x: number; y: number; k: number } | null = null;
+  for (let z = Math.min(c.z - 1, zs?.max ?? -1); zs && z >= zs.min; z--) {
+    const k = 2 ** (c.z - z);
+    const x = Math.floor(c.x / k);
+    const y = Math.floor(c.y / k);
+    if (imagerySource(z, x, y) === 'pack') {
+      found = { z, x, y, k };
+      break;
+    }
+  }
+  if (!found) {
+    setTimeout(() => done(undefined, canvas));
+    return canvas;
+  }
+  const a = found;
+  const img = new Image();
+  img.onload = () => {
+    const s = 256 / a.k;
+    const ctx = canvas.getContext('2d')!;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, (c.x - a.x * a.k) * s, (c.y - a.y * a.k) * s, s, s, 0, 0, 256, 256);
+    done(undefined, canvas);
+  };
+  img.onerror = () => done(undefined, canvas);
+  img.src = packImageryUrl(a.z, a.x, a.y);
+  return canvas;
+}
+
+/** Высоты тайлов рельефа для карты: последние декодированные (по 256 КБ). */
+const reliefHeights = new Map<string, Promise<Float32Array | null>>();
+function heightsOf(z: number, x: number, y: number): Promise<Float32Array | null> {
+  const key = `${z}/${x}/${y}`;
+  let p = reliefHeights.get(key);
+  if (p) reliefHeights.delete(key);
+  else
+    p = terrainTile(z, x, y)
+      .then((t) => decodeTerrarium(t.blob))
+      .then((h) => (h.length === 256 * 256 ? h : null))
+      .catch(() => null);
+  reliefHeights.set(key, p);
+  if (reliefHeights.size > 64) reliefHeights.delete(reliefHeights.keys().next().value!);
+  return p;
+}
+
+/**
+ * Тонированный рельеф тайла карты (z, x, y) из высот пакета: цвет по высоте и склону, отмывка
+ * с северо-запада, горизонтали. Крупнее уровней пакета — участок его тайла с билинейной
+ * интерполяцией. null — рельефа здесь нет.
+ */
+async function reliefImage(z: number, x: number, y: number): Promise<ImageData | null> {
+  const terrain = activePackNow()?.manifest.terrain;
+  if (!terrain) return null;
+  let tz = -1;
+  for (const q of terrain.zooms) if (q <= z) tz = q;
+  if (tz < 0) return null;
+  const k = 2 ** (z - tz);
+  const px = Math.floor(x / k);
+  const py = Math.floor(y / k);
+  if (!layerCovers(terrain, tz, px, py)) return null;
+  const src = await heightsOf(tz, px, py);
+  if (!src) return null;
+  const S = 256;
+  const W = S + 2;
+  const H = new Float32Array(W * W);
+  const ox = ((x - px * k) * S) / k;
+  const oy = ((y - py * k) * S) / k;
+  const at = (i: number, j: number) => src[Math.max(0, Math.min(S - 1, j)) * S + Math.max(0, Math.min(S - 1, i))]!;
+  for (let j = -1; j <= S; j++) {
+    const v = oy + (j + 0.5) / k - 0.5;
+    const j0 = Math.floor(v);
+    const fv = v - j0;
+    for (let i = -1; i <= S; i++) {
+      const u = ox + (i + 0.5) / k - 0.5;
+      const i0 = Math.floor(u);
+      const fu = u - i0;
+      const top = at(i0, j0) * (1 - fu) + at(i0 + 1, j0) * fu;
+      const bottom = at(i0, j0 + 1) * (1 - fu) + at(i0 + 1, j0 + 1) * fu;
+      H[(j + 1) * W + i + 1] = top * (1 - fv) + bottom * fv;
+    }
+  }
+  const lat = mercatorToGeo((x + 0.5) * 256, (y + 0.5) * 256, z).lat;
+  const mpp = (40_075_016.686 * Math.cos((lat * Math.PI) / 180)) / (256 * 2 ** z);
+  const step = contourStepM(z);
+  const img = new ImageData(S, S);
+  const rgb: [number, number, number] = [0, 0, 0];
+  for (let j = 0; j < S; j++) {
+    for (let i = 0; i < S; i++) {
+      const c = (j + 1) * W + i + 1;
+      const e = H[c]!;
+      const dzdx = (H[c + 1]! - H[c - 1]!) / (2 * mpp);
+      const dzdy = (H[c + W]! - H[c - W]!) / (2 * mpp);
+      reliefRgb(e, Math.hypot(dzdx, dzdy), rgb);
+      let f = 0.3 + 0.98 * hillshade(dzdx, dzdy);
+      // Горизонталь — где соседний пиксель справа или снизу уже в другом слое; каждая пятая — жирнее.
+      const band = Math.floor(e / step);
+      const right = Math.floor(H[c + 1]! / step);
+      const below = Math.floor(H[c + W]! / step);
+      if (band !== right || band !== below) f *= Math.max(band, right, below) % 5 === 0 ? 0.62 : 0.8;
+      const o = (j * S + i) * 4;
+      img.data[o] = rgb[0] * f;
+      img.data[o + 1] = rgb[1] * f;
+      img.data[o + 2] = rgb[2] * f;
+      img.data[o + 3] = 255;
+    }
+  }
+  return img;
+}
+
+/** Без сети и без рельефа: ровный фон и сетка по границам тайлов. */
+function emptyTile(ctx: CanvasRenderingContext2D) {
+  ctx.fillStyle = '#e3e5e0';
+  ctx.fillRect(0, 0, 256, 256);
+  ctx.strokeStyle = '#c3c7bf';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, 256, 256);
+}
+
+/** Тонированный рельеф пакета — подложка карты без сети. */
+class ReliefLayer extends L.GridLayer {
+  override createTile(c: L.Coords, done: L.DoneCallback): HTMLElement {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 256;
+    void reliefImage(c.z, c.x, c.y).then((img) => {
+      const ctx = canvas.getContext('2d')!;
+      if (img) ctx.putImageData(img, 0, 0);
+      else emptyTile(ctx);
+      done(undefined, canvas);
+    });
+    return canvas;
+  }
+}
+
 /** Точка маршрута с подписью высоты — как в НСУ. */
 export interface Pin {
   position: GeoPoint;
@@ -200,8 +379,8 @@ export class Map2D {
 
   constructor(el: HTMLElement, site: Site) {
     this.map = L.map(el, { zoomControl: false, preferCanvas: true, maxZoom: 19 }).setView(ll(site), 13);
-    L.tileLayer(IMAGERY, { maxZoom: 19, maxNativeZoom: 19, subdomains: ESRI_HOSTS, attribution: 'Снимки © Esri, Maxar, Earthstar Geographics' }).addTo(this.map);
-    L.tileLayer(LABELS, { maxZoom: 19, maxNativeZoom: 19, subdomains: ESRI_HOSTS }).addTo(this.map);
+    // Подложка — когда известно, есть ли пакет района (к этому времени обычно уже известно).
+    void activePack().then(() => this.addBaseLayers());
     L.control.scale({ imperial: false, position: 'bottomright' }).addTo(this.map);
     this.map.createPane('zones').style.zIndex = '350';
     this.zoneRenderer = L.svg({ pane: 'zones', padding: 0.5 });
@@ -240,6 +419,19 @@ export class Map2D {
       this.draw ? this.drawClick(e.latlng) : this.relayPlace ? this.relayClick(e.latlng) : this.onClick?.({ lat: e.latlng.lat, lon: e.latlng.lng }),
     );
     this.map.on('zoomend', () => this.updateMarks());
+  }
+
+  /**
+   * С сетью — снимки (из пакета, где он их покрывает, иначе Esri) и подписи Esri, как прежде.
+   * Без сети — тонированный рельеф пакета (вне его — пусто с сеткой) и поверх снимки пакета, если есть.
+   */
+  private addBaseLayers() {
+    const offline = tileEnv().offline;
+    const a = attribution();
+    if (offline) new ReliefLayer({ maxZoom: 19, attribution: a.terrain }).addTo(this.map);
+    const zs = packImageryZooms();
+    if (!offline || zs) new ImageryLayer({ maxZoom: 19, maxNativeZoom: offline ? zs!.max : 19, attribution: a.imagery ?? '' }).addTo(this.map);
+    if (!offline) L.tileLayer(LABELS, { maxZoom: 19, maxNativeZoom: 19, subdomains: ESRI_HOSTS }).addTo(this.map);
   }
 
   invalidate() {
@@ -447,6 +639,22 @@ export class Map2D {
     const sw = fromLocal(origin, cov.e0, cov.n0);
     const ne = fromLocal(origin, cov.e0 + cov.cols * cov.cellM, cov.n0 + cov.rows * cov.cellM);
     this.radioShadow = L.imageOverlay(canvas.toDataURL(), L.latLngBounds(ll(sw), ll(ne)), { pane: 'radioShadow', interactive: false, className: 'radio-shadow' }).addTo(this.map);
+  }
+
+  /* ------------------------------ Досягаемость ------------------------------ */
+
+  private reach: ReachLayer | null = null;
+
+  /**
+   * Досягаемость (reach.ts): заливка градиентом «с запасом → впритык → в один конец», кольца
+   * с подписями; в полёте noReturn — точка невозврата по курсу и пунктир возврата. Заливка — под
+   * радиотенью (где нет связи, она темнее), контуры — под зонами и маршрутом (reachLayer.ts).
+   * null — убрать. origin — начало лучей, по умолчанию result.origin.
+   */
+  setReach(result: ReachResult | null, origin?: GeoPoint, noReturn?: NoReturn | null) {
+    if (!result && !this.reach) return;
+    this.reach ??= new ReachLayer(this.map);
+    this.reach.set(result, origin, noReturn);
   }
 
   /* ------------------------------ Ветер у рельефа ------------------------------ */
