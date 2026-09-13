@@ -136,6 +136,91 @@ export interface RoutePoint extends GeoPoint {
   heightAglM: number;
 }
 
+/** Вид процедурной модели ориентира (src/ui/landmarks.ts). */
+export type LandmarkKind = 'clockTower' | 'museum';
+
+/** Ярус башни: от верха предыдущего (первый — от земли) до toM; в плане квадрат со стороной widthM. */
+export interface TowerTier {
+  toM: number;
+  widthM: number;
+  /** Облицовка, '#rrggbb'. */
+  color?: string;
+  /** Металлическая (серебристая) облицовка — блестит. */
+  metallic?: boolean;
+  /**
+   * plain — гладкий; banded — с поясами; ribbed — рёбра-пилястры по граням, между ними тёмные
+   * проёмы; arcaded — арочные проёмы; slotted — тёмные вертикальные прорези-ниши; flared —
+   * расширяется кверху до topWidthM (карниз-«корона»).
+   */
+  style?: 'plain' | 'banded' | 'ribbed' | 'arcaded' | 'slotted' | 'flared';
+  /** ribbed: рёбер на грань, цвет проёмов между ними и их подсветка ночью. */
+  ribs?: number;
+  gapColor?: string;
+  gapGlowColor?: string;
+  /** slotted: прорези на грань. */
+  slots?: { count: number; widthM: number; color?: string };
+  /** flared: ширина поверху. */
+  topWidthM?: number;
+  /** Подсветка ночью, 0…2 (у ribbed — проёмов между рёбрами), и её цвет. */
+  glow?: number;
+  glowColor?: string;
+  /** Выступающий карниз поверху яруса и ограждение открытой площадки на нём. */
+  cornice?: { widthM: number; heightM: number; color?: string };
+  balustrade?: { heightM: number; color?: string };
+}
+
+/** Башня с часами по ярусам — чтобы подогнать облик под настоящую без переписывания модели. */
+export interface ClockTowerSpec {
+  /** Снизу вверх. */
+  tiers: TowerTier[];
+  /** Четыре циферблата на гранях. */
+  clock: {
+    /** Высота центра циферблата, м. */
+    centerM: number;
+    diameterM: number;
+    /** Выступающая панель под циферблатами (все четыре грани). */
+    panel?: { fromM: number; toM: number; widthM: number; color?: string };
+    faceColor?: string;
+    /** Риски и цифры. */
+    markColor?: string;
+    /** Обод по краю циферблата; без него — кольцо цвета рисок. */
+    rimColor?: string;
+    /** Арабские цифры 1…12. */
+    numerals?: boolean;
+    handColor?: string;
+    /** Подсветка ночью, 0…2: светятся светлые элементы циферблата, тёмный фон остаётся тёмным. */
+    glow?: number;
+  };
+  /**
+   * Завершение: шатёр (четырёхскатная пирамида, ribColor — светлые рёбра по углам и серединам
+   * скатов) или стеклянная пирамида (стенки до wallToM, выше — скаты до toM).
+   */
+  top?: { kind: 'tent' | 'glassPyramid'; toM: number; widthM: number; wallToM?: number; color?: string; ribColor?: string; glow?: number };
+  /** Шпиль; ball — шар под вершиной, vane — флюгер-флажок. */
+  spire?: { toM: number; widthM: number; color?: string; ball?: boolean; vane?: boolean };
+}
+
+/**
+ * Ориентир района — узнаваемое здание процедурной моделью в 3D. Стоит на рельефе; дом OSM,
+ * в контур которого попадает точка музея, не рисуется (модель его заменяет), башня с часами
+ * встаёт прямо в контур здания и поднимается над крышей.
+ */
+export interface Landmark {
+  kind: LandmarkKind;
+  lat: number;
+  lon: number;
+  /** Куда смотрит главный фасад (циферблат, портал), ° от севера по часовой. */
+  headingDeg?: number;
+  /** Полная высота, м. */
+  heightM?: number;
+  /** Ширина по фасаду, м. */
+  widthM?: number;
+  /** Глубина от фасада назад, м. */
+  depthM?: number;
+  /** Облик башни с часами по ярусам; без него — классическая башня по heightM и widthM. */
+  tower?: ClockTowerSpec;
+}
+
 /** Район заданий: площадка, область рельефа и снимков, точки заданий. */
 export interface LocationSpec {
   /** Название района для выбора в интерфейсе: «Подмосковье — долина Оки». */
@@ -162,6 +247,8 @@ export interface LocationSpec {
    * связь за рельефом дольше таймаута и борт на земле в пункте Б был на связи.
    */
   relays?: Relay[];
+  /** Узнаваемые здания района процедурными моделями (src/ui/landmarks.ts). */
+  landmarks?: Landmark[];
 }
 
 /** Район заданий для выбора в интерфейсе (src/game/regions.ts). */

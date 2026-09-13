@@ -12,7 +12,9 @@ import type { Coverage, Frame } from '../sim/survey';
 import type { LocalPoint } from '../sim/timeline';
 import type { GeoPoint, Site, Terrain, Weather } from '../sim/types';
 import type { Zone } from '../sim/zones';
+import { ACTIVE_REGION } from '../game/scenarios';
 import { createAircraft, type AircraftModel } from './aircraftModel';
+import { Landmarks } from './landmarks';
 import { OsmLayer } from './osmLayer';
 import { createGroundStation, createLandingPad, createLandingZone, createVehicle, createWaypointMarker, RotorDust } from './props';
 import { QUALITY, type QualitySettings } from './quality';
@@ -114,6 +116,8 @@ export class World {
   private readonly site: Site;
   private readonly lod: TerrainLod;
   private osm: OsmLayer | null = null;
+  /** Ориентиры района процедурными моделями (LocationSpec.landmarks), если они есть. */
+  private readonly landmarks: Landmarks | null = null;
   private readonly sky = new SkyDome();
   private readonly skyEnv = new THREE.Scene();
   private readonly pmrem: THREE.PMREMGenerator;
@@ -225,6 +229,11 @@ export class World {
 
     this.scene.add(this.lod.group, this.createGroundFill(env.bounds), this.routeGroup, this.markerGroup, this.trail, this.frameLines, this.createPad(0, 0));
     this.scene.add(this.createWindsock({ east: 8, north: 6 }), this.createCamp(), this.zoneWalls.group);
+    const loc = ACTIVE_REGION.location;
+    if (loc.landmarks?.length) {
+      this.landmarks = new Landmarks(loc.landmarks, this.site, (e, n) => this.groundAt(e, n), { date: new Date(`${loc.date}T12:00:00Z`), utcOffsetH: loc.utcOffsetH });
+      this.scene.add(this.landmarks.group);
+    }
     this.setArea(env.area);
 
     this.clouds = new THREE.Mesh(
@@ -341,6 +350,8 @@ export class World {
       this.scene.remove(this.osm.group);
       this.osm.dispose();
     }
+    // Дом под моделью ориентира не рисуется — не будет двойного объёма.
+    if (this.landmarks) data = this.landmarks.withoutReplaced(data);
     this.osm = new OsmLayer(data, (e, n) => this.groundAt(e, n), this.q);
     this.scene.add(this.osm.group);
   }
@@ -385,6 +396,8 @@ export class World {
 
   /** Положение Солнца: небо, прямой свет, рассеянный свет, дымка и отражения. */
   setSun(sun: SunPosition) {
+    // Часы на ориентирах идут каждый кадр, небо пересчитывается реже.
+    this.landmarks?.setSun(sun);
     if (this.lastSun && Math.abs(this.lastSun.elevationDeg - sun.elevationDeg) < 0.2 && Math.abs(this.lastSun.azimuthDeg - sun.azimuthDeg) < 0.2) return;
     this.lastSun = sun;
     const el = sun.elevationDeg * DEG;
@@ -633,6 +646,7 @@ export class World {
     );
     // Мир из OpenStreetMap: деревья качает ветер, ночью горят окна и фонари.
     this.osm?.update(this.camera.position, { time: this.clock, nightFactor: this.nightFactor, wind: this.groundWind });
+    this.landmarks?.update(this.nightFactor);
     this.precip.update(dt, this.camera);
     if (this.q.postprocess) this.composer.render(dt);
     else this.renderer.render(this.scene, this.camera);

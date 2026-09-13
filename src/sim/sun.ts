@@ -10,6 +10,26 @@ export interface SunPosition {
 }
 
 /**
+ * Местное время, ч (0…24), по положению Солнца: часовой угол из высоты и азимута, затем
+ * уравнение времени на дату, долгота и часовой пояс. Для часов в 3D — сцена получает только
+ * Солнце. Точность — минута-другая; ночью тоже: часовой угол однозначен и под горизонтом.
+ */
+export function localHourFromSun(sun: SunPosition, p: GeoPoint, date: Date, utcOffsetH: number): number {
+  const h = sun.elevationDeg * RAD;
+  const a = sun.azimuthDeg * RAD;
+  const lat = p.lat * RAD;
+  // Часовой угол: к западу (после полудня) — положительный.
+  const hourAngle = Math.atan2(-Math.sin(a) * Math.cos(h), Math.sin(h) * Math.cos(lat) - Math.cos(h) * Math.cos(a) * Math.sin(lat));
+  const trueSolarMin = 720 + (hourAngle / RAD) * 4;
+  // Уравнение времени, мин (приближение Спенсера — погрешность меньше минуты).
+  const day = (date.getTime() - Date.UTC(date.getUTCFullYear(), 0, 0)) / 86400000;
+  const b = (2 * Math.PI * (day - 81)) / 364;
+  const eqTimeMin = 9.87 * Math.sin(2 * b) - 7.53 * Math.cos(b) - 1.5 * Math.sin(b);
+  const localMin = trueSolarMin - eqTimeMin - 4 * p.lon + 60 * utcOffsetH;
+  return ((((localMin / 60) % 24) + 24) % 24);
+}
+
+/**
  * Положение Солнца по упрощённому алгоритму NOAA (точность ~0.1° для 1900–2100).
  * Без учёта рефракции.
  */
