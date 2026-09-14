@@ -123,7 +123,7 @@ function timeStep(spanS: number, px: number): number {
  * Открыть файлы: запись симулятора (JSON, одну) или, если профиль умеет, бортовые журналы одного
  * полёта — основной и служебный можно выбрать вместе.
  */
-export async function openRecordingFiles(files: File[]): Promise<Recording> {
+export async function openRecordingFiles(files: File[], current?: Recording | null): Promise<Recording> {
   if (!files.length) throw new Error('Файл не выбран');
   // По началу файла: запись — JSON; журнал без сжатия тоже начинается с «{», но это заголовок журнала.
   const heads = await Promise.all(files.map(async (f) => new TextDecoder('latin1').decode(await f.slice(0, 4096).arrayBuffer())));
@@ -132,7 +132,7 @@ export async function openRecordingFiles(files: File[]): Promise<Recording> {
     return parseRecording(await files[0]!.text());
   }
   if (!PROFILE.importLog) throw new Error('Это не запись симулятора (JSON), а импорт бортовых журналов в этой сборке недоступен');
-  return PROFILE.importLog(await Promise.all(files.map(async (f) => ({ name: f.name, buf: await f.arrayBuffer() }))));
+  return PROFILE.importLog(await Promise.all(files.map(async (f) => ({ name: f.name, buf: await f.arrayBuffer() }))), current);
 }
 
 /** Имя файла записи по времени начала: запись-2026-09-12-1430.json. */
@@ -314,7 +314,7 @@ export class Debrief {
       if (!files.length) return;
       if (this.onImport) return this.onImport(files);
       this.error(null);
-      openRecordingFiles(files).then(
+      openRecordingFiles(files, this.rec).then(
         (rec) => this.show(rec),
         (e: unknown) => this.error(e instanceof Error ? e.message : String(e)),
       );

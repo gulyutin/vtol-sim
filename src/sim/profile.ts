@@ -283,5 +283,5 @@ export interface Profile {
    * Бортовой журнал аппарата → запись для разбора (src/game/recorder.ts). Формат журнала —
    * дело профиля; без этого поля разбор открывает только записи симулятора.
    */
-  importLog?: (files: { name: string; buf: ArrayBuffer }[]) => Promise<Recording>;
+  importLog?: (files: { name: string; buf: ArrayBuffer }[], current?: Recording | null) => Promise<Recording>;
 }

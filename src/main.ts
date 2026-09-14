@@ -7,7 +7,7 @@ import { loadQuality, QUALITY, saveQuality } from './ui/quality';
 import { Preparation, PREP_STEPS, type GroundTest, type PrepStepId } from './game/preparation';
 import { ACTIVE_REGION, buildMission, departure, forecastWeather, REGION, SCENARIOS, type Mission, type Scenario, type Settings } from './game/scenarios';
 import { LOG_REGION_ID, osmRegionFor, REGIONS, saveLogRegion, setRegion } from './game/regions';
-import { inBounds, placeRecording, regionFromRecording } from './game/logRegion';
+import { inBounds, placeRecording, regionFromRecording, settleOnTerrain } from './game/logRegion';
 import { SurfaceMotion } from './game/surfaces';
 import { loadLastLog, saveLastLog } from './ui/logStore';
 import { osmUrlFor } from './ui/tileSource';
@@ -266,14 +266,19 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   // по журналу (рельеф, снимки, маршрут повтора полёта) и страница перезагружается туда.
   debrief.onImport = (files) => {
     debrief.showError(null);
-    openRecordingFiles(files)
+    // Открытая запись — чтобы служебный журнал можно было добавить к уже открытому основному.
+    openRecordingFiles(files, debrief.recording)
       .then(async (rec) => {
         const origin = rec.meta.origin;
         if (!origin) return openDebrief(rec);
-        if (inBounds(ACTIVE_REGION.location.region, origin)) return openDebrief(placeRecording(rec, siteA, terrain.elevationM(origin) - siteA.elevationM));
+        if (inBounds(ACTIVE_REGION.location.region, origin)) {
+          // На месте полёта из журнала — запомнить, что открыто сейчас: после перезагрузки откроется оно.
+          if (ACTIVE_REGION.id === LOG_REGION_ID) void saveLastLog(rec).catch((e: unknown) => console.warn('Журнал не сохранился в браузере:', e));
+          return openDebrief(onTerrain(placeRecording(rec, siteA, terrain.elevationM(origin) - siteA.elevationM)));
+        }
         if (started) {
           gcs.toast('<b>Журнал записан в другом месте</b>Показываю его у площадки. Чтобы увидеть полёт на месте, нажмите «Начать заново» и откройте журнал снова.', 'warn');
-          return openDebrief(placeRecording(rec, siteA, 0));
+          return openDebrief(onTerrain(placeRecording(rec, siteA, 0)));
         }
         gcs.toast('<b>Переношу сцену на место полёта</b>Журнал записан вне района — загружаю рельеф и снимки там, где летал аппарат.', 'good');
         // Высоты маршрута повтора — над рельефом места полёта; без сети — над точкой взлёта.
@@ -1234,6 +1239,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       const logStart = replayRec.meta.source === 'log' ? Date.parse(replayRec.meta.startedAt) : NaN;
       const t0 = Number.isNaN(logStart) ? departure(scenario, settings).getTime() : logStart;
       world.setSun(sunPosition(new Date(t0 + smp.t * 1000), siteA));
+      if (smp.mode === 'ground' || smp.mode === 'spool' || smp.mode === 'landed') standOnSlope(pose);
       world.setPose(pose);
       // Рули: у журнала — команды автопилота, у записи симулятора — по движению.
       const surfaces =
@@ -1317,6 +1323,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       pose.position.up = Math.max(floor, s.up - 0.5 * 9.81 * fallS * fallS);
       pose.pitchDeg = pose.position.up > floor ? -35 : -8;
     }
+    if (s.mode === 'ground' || s.mode === 'spool' || s.mode === 'landed') standOnSlope(pose);
     world.setPose(pose);
     // Предполётная подготовка: проверки на земле видны на модели; разворот носом против ветра — плавно.
     const test = s.mode === 'ground' && !s.armed ? prep.update(performance.now() / 1000, evaluatePrep) : null;
@@ -1492,9 +1499,30 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   if (logHere)
     void loadLastLog()
       .then((r) => {
-        if (r?.meta.origin) openDebrief(placeRecording(r, siteA, terrain.elevationM(r.meta.origin) - siteA.elevationM));
+        if (r?.meta.origin) openDebrief(onTerrain(placeRecording(r, siteA, terrain.elevationM(r.meta.origin) - siteA.elevationM)));
       })
       .catch((e: unknown) => console.warn('Журнал места полёта не открылся:', e));
+
+  /** Журнал — на рельеф сцены: высота журнала за полёт уходит на метры, и без поправки аппарат стоит под землёй. */
+  function onTerrain(r: Recording): Recording {
+    return r.meta.source === 'log' ? settleOnTerrain(r, (e, n) => world.groundAt(e, n)) : r;
+  }
+
+  /**
+   * На земле аппарат стоит по склону: тангаж и крен — по рельефу под опорами (±0,6 м вдоль,
+   * ±0,42 м поперёк), центр — на земле. Горизонтально стоящий на склоне аппарат уходит опорой под рельеф.
+   */
+  function standOnSlope(pose: { position: { east: number; north: number; up: number }; headingDeg: number; pitchDeg: number; bankDeg: number }) {
+    const h = (pose.headingDeg * Math.PI) / 180;
+    const fe = Math.sin(h);
+    const fn = Math.cos(h);
+    const { east, north } = pose.position;
+    // a — вперёд, l — вправо.
+    const g = (a: number, l: number) => world.groundAt(east + fe * a + fn * l, north + fn * a - fe * l);
+    pose.position.up = world.groundAt(east, north);
+    pose.pitchDeg = (Math.atan2(g(0.6, 0) - g(-0.6, 0), 1.2) * 180) / Math.PI;
+    pose.bankDeg = (Math.atan2(g(0, -0.42) - g(0, 0.42), 0.84) * 180) / Math.PI;
+  }
 
   let last = performance.now();
   function frame(now: number) {

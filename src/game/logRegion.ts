@@ -218,6 +218,41 @@ export function placeRecording(rec: Recording, site: GeoPoint, upShiftM: number)
   };
 }
 
+const ON_GROUND = new Set(['ground', 'spool', 'landed', 'crashed']);
+
+/**
+ * Высоты записи журнала — к рельефу сцены. Высота в журнале — по баро и ГНСС от точки взлёта: за
+ * полёт она уходит на метры, а земля в точке посадки не той высоты, что в точке взлёта, — без
+ * поправки аппарат в повторе стоит под землёй. На земле отсчёт ставится на рельеф; в воздухе
+ * поправка идёт линейно от последней на земле до отрыва к первой после касания, и ниже рельефа
+ * аппарат не опускается.
+ */
+export function settleOnTerrain(rec: Recording, groundAt: (east: number, north: number) => number): Recording {
+  const s = rec.samples;
+  const n = s.length;
+  const ground = s.map((x) => groundAt(x.east, x.north));
+  const onGround = s.map((x) => ON_GROUND.has(x.mode));
+  // Ближайшие отсчёты на земле до и после каждого.
+  const prev = new Int32Array(n);
+  const next = new Int32Array(n);
+  for (let i = 0, p = -1; i < n; i++) prev[i] = onGround[i] ? (p = i) : p;
+  for (let i = n - 1, q = -1; i >= 0; i--) next[i] = onGround[i] ? (q = i) : q;
+  const fix = (i: number) => ground[i]! - s[i]!.up;
+  const samples = s.map((x, i) => {
+    let up = ground[i]!;
+    if (!onGround[i]) {
+      const a = prev[i]!;
+      const b = next[i]!;
+      const fa = a >= 0 ? fix(a) : b >= 0 ? fix(b) : 0;
+      const fb = b >= 0 ? fix(b) : fa;
+      const k = a >= 0 && b >= 0 ? (x.t - s[a]!.t) / Math.max(1e-6, s[b]!.t - s[a]!.t) : 0;
+      up = Math.max(ground[i]!, x.up + fa + (fb - fa) * k);
+    }
+    return up === x.up ? x : { ...x, up };
+  });
+  return { ...rec, samples };
+}
+
 /** Точка внутри области района. */
 export const inBounds = (b: { south: number; west: number; north: number; east: number }, p: GeoPoint): boolean =>
   p.lat > b.south && p.lat < b.north && p.lon > b.west && p.lon < b.east;

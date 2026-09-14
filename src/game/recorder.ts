@@ -83,6 +83,8 @@ export interface RecordingMeta {
   origin?: GeoPoint;
   /** Ветер по бортовому журналу, средний в полёте: м/с и откуда дует, °. */
   wind?: { speedMs: number; fromDeg: number };
+  /** Часы бортового вычислителя в начале записи журнала, с: по ним служебный журнал подшивается позже. */
+  clockS?: number;
 }
 
 export interface Recording {
@@ -412,6 +414,7 @@ export function parseRecording(text: string): Recording {
   if (Array.isArray(m.zones)) meta.zones = m.zones.filter(isZone);
   if (isObj(m.origin) && num(m.origin.lat) && num(m.origin.lon)) meta.origin = { lat: m.origin.lat, lon: m.origin.lon };
   if (isObj(m.wind) && num(m.wind.speedMs) && num(m.wind.fromDeg)) meta.wind = { speedMs: m.wind.speedMs, fromDeg: m.wind.fromDeg };
+  if (num(m.clockS)) meta.clockS = m.clockS;
 
   let objects: Record<string, unknown>[];
   if (Array.isArray(raw.rows)) {
