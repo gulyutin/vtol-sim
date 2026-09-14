@@ -382,6 +382,14 @@ export function serialize(rec: Recording): string {
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x);
 const num = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x);
 
+/**
+ * Похоже на файл записи (JSON)? head — начало файла. Бортовой журнал без сжатия тоже начинается
+ * с «{» — это его заголовок, — но в заголовке есть "logtype" и описания переменных "var".
+ */
+export function looksLikeRecordingJson(head: string): boolean {
+  return head.trimStart().startsWith('{') && !/"logtype"\s*:|"var"\s*:\s*\{/.test(head);
+}
+
 /** Разобрать файл записи (serialize или отсчёты объектами). Ошибка — с понятным текстом. */
 export function parseRecording(text: string): Recording {
   let raw: unknown;

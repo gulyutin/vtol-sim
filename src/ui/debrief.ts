@@ -1,5 +1,5 @@
 import { PROFILE } from '@profile';
-import { parseRecording, serialize, stateAt, summarize, type Recording, type Sample } from '../game/recorder';
+import { looksLikeRecordingJson, parseRecording, serialize, stateAt, summarize, type Recording, type Sample } from '../game/recorder';
 import type { Assessment } from '../game/scoring';
 import { flightConclusion, type ConclusionContext } from '../game/flightSummary';
 import { MODE_NAMES } from '../sim/flight';
@@ -125,8 +125,9 @@ function timeStep(spanS: number, px: number): number {
  */
 export async function openRecordingFiles(files: File[]): Promise<Recording> {
   if (!files.length) throw new Error('Файл не выбран');
-  const heads = await Promise.all(files.map(async (f) => new Uint8Array(await f.slice(0, 1).arrayBuffer())[0]));
-  if (heads.includes(0x7b)) {
+  // По началу файла: запись — JSON; журнал без сжатия тоже начинается с «{», но это заголовок журнала.
+  const heads = await Promise.all(files.map(async (f) => new TextDecoder('latin1').decode(await f.slice(0, 4096).arrayBuffer())));
+  if (heads.some((h) => looksLikeRecordingJson(h))) {
     if (files.length > 1) throw new Error('Запись симулятора открывается по одной — выберите один файл');
     return parseRecording(await files[0]!.text());
   }
