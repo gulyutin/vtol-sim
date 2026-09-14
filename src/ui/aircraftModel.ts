@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import type { GroundTest } from '../game/preparation';
+import { neutralSurfaces, type Surfaces } from '../game/surfaces';
 import { glowSprite } from './props';
 
 /** Высота стоек упрощённой модели: начало координат — точка касания земли. */
@@ -12,17 +13,30 @@ const GEAR_M = 0.24;
 const RAL_3024 = 0xf52a1d;
 /** Детали, окрашенные в цвет аппарата (имена материалов GLB-модели). */
 const LIVERY_PARTS = ['airframe', 'tail', 'aileron'];
+/** Полное отклонение руля, рад. */
+const MAX_DEFLECTION_RAD = 0.35;
 
 export interface AircraftModel {
   /** Позицию и ориентацию задают снаружи. Нос смотрит в −Z, правое крыло — в +X, размеры в метрах. */
   group: THREE.Group;
   /**
    * dt — реальное время кадра, с; lift и pusher — загрузка подъёмных роторов и маршевого винта 0…1.
-   * test — проверка на земле (предполётная подготовка): роторы по отдельности, элероны, огни.
+   * test — проверка на земле (предполётная подготовка): роторы по отдельности, рули, огни.
+   * surfaces — отклонения рулей в полёте (src/game/surfaces.ts); на проверке СП рули — из test.
    */
-  animate(dt: number, lift: number, pusher: number, test?: GroundTest | null): void;
+  animate(dt: number, lift: number, pusher: number, test?: GroundTest | null, surfaces?: Surfaces | null): void;
   /** Посадочная фара под носом: 0 — выключена, 1 — полная яркость. */
   setLandingLight(level: number): void;
+  /** БАНО горят, только когда на борт подано питание. */
+  setLights(on: boolean): void;
+}
+
+/** Руль на шарнире по передней кромке: поворот вокруг axis (в системе родителя шарнира), плюс — задняя кромка вниз. */
+interface SurfaceRig {
+  node: THREE.Object3D;
+  axis: THREE.Vector3;
+  key: keyof Surfaces;
+  angle: number;
 }
 
 interface Rig {
@@ -35,8 +49,10 @@ interface Rig {
   rotorBlade: THREE.Material;
   pusherBlade: THREE.Material;
   strobe: THREE.Object3D;
-  /** Элероны на шарнире (вращение вокруг своей оси X); sign — чтобы левый и правый шли в разные стороны. */
-  ailerons: { node: THREE.Object3D; sign: number }[];
+  /** Огни на законцовках крыла: красный слева, зелёный справа. */
+  navs: THREE.Object3D[];
+  /** Элероны и рули оперения. */
+  surfaces: SurfaceRig[];
 }
 
 const approach = (cur: number, target: number, dt: number, tau: number) => cur + (target - cur) * (1 - Math.exp(-dt / tau));
@@ -68,7 +84,7 @@ function navLight(color: number, at: THREE.Vector3): THREE.Mesh {
   return m;
 }
 
-/** Анимация винтов: разгон, остановка вдоль балки, размытие диска на оборотах. */
+/** Анимация винтов: разгон, остановка вдоль балки, размытие диска на оборотах; рули и огни. */
 function rigged(group: THREE.Group, rig: Rig): AircraftModel {
   const rotorDisc = discMaterial();
   const pusherDisc = discMaterial();
@@ -85,6 +101,8 @@ function rigged(group: THREE.Group, rig: Rig): AircraftModel {
   const rotors = rig.rotors.map((r) => ({ ...r, omega: 0, base: r.node.rotation.y }));
   let pusherOmega = 0;
   let clock = 0;
+  let lightsOn = false;
+  const neutral = neutralSurfaces();
 
   // Посадочная фара: под носом, светит вперёд-вниз. Свет есть всегда (меняется только яркость),
   // чтобы при включении не пересобирались шейдеры.
@@ -104,7 +122,10 @@ function rigged(group: THREE.Group, rig: Rig): AircraftModel {
       landing.intensity = 4000 * level;
       landingGlow.visible = level > 0.01;
     },
-    animate(dt, lift, pusherLoad, test) {
+    setLights(on) {
+      lightsOn = on;
+    },
+    animate(dt, lift, pusherLoad, test, surfaces) {
       clock += dt;
       rotors.forEach((r, i) => {
         // На проверке регуляторов роторы крутятся по одному.
@@ -120,8 +141,12 @@ function rigged(group: THREE.Group, rig: Rig): AircraftModel {
           r.node.rotation.y += r.dir * r.omega * dt;
         }
       });
-      const defl = (test?.aileron ?? 0) * 0.35;
-      for (const a of rig.ailerons) a.node.rotation.x = approach(a.node.rotation.x, a.sign * defl, dt, 0.06);
+      // Рули: на проверке СП — по программе проверки, иначе — что пришло снаружи.
+      const want = test?.surfaces ?? surfaces ?? neutral;
+      for (const s of rig.surfaces) {
+        s.angle = approach(s.angle, want[s.key] * MAX_DEFLECTION_RAD, dt, 0.06);
+        s.node.quaternion.setFromAxisAngle(s.axis, s.angle);
+      }
       const rotorBlur = smooth01((Math.max(...rotors.map((r) => r.omega)) - 12) / 40);
       rotorDisc.opacity = 0.28 * rotorBlur;
       blade(rig.rotorBlade, 1 - 0.75 * rotorBlur);
@@ -133,8 +158,58 @@ function rigged(group: THREE.Group, rig: Rig): AircraftModel {
       pusherDisc.opacity = 0.25 * pusherBlur;
       blade(rig.pusherBlade, 1 - 0.75 * pusherBlur);
 
-      rig.strobe.visible = test?.lights ? clock % 0.25 < 0.12 : clock % 1.2 < 0.08;
+      // БАНО: без питания не горят; на проверке огни мигают, строб — часто.
+      const testing = test?.lights ?? false;
+      for (const n of rig.navs) n.visible = lightsOn && (!testing || clock % 0.5 < 0.3);
+      rig.strobe.visible = lightsOn && (testing ? clock % 0.25 < 0.12 : clock % 1.2 < 0.08);
     },
+  };
+}
+
+/**
+ * Руль из GLB — на шарнир по передней кромке. Ось шарнира — вдоль размаха поверхности: главная ось
+ * её точек в плоскости x–y (у элерона почти по X, у руля V-оперения — наклонно), к +X, чтобы плюс
+ * у всех рулей означал «задняя кромка вниз».
+ */
+function hingeSurface(mesh: THREE.Mesh, tail: boolean): SurfaceRig {
+  const pos = mesh.geometry.getAttribute('position');
+  const v = new THREE.Vector3();
+  const each = (fn: (p: THREE.Vector3) => void) => {
+    for (let i = 0; i < pos.count; i++) fn(v.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld));
+  };
+  let mx = 0;
+  let my = 0;
+  let minZ = Infinity;
+  each((p) => {
+    mx += p.x;
+    my += p.y;
+    minZ = Math.min(minZ, p.z);
+  });
+  mx /= pos.count;
+  my /= pos.count;
+  let cxx = 0;
+  let cyy = 0;
+  let cxy = 0;
+  each((p) => {
+    cxx += (p.x - mx) ** 2;
+    cyy += (p.y - my) ** 2;
+    cxy += (p.x - mx) * (p.y - my);
+  });
+  const th = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
+  const axis = new THREE.Vector3(Math.cos(th), Math.sin(th), 0);
+  if (axis.x < 0) axis.negate();
+  const parent = mesh.parent!;
+  const pivot = new THREE.Group();
+  pivot.position.copy(parent.worldToLocal(new THREE.Vector3(mx, my, minZ)));
+  parent.add(pivot);
+  pivot.updateMatrixWorld(true);
+  pivot.attach(mesh);
+  const left = mx < 0;
+  return {
+    node: pivot,
+    axis: axis.transformDirection(parent.matrixWorld.clone().invert()),
+    key: tail ? (left ? 'tailL' : 'tailR') : left ? 'ailL' : 'ailR',
+    angle: 0,
   };
 }
 
@@ -200,32 +275,22 @@ export async function loadAircraft(url: string): Promise<AircraftModel> {
     }
   });
   const strobe = navLight(0xffffff, extremes.top.clone().add(new THREE.Vector3(0, 0.02, 0)));
-  root.add(navLight(0xff2a2a, extremes.left), navLight(0x2aff6a, extremes.right), strobe);
+  const navs = [navLight(0xff2a2a, extremes.left), navLight(0x2aff6a, extremes.right)];
+  root.add(...navs, strobe);
 
-  // Элероны — отдельные тела с материалом aileron: каждое ставим на шарнир по передней кромке.
-  const surfaces: THREE.Mesh[] = [];
+  // Рули — отдельные тела: элероны (материал aileron) и рули V-оперения (tail).
+  const bodies: { mesh: THREE.Mesh; tail: boolean }[] = [];
   root.traverse((o) => {
     const m = (o as THREE.Mesh).material;
-    if ((o as THREE.Mesh).isMesh && m && !Array.isArray(m) && m.name === 'aileron') surfaces.push(o as THREE.Mesh);
+    if ((o as THREE.Mesh).isMesh && m && !Array.isArray(m) && (m.name === 'aileron' || m.name === 'tail')) bodies.push({ mesh: o as THREE.Mesh, tail: m.name === 'tail' });
   });
   root.updateMatrixWorld(true);
-  const ailerons: Rig['ailerons'] = [];
-  for (const mesh of surfaces) {
-    const box = new THREE.Box3().setFromObject(mesh);
-    const hinge = new THREE.Vector3((box.min.x + box.max.x) / 2, (box.min.y + box.max.y) / 2, box.min.z);
-    const parent = mesh.parent!;
-    const pivot = new THREE.Group();
-    pivot.position.copy(parent.worldToLocal(hinge.clone()));
-    parent.add(pivot);
-    pivot.updateMatrixWorld(true);
-    pivot.attach(mesh);
-    ailerons.push({ node: pivot, sign: hinge.x < 0 ? -1 : 1 });
-  }
+  const surfaces = bodies.map(({ mesh, tail }) => hingeSurface(mesh, tail));
 
   const group = new THREE.Group();
   group.add(root);
   return rigged(group, {
-    ailerons,
+    surfaces,
     rotors,
     pusher,
     rotorRadius: radius(rotors[0]!.node, ['x', 'z']),
@@ -233,6 +298,7 @@ export async function loadAircraft(url: string): Promise<AircraftModel> {
     rotorBlade: materialOf(rotors[0]!.node),
     pusherBlade: materialOf(pusher),
     strobe,
+    navs,
   });
 }
 
@@ -257,6 +323,15 @@ export function createAircraft(): AircraftModel {
     parent.add(m);
     return m;
   };
+  /** Руль на шарнире с осью по X; тело руля — позади шарнира (нос — к −Z). */
+  const surfaces: SurfaceRig[] = [];
+  const hinged = (key: keyof Surfaces, x: number, y: number, z: number, w: number, h: number, d: number) => {
+    const hinge = new THREE.Group();
+    hinge.position.set(x, y, z);
+    body.add(hinge);
+    add(new THREE.BoxGeometry(w, h, d), orange, 0, 0, d / 2, hinge);
+    surfaces.push({ node: hinge, axis: new THREE.Vector3(1, 0, 0), key, angle: 0 });
+  };
 
   const profile = [
     [0, -0.8], [0.05, -0.8], [0.08, -0.62], [0.11, -0.32], [0.125, 0], [0.12, 0.3],
@@ -264,15 +339,8 @@ export function createAircraft(): AircraftModel {
   ].map(([r, y]) => new THREE.Vector2(r, y));
   add(new THREE.LatheGeometry(profile, 28), white, 0, 0.02, 0).rotation.x = -Math.PI / 2;
   add(new THREE.BoxGeometry(3.0, 0.035, 0.2), white, 0, 0.13, -0.08);
-  const ailerons: Rig['ailerons'] = [];
-  for (const sx of [-1, 1]) {
-    // Законцовка-элерон на шарнире по передней кромке.
-    const hinge = new THREE.Group();
-    hinge.position.set(sx * 1.42, 0.13, -0.181);
-    body.add(hinge);
-    add(new THREE.BoxGeometry(0.16, 0.038, 0.202), orange, 0, 0, 0.101, hinge);
-    ailerons.push({ node: hinge, sign: sx });
-  }
+  // Законцовки-элероны на шарнире по передней кромке.
+  for (const sx of [-1, 1]) hinged(sx < 0 ? 'ailL' : 'ailR', sx * 1.42, 0.13, -0.181, 0.16, 0.038, 0.202);
   add(new THREE.SphereGeometry(0.075, 20, 14), black, 0, -0.15, -0.45);
 
   const rotors: Rig['rotors'] = [];
@@ -291,7 +359,9 @@ export function createAircraft(): AircraftModel {
     }
     add(new THREE.BoxGeometry(0.018, 0.3, 0.2), white, x, 0.24, 1.08);
   }
-  add(new THREE.BoxGeometry(0.86, 0.02, 0.17), orange, 0, 0.39, 1.1);
+  // Стабилизатор и две половины руля высоты за ним — вместо рулей V-оперения настоящей модели.
+  add(new THREE.BoxGeometry(0.86, 0.02, 0.11), orange, 0, 0.39, 1.07);
+  for (const sx of [-1, 1]) hinged(sx < 0 ? 'tailL' : 'tailR', sx * 0.215, 0.39, 1.125, 0.42, 0.018, 0.06);
 
   const pusher = new THREE.Group();
   pusher.position.set(0, 0.02, 0.86);
@@ -299,7 +369,8 @@ export function createAircraft(): AircraftModel {
   add(new THREE.BoxGeometry(0.425, 0.045, 0.01), pusherBlade, 0, 0, 0, pusher);
 
   const strobe = navLight(0xffffff, new THREE.Vector3(0, 0.41, 1.1));
-  body.add(navLight(0xff2a2a, new THREE.Vector3(-1.51, 0.13, -0.08)), navLight(0x2aff6a, new THREE.Vector3(1.51, 0.13, -0.08)), strobe);
+  const navs = [navLight(0xff2a2a, new THREE.Vector3(-1.51, 0.13, -0.08)), navLight(0x2aff6a, new THREE.Vector3(1.51, 0.13, -0.08))];
+  body.add(...navs, strobe);
 
-  return rigged(group, { rotors, pusher, rotorRadius: 0.212, pusherRadius: 0.2125, rotorBlade, pusherBlade, strobe, ailerons });
+  return rigged(group, { rotors, pusher, rotorRadius: 0.212, pusherRadius: 0.2125, rotorBlade, pusherBlade, strobe, navs, surfaces });
 }

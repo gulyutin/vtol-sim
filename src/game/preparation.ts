@@ -1,7 +1,9 @@
+import { mixSurfaces, neutralSurfaces, type Surfaces } from './surfaces';
+
 /*
  * Предполётная подготовка по РЛЭ (прил. А.3–А.4): питание, связь, проверки СП, СВС, регуляторов
  * СВВП, БАНО, МЭД, миссия, ориентация против ветра, ПДУ, опрос перед взлётом. Проверки с
- * движением видны на модели: элероны, роторы по очереди, огни, маршевый. Без DOM.
+ * движением видны на модели: элероны и рули оперения, роторы по очереди, огни, маршевый. Без DOM.
  */
 
 export type PrepStepId = 'power' | 'link' | 'servos' | 'airdata' | 'vtol' | 'lights' | 'pusher' | 'mission' | 'heading' | 'rc' | 'poll';
@@ -15,10 +17,10 @@ export interface PrepStepDef {
 }
 
 export const PREP_STEPS: readonly PrepStepDef[] = [
-  { id: 'power', title: 'Подать питание на БВС', hint: 'Дождаться загрузки автопилота', durationS: 6 },
+  { id: 'power', title: 'Подать питание на БВС', hint: 'Дождаться загрузки автопилота; загораются БАНО', durationS: 6 },
   { id: 'link', title: 'Связь с НСУ, телеметрия', hint: 'Крен, тангаж и координаты на авиагоризонте', durationS: 2 },
-  { id: 'servos', title: 'СП — сервоприводы', hint: 'Элероны отклоняются вверх и вниз', durationS: 6 },
-  { id: 'airdata', title: 'СВС — воздушные сигналы', hint: 'Подуть в ПВД: приборная скорость растёт и возвращается к нулю', durationS: 4 },
+  { id: 'servos', title: 'СП — сервоприводы', hint: 'Элероны, затем рули V-оперения: вместе (руль высоты) и врозь (руль направления)', durationS: 9 },
+  { id: 'airdata', title: 'СВС — воздушные сигналы', hint: 'Подуть в ПВД: приборная скорость в телеметрии растёт и возвращается к нулю', durationS: 4 },
   { id: 'vtol', title: 'Регуляторы СВВП', hint: 'Роторы 1–4 раскручиваются по очереди', durationS: 10 },
   { id: 'lights', title: 'БАНО — бортовые огни', hint: 'Огни и строб мигают', durationS: 3 },
   { id: 'pusher', title: 'МЭД — маршевый двигатель', hint: 'Маршевый винт раскручивается и останавливается', durationS: 4 },
@@ -35,8 +37,8 @@ export interface GroundTest {
   /** Загрузка роторов 1–4 (передний левый, передний правый, задний левый, задний правый) 0…1. */
   rotors: [number, number, number, number];
   pusher: number;
-  /** Отклонение элеронов −1…1. */
-  aileron: number;
+  /** Отклонения рулей −1…1 (src/game/surfaces.ts). */
+  surfaces: Surfaces;
   /** Огни мигают часто. */
   lights: boolean;
   /** Приборная скорость на СВС, м/с. */
@@ -49,7 +51,7 @@ const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
 const bump = (x: number) => Math.sin(Math.PI * clamp01(x));
 
 export function idleTest(): GroundTest {
-  return { rotors: [0, 0, 0, 0], pusher: 0, aileron: 0, lights: false, airspeedMs: 0, turnToWind: null };
+  return { rotors: [0, 0, 0, 0], pusher: 0, surfaces: neutralSurfaces(), lights: false, airspeedMs: 0, turnToWind: null };
 }
 
 export class Preparation {
@@ -64,6 +66,11 @@ export class Preparation {
 
   get running(): PrepStepId | null {
     return this.active?.id ?? null;
+  }
+
+  /** Питание на борт подано: шаг «Подать питание» выполнен. */
+  get powered(): boolean {
+    return this.status.power === 'done';
   }
 
   /** Причина, по которой шаг сейчас начать нельзя, или null. Питание — первым, опрос — последним. */
@@ -94,9 +101,13 @@ export class Preparation {
     const def = PREP_STEPS.find((s) => s.id === id)!;
     const tau = (t - t0) / def.durationS;
     switch (id) {
-      case 'servos':
-        test.aileron = Math.sin(clamp01(tau) * Math.PI * 4);
+      case 'servos': {
+        // Элероны, потом руль высоты (оба руля оперения вместе), потом руль направления (врозь): вверх-вниз.
+        const k = Math.min(2, Math.floor(clamp01(tau) * 3));
+        const x = Math.sin(clamp01(clamp01(tau) * 3 - k) * Math.PI * 2);
+        test.surfaces = mixSurfaces(k === 0 ? x : 0, k === 1 ? x : 0, k === 2 ? x : 0);
         break;
+      }
       case 'airdata':
         test.airspeedMs = 9 * bump(tau);
         break;

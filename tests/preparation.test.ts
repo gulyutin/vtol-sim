@@ -37,12 +37,19 @@ describe('предполётная подготовка (РЛЭ, прил. А.3�
     expect(p.status.vtol).toBe('done');
   });
 
-  it('СП отклоняет элероны в обе стороны, СВС показывает приборную и возвращает к нулю', () => {
+  it('СП отклоняет элероны и оба руля V-оперения в обе стороны, СВС показывает приборную и возвращает к нулю', () => {
     const p = new Preparation();
+    expect(p.powered).toBe(false);
     run(p, 'power', 0);
+    expect(p.powered).toBe(true);
     const servos = run(p, 'servos', 10);
-    expect(Math.max(...servos.map((g) => g.aileron))).toBeGreaterThan(0.9);
-    expect(Math.min(...servos.map((g) => g.aileron))).toBeLessThan(-0.9);
+    for (const k of ['ailL', 'ailR', 'tailL', 'tailR'] as const) {
+      expect(Math.max(...servos.map((g) => g.surfaces[k])), k).toBeGreaterThan(0.9);
+      expect(Math.min(...servos.map((g) => g.surfaces[k])), k).toBeLessThan(-0.9);
+    }
+    // Руль направления: рули оперения врозь.
+    expect(servos.some((g) => g.surfaces.tailL > 0.5 && g.surfaces.tailR < -0.5)).toBe(true);
+    expect(servos.at(-1)!.surfaces.ailL).toBe(0);
     const air = run(p, 'airdata', 20);
     expect(Math.max(...air.map((g) => g.airspeedMs))).toBeGreaterThan(5);
     expect(air.at(-1)!.airspeedMs).toBeLessThan(0.5);

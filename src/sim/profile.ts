@@ -233,6 +233,8 @@ export interface LocationSpec {
   /** Дата заданий (Солнце и освещённость) и часовой пояс. */
   date: string;
   utcOffsetH: number;
+  /** Местный час вылета по умолчанию; нет — 11:00. */
+  localHour?: number;
   /** Прогноз по умолчанию: ветер на 10 м и температура у земли. */
   windSpeedMs: number;
   windFromDeg: number;
@@ -281,5 +283,5 @@ export interface Profile {
    * Бортовой журнал аппарата → запись для разбора (src/game/recorder.ts). Формат журнала —
    * дело профиля; без этого поля разбор открывает только записи симулятора.
    */
-  importLog?: (buf: ArrayBuffer, fileName: string) => Promise<Recording>;
+  importLog?: (files: { name: string; buf: ArrayBuffer }[]) => Promise<Recording>;
 }

@@ -125,7 +125,7 @@ export function buildScenarios(L: LocationSpec): Scenario[] {
     windSpeedMs: L.windSpeedMs,
     windFromDeg: L.windFromDeg,
     temperatureC: L.temperatureC,
-    localHour: 11,
+    localHour: L.localHour ?? 11,
   };
   return [
     {

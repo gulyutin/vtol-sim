@@ -1,5 +1,7 @@
 import type { LiveState } from '../sim/flight';
+import type { GeoPoint } from '../sim/types';
 import { isZone, type Zone } from '../sim/zones';
+import type { Surfaces } from './surfaces';
 
 /*
  * Запись полёта для разбора: компактные отсчёты состояния с постоянной частотой плюс
@@ -20,8 +22,11 @@ export function eventKindOf(text: string): EventKind {
   return 'info';
 }
 
-/** Отсчёт состояния. Локальные метры — восток, север, вверх от площадки взлёта. */
-export interface Sample {
+/**
+ * Отсчёт состояния. Локальные метры — восток, север, вверх от площадки взлёта. Рули (Surfaces) —
+ * только в записях бортового журнала: команды автопилота.
+ */
+export interface Sample extends Partial<Surfaces> {
   t: number;
   east: number;
   north: number;
@@ -43,7 +48,14 @@ export interface Sample {
   /** Загрузка подъёмных роторов и маршевого винта 0…1. */
   lift: number;
   pusher: number;
+  /** Связь (не во всех записях): мощность приёма на борту, дБм, и качество приёма, %. */
+  rxDbm?: number;
+  linkPct?: number;
 }
+
+/** Необязательные поля отсчёта — рули и связь — и знаков после запятой при записи. */
+const OPT_DIGITS = { ailL: 3, ailR: 3, tailL: 3, tailR: 3, rxDbm: 1, linkPct: 0 } as const satisfies Partial<Record<keyof Sample, number>>;
+export const OPT_KEYS = Object.keys(OPT_DIGITS) as (keyof typeof OPT_DIGITS)[];
 
 export interface RecordingEvent {
   t: number;
@@ -64,6 +76,13 @@ export interface RecordingMeta {
   difficulty?: string;
   /** Запретные зоны и зоны РЭБ на конец полёта — чтобы нарисовать их в разборе. */
   zones?: Zone[];
+  /**
+   * Где записан полёт: точка отсчёта локальных координат (место взлёта). Нет — площадка района,
+   * в котором сделана запись (записи симулятора).
+   */
+  origin?: GeoPoint;
+  /** Ветер по бортовому журналу, средний в полёте: м/с и откуда дует, °. */
+  wind?: { speedMs: number; fromDeg: number };
 }
 
 export interface Recording {
@@ -128,6 +147,10 @@ export function compactSample(s: Sample): Sample {
   const out = { mode: s.mode } as Sample;
   for (const k of NUM_KEYS) out[k] = round(k === 'headingDeg' ? norm360(s[k]) : s[k], DIGITS[k]);
   if (out.headingDeg >= 360) out.headingDeg = 0;
+  for (const k of OPT_KEYS) {
+    const x = s[k];
+    if (x !== undefined) out[k] = round(x, OPT_DIGITS[k]);
+  }
   return out;
 }
 
@@ -161,6 +184,8 @@ export function sampleOf(s: LiveState): Sample {
     mode: s.mode,
     lift: s.lift,
     pusher: s.pusher,
+    // Связь по модели радиоканала — чтобы сравнить с журналом, где она записана.
+    ...(s.link ? { rxDbm: s.link.rssiDbm, linkPct: s.linkQuality * 100 } : {}),
   });
 }
 
@@ -250,6 +275,11 @@ export function stateAt(rec: Recording, t: number): Sample {
   const k = Math.min(1, (t - a.t) / (b.t - a.t));
   const out = { mode: a.mode } as Sample;
   for (const key of NUM_KEYS) out[key] = a[key] + (b[key] - a[key]) * k;
+  for (const key of OPT_KEYS) {
+    const x = a[key];
+    const y = b[key];
+    if (x !== undefined && y !== undefined) out[key] = x + (y - x) * k;
+  }
   out.t = t;
   out.headingDeg = norm360(a.headingDeg + wrap180(b.headingDeg - a.headingDeg) * k);
   out.bankDeg = a.bankDeg + wrap180(b.bankDeg - a.bankDeg) * k;
@@ -343,8 +373,10 @@ export function summarize(rec: Recording): RecordingSummary {
 
 /** В файл: JSON, отсчёты — строками по столбцам (втрое короче объектов). */
 export function serialize(rec: Recording): string {
-  const rows = rec.samples.map((s) => [...NUM_KEYS.map((k) => s[k]), s.mode]);
-  return JSON.stringify({ version: rec.version, meta: rec.meta, columns: [...NUM_KEYS, 'mode'], rows, events: rec.events });
+  // Необязательные поля (рули, связь): столбцы есть, если они есть хоть у одного отсчёта.
+  const opt = OPT_KEYS.filter((k) => rec.samples.some((s) => s[k] !== undefined));
+  const rows = rec.samples.map((s) => [...NUM_KEYS.map((k) => s[k]), ...opt.map((k) => s[k] ?? null), s.mode]);
+  return JSON.stringify({ version: rec.version, meta: rec.meta, columns: [...NUM_KEYS, ...opt, 'mode'], rows, events: rec.events });
 }
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x);
@@ -370,6 +402,8 @@ export function parseRecording(text: string): Recording {
   if (typeof m.difficulty === 'string') meta.difficulty = m.difficulty;
   if (isObj(m.landing) && num(m.landing.east) && num(m.landing.north)) meta.landing = { east: m.landing.east, north: m.landing.north };
   if (Array.isArray(m.zones)) meta.zones = m.zones.filter(isZone);
+  if (isObj(m.origin) && num(m.origin.lat) && num(m.origin.lon)) meta.origin = { lat: m.origin.lat, lon: m.origin.lon };
+  if (isObj(m.wind) && num(m.wind.speedMs) && num(m.wind.fromDeg)) meta.wind = { speedMs: m.wind.speedMs, fromDeg: m.wind.fromDeg };
 
   let objects: Record<string, unknown>[];
   if (Array.isArray(raw.rows)) {
@@ -393,6 +427,11 @@ export function parseRecording(text: string): Recording {
       const v = o[k];
       if (!num(v)) throw new Error(`Отсчёт ${i + 1}: поле ${k} не число`);
       s[k] = v;
+    }
+    // Рули и связь — необязательные столбцы.
+    for (const k of OPT_KEYS) {
+      const v = o[k];
+      if (num(v)) s[k] = v;
     }
     return s;
   });

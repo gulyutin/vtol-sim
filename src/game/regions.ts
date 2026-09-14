@@ -1,5 +1,6 @@
 import { PROFILE } from '@profile';
 import type { LocationSpec, RegionSpec } from '../sim/profile';
+import type { GeoPoint } from '../sim/types';
 import baikalOsm from '../regions/baikal.osm.bin?url';
 import elbrusOsm from '../regions/elbrus.osm.bin?url';
 import khibinyOsm from '../regions/khibiny.osm.bin?url';
@@ -178,18 +179,6 @@ const BAIKAL: LocationSpec = {
   },
 };
 
-/** Все районы; первый — домашний, за ним — дополнительные районы профиля. */
-export const REGION_PRESETS: readonly RegionPreset[] = [
-  HOME,
-  ...(PROFILE.regions ?? []),
-  { id: 'elbrus', title: 'Приэльбрусье', hint: 'Высокогорье: узкая долина Баксана под Эльбрусом, площадка на 1880 м', location: ELBRUS, osmUrl: elbrusOsm },
-  { id: 'khibiny', title: 'Хибины', hint: 'Горы до 1200 м за Полярным кругом, полярный день; площадка на 230 м', location: KHIBINY, osmUrl: khibinyOsm },
-  { id: 'baikal', title: 'Байкал — Малое Море', hint: 'Ольхон: вода, скалистые берега, степь; площадка на 490 м', location: BAIKAL, osmUrl: baikalOsm },
-];
-
-/** Для выбора в интерфейсе. */
-export const REGIONS: readonly { id: string; title: string; hint: string }[] = REGION_PRESETS.map(({ id, title, hint }) => ({ id, title, hint }));
-
 const STORAGE_KEY = 'vtol-sim.region';
 
 /** Ядро собирается без DOM-типов: адрес и хранилище берём через globalThis, если они есть. */
@@ -199,7 +188,52 @@ interface Env {
 }
 const env = () => globalThis as unknown as Env;
 
+/** Место полёта из бортового журнала (src/game/logRegion.ts): район строится по записи и хранится в браузере. */
+export const LOG_REGION_ID = 'log';
+const LOG_REGION_KEY = 'vtol-sim.logRegion';
+
+function storedLogRegion(): RegionPreset | null {
+  try {
+    const raw = env().localStorage?.getItem(LOG_REGION_KEY);
+    const r = raw ? (JSON.parse(raw) as RegionPreset) : null;
+    return r && r.id === LOG_REGION_ID && typeof r.location?.site?.lat === 'number' && r.location.region ? r : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Запомнить место полёта из журнала как район; переходит туда setRegion(LOG_REGION_ID). */
+export function saveLogRegion(r: RegionPreset): void {
+  env().localStorage?.setItem(LOG_REGION_KEY, JSON.stringify(r));
+}
+
+const LOG_REGION = storedLogRegion();
+
+/** Все районы; первый — домашний, за ним — дополнительные районы профиля, в конце — место полёта из журнала. */
+export const REGION_PRESETS: readonly RegionPreset[] = [
+  HOME,
+  ...(PROFILE.regions ?? []),
+  { id: 'elbrus', title: 'Приэльбрусье', hint: 'Высокогорье: узкая долина Баксана под Эльбрусом, площадка на 1880 м', location: ELBRUS, osmUrl: elbrusOsm },
+  { id: 'khibiny', title: 'Хибины', hint: 'Горы до 1200 м за Полярным кругом, полярный день; площадка на 230 м', location: KHIBINY, osmUrl: khibinyOsm },
+  { id: 'baikal', title: 'Байкал — Малое Море', hint: 'Ольхон: вода, скалистые берега, степь; площадка на 490 м', location: BAIKAL, osmUrl: baikalOsm },
+  ...(LOG_REGION ? [LOG_REGION] : []),
+];
+
+/** Для выбора в интерфейсе. */
+export const REGIONS: readonly { id: string; title: string; hint: string }[] = REGION_PRESETS.map(({ id, title, hint }) => ({ id, title, hint }));
+
 export const findRegion = (id: string): RegionPreset | undefined => REGION_PRESETS.find((r) => r.id === id);
+
+/**
+ * Район с домами и лесом (файл OSM), в который попадает точка, — для места полёта из журнала:
+ * если журнал записан внутри готового района, дома и лес берутся оттуда.
+ */
+export function osmRegionFor(p: GeoPoint): RegionPreset | undefined {
+  return REGION_PRESETS.find((r) => {
+    const b = r.location.region;
+    return r.id !== LOG_REGION_ID && r.osmUrl && p.lat > b.south && p.lat < b.north && p.lon > b.west && p.lon < b.east;
+  });
+}
 
 /** Выбранный район: ?region=<id> в адресе, иначе последний выбор, иначе домашний. */
 export function activeRegion(): RegionPreset {

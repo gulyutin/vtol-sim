@@ -1,4 +1,4 @@
-import { AIRCRAFT } from './aircraft';
+import { AIRCRAFT, ASPECT_RATIO } from './aircraft';
 import { brakeDecel, climbPowerW, HOVER_TRANSLATE_MS, hoverPowerW, polar, takeoffMassKg } from './aero';
 import { airDensity, batteryCapacityWh, G, RHO0, tasFromIas, temperatureAt } from './atmosphere';
 import { failureInfo, FIRE_TO_POWER_S, LINK_TIMEOUT_S, RC_RANGE_M, type FailureId } from './failures';
@@ -103,6 +103,57 @@ const GUST_ROLL_TAU_S = 2.5;
 /** Доля вертикальных порывов, которую не успевает парировать тяга: самолёт / висение. */
 const GUST_VZ_PLANE = 0.6;
 const GUST_VZ_HOVER = 0.3;
+/**
+ * Отклик на порывы, с: крен — инерция по крену и размах (вихри мельче крыла усредняются), вертикальные —
+ * инерция по высоте. Без них каждый шаг крен и Vz повторяли бы мелкие вихри — поза дрожала.
+ */
+const GUST_ROLL_LAG_S = 0.4;
+const GUST_HEAVE_LAG_S = 0.5;
+/** Нос в вертикальный порыв (флюгерная устойчивость): восходящий — нос вниз, ° на м/с; медленную часть парирует автопилот. */
+const GUST_PITCH_DEG = 1.5;
+
+/*
+ * Роторы: ускорения ограничены, как у настоящего коптера, — никаких мгновенных скачков скорости при
+ * смене режима. Подход к точке и к высоте — с торможением, чтобы встать без рывка.
+ */
+/** Вертикальное ускорение на роторах и торможение к высоте перехода, м/с². */
+const ROTOR_VZ_ACCEL = 1.5;
+const ROTOR_VZ_BRAKE = 1.2;
+/** Горизонтальное ускорение на роторах, торможение к точке, м/с², и коэффициент подхода, 1/с (HOVER_BRAKE < HOVER_ACCEL / 2). */
+const HOVER_ACCEL = 1.5;
+const HOVER_BRAKE = 0.7;
+const HOVER_GAIN = 0.6;
+/** Крен в самолёте: подход к уставке и инерция по крену (разгон скорости крена), с. */
+const ROLL_TAU_S = 0.3;
+const ROLL_LAG_S = 0.12;
+/** Торможение перед посадкой — не больше этого, м/с²: сопротивление и наклон роторов назад. */
+const BRAKE_DECEL_MAX = 3;
+/** Разворот на висении: не быстрее, °/с; подход к курсу и разгон вращения, с. */
+const HOVER_YAW_DEG_S = 20;
+const HOVER_YAW_TAU_S = 1;
+const HOVER_YAW_LAG_S = 0.3;
+/**
+ * Наклон коптера: горизонтальную силу роторов дают наклоном — разгон, торможение, сопротивление в потоке
+ * (CdA корпуса, крыла и роторов, м²). Углы коптер держит быстро: постоянная времени, с, предел скорости, °/с.
+ */
+const COPTER_DRAG_AREA_M2 = 0.5;
+const COPTER_TILT_MAX_DEG = 30;
+const COPTER_TILT_TAU_S = 0.3;
+const COPTER_TILT_RATE_DEG_S = 90;
+/**
+ * Тангаж корпуса на крыле: угол пути относительно воздуха + угол атаки. Угол атаки — PITCH_TRIM_DEG на
+ * крейсерской приборной, дальше по CL (медленнее, тяжелее, в вираже — нос выше), в пределах.
+ */
+const PITCH_TRIM_DEG = 2;
+const PITCH_ALPHA_MIN_DEG = -3;
+const PITCH_ALPHA_MAX_DEG = 12;
+/** dCL/dα крыла конечного размаха (Гельмбольд), 1/°. */
+const CL_ALPHA_DEG = ((2 * Math.PI * ASPECT_RATIO) / (2 + Math.sqrt(ASPECT_RATIO ** 2 + 4))) * (Math.PI / 180);
+/** Инерция корпуса по тангажу: два звена по столько секунд и предельная скорость, °/с. */
+const ATTITUDE_LAG_S = 0.15;
+const PITCH_RATE_DEG_S = 30;
+/** После касания корпус ложится на опоры, с. */
+const SETTLE_S = 0.2;
 
 /** Отказ ПВД: показания уходят к доле истинной (занижение — забит, завышение — вода в трассе). */
 const AIRSPEED_LOW = 0.4;
@@ -376,7 +427,17 @@ export interface LiveState {
   headingDeg: number;
   trackDeg: number;
   driftDeg: number;
+  /**
+   * Крен корпуса, °: + вправо. В самолёте — крен, по которому идёт разворот (g·tg(крен)/V); на роторах —
+   * наклон коптера вбок (боковое ускорение, боковой ветер).
+   */
   bankDeg: number;
+  /**
+   * Тангаж корпуса, °: + нос вверх. На крыле — угол пути относительно воздуха плюс балансировочный угол
+   * атаки; на роторах — наклон коптера (разгон, торможение, ветер); на переходах — по доле веса на крыле.
+   * Сглажен инерцией корпуса — для 3D, авиагоризонта и записи.
+   */
+  pitchDeg: number;
   /** Истинная приборная скорость (что на самом деле), м/с; показания ПВД — iasReadingMs. */
   iasMs: number;
   tasMs: number;
@@ -502,6 +563,34 @@ export class LiveFlight {
   private vzGust = 0;
   /** Путевая скорость по перемещению за прошлый шаг. */
   private lastVel = { e: 0, n: 0 };
+  /** Порыв через отклик аппарата: боковой (для крена) и вертикальный (для Vz); медленная часть вертикального — её парирует автопилот. */
+  private gustSide = 0;
+  private gustHeave = 0;
+  private heaveLp = 0;
+  /** На роторах: скорость, которую держит автопилот (в своих осях навигации), и её ускорение на шаге; на роторах ли были шагом раньше. */
+  private hoverVel = { e: 0, n: 0 };
+  private hoverAcc = { e: 0, n: 0 };
+  private hoverOn = false;
+  private hoverWas = false;
+  /** Кинематика самолёта (fly): была ли на прошлом шаге; остаток путевой скорости из прошлого режима, м/с. */
+  private flyOn = false;
+  private flyWas = false;
+  private carry = { e: 0, n: 0 };
+  /** Скорость крена в самолёте, °/с. */
+  private rollRate = 0;
+  /** Vz в состоянии — относительно воздуха (самолёт, падение) или земли (роторы держат по баро и ГНСС). */
+  private vzIsAir = false;
+  /** Угловая скорость рыскания, °/с: на висении — своя, вне висения — измеренная (с неё и начинается разворот). */
+  private yawRate = 0;
+  private yawOn = false;
+  /** Замедление, которое дают роторы на торможении перед посадкой (сверх сопротивления), м/с². */
+  private rotorBrake = 0;
+  /** Доля веса на крыле в ручном коптере. */
+  private copterWing = 0;
+  /** Первые звенья сглаживания тангажа и крена коптера; CL на крейсерской приборной — от него угол атаки. */
+  private pitchLag = 0;
+  private rollLag = 0;
+  private readonly clRef: number;
 
   private readonly failed = new Set<FailureId>();
   private readonly failT: Partial<Record<FailureId, number>> = {};
@@ -580,6 +669,7 @@ export class LiveFlight {
     this.terrain = setup.terrain;
     this.weather = setup.weather;
     this.mass = takeoffMassKg(plan.payload?.massKg ?? 0);
+    this.clRef = (this.mass * G) / (0.5 * RHO0 * AIRCRAFT.cruiseIasMs ** 2 * AIRCRAFT.wingAreaM2);
     this.payloadW = plan.payload?.powerW ?? 0;
     this.capacityWh = setup.capacityWh ?? batteryCapacityWh(setup.weather.groundTemperatureC);
     this.usableWh = this.capacityWh * (1 - AIRCRAFT.reserve);
@@ -614,6 +704,7 @@ export class LiveFlight {
       trackDeg: heading,
       driftDeg: 0,
       bankDeg: 0,
+      pitchDeg: 0,
       iasMs: 0,
       tasMs: 0,
       groundSpeedMs: 0,
@@ -1225,6 +1316,7 @@ export class LiveFlight {
         this.state.t += dt / n;
         // После касания роторы на холостых, пока оператор не задизармит (по РЛЭ — сразу после касания).
         if (this.state.armed && this.state.mode === 'landed') this.idle(dt / n);
+        if (this.state.mode === 'landed') this.settle(dt / n);
         continue;
       }
       this.tick(dt / n, c);
@@ -1672,6 +1764,16 @@ export class LiveFlight {
     return this.lw?.upMs ?? 0;
   }
 
+  /**
+   * Vz относительно воздуха или земли — смотря кто держит высоту. При смене (набор → разгон, торможение →
+   * снижение) пересчитываем через поток воздуха у борта: скорость над землёй не скачет на его величину.
+   */
+  private vzFrame(air: boolean) {
+    if (this.vzIsAir === air) return;
+    this.vzIsAir = air;
+    this.state.vzMs += air ? -this.upflowMs : this.upflowMs;
+  }
+
   /** Роторы держат вертикальную относительно земли: в нисходящем потоке тяги нужно больше, в восходящем — меньше. */
   private rotorUpflow(): number {
     const w = this.lw?.upMs ?? 0;
@@ -1735,6 +1837,12 @@ export class LiveFlight {
     this.vzGust = 0;
     const e0 = s.east;
     const n0 = s.north;
+    const psi0 = s.headingDeg;
+    this.hoverWas = this.hoverOn;
+    this.hoverOn = false;
+    this.flyWas = this.flyOn;
+    this.flyOn = false;
+    this.yawOn = false;
     const ground = this.groundUp(s.east, s.north);
     s.aglM = s.up - ground;
     if (this.tw) this.lw = this.tw.localWind(s.east, s.north, s.aglM, s.t);
@@ -1765,21 +1873,24 @@ export class LiveFlight {
         if (s.modeT >= VT.spoolUpS) this.setMode('climb');
         break;
 
-      case 'climb':
-        // Висение носом на первую точку взлётного маршрута — против ветра.
+      case 'climb': {
+        // Висение носом на первую точку взлётного маршрута — против ветра: разворот к ней в наборе
+        // (нос на площадке мог стоять иначе — например, против ветра по предполётной).
         power = VT.climbFactor * hover * this.rotorUpflow();
         s.lift = 1;
+        if (this.path.length > 1) this.hoverYaw(h, bearing(this.path[0]!, this.path[1]!));
         this.hoverMove(h, this.takeoffPt);
         this.spin(h);
-        s.vzMs = this.rotorVz(h, VT.climbRateMs * Math.min(1, s.modeT / 1.5));
+        // К высоте перехода — с торможением: встаём на ней без рывка, разгон — с неё.
+        const top = this.path[0]!.up;
+        s.vzMs = this.rotorVz(h, Math.min(VT.climbRateMs * Math.min(1, s.modeT / 1.5), Math.sqrt(2 * ROTOR_VZ_BRAKE * Math.max(0, top - s.up))));
         s.up += s.vzMs * h;
-        if (s.up >= this.path[0]!.up) {
-          s.up = this.path[0]!.up;
-          s.vzMs = 0;
-          s.headingDeg = this.path.length > 1 ? bearing(this.path[0]!, this.path[1]!) : s.headingDeg;
+        if (s.up >= top - 0.01) {
+          s.up = Math.min(s.up, top);
           this.setMode('transition');
         } else if (s.up <= this.groundUp(s.east, s.north) && s.modeT > 1) this.touchdown('отрыв винта подъёмного двигателя');
         break;
+      }
 
       case 'transition': {
         power = VT.transitionFactor * hover;
@@ -1855,7 +1966,7 @@ export class LiveFlight {
         s.lift = 1;
         s.pusher = 0.1;
         this.hoverYaw(h);
-        if (this.landAt) this.hoverMove(h, this.landAt);
+        this.hoverMove(h, this.landAt ?? this.navPos());
         this.spin(h);
         s.vzMs = this.rotorVz(h, -VT.finalHeightM / VT.finalS);
         s.up += s.vzMs * h;
@@ -1894,6 +2005,9 @@ export class LiveFlight {
     } else if ((AIRBORNE.includes(s.mode) || s.mode === 'backtransition') && s.aglM < 0.5) this.crash('Столкновение с рельефом');
     else if (AIRBORNE.includes(s.mode)) this.checkAttitudeLimits();
     this.syncMotors();
+    // Вне висения скорость рыскания — какая вышла: с неё начнётся разворот на роторах.
+    if (!this.yawOn) this.yawRate = wrap180(s.headingDeg - psi0) / h;
+    if (s.mode !== 'crashed') this.attitude(h, rho);
   }
 
   /** Ручки ПДУ доходят до борта только в зоне действия пульта. */
@@ -1912,6 +2026,14 @@ export class LiveFlight {
     this.gust = g;
     const a = 1 - Math.exp(-h / GUST_LAG_S);
     this.gustLp = { e: this.gustLp.e + (g.e - this.gustLp.e) * a, n: this.gustLp.n + (g.n - this.gustLp.n) * a, u: this.gustLp.u + (g.u - this.gustLp.u) * a };
+    // Отклик аппарата — на каждом шаге, в любом режиме: к переходу на крыло фильтры уже в курсе.
+    const psi = s.headingDeg * RAD;
+    const lateral = g.e * Math.cos(psi) - g.n * Math.sin(psi);
+    this.gustSide += (lateral - this.gustSide) * (1 - Math.exp(-h / GUST_ROLL_LAG_S));
+    this.gustHeave += (g.u - this.gustHeave) * (1 - Math.exp(-h / GUST_HEAVE_LAG_S));
+    const slow = 1 - Math.exp(-h / GUST_ROLL_TAU_S);
+    this.rollLp += (this.gustSide - this.rollLp) * slow;
+    this.heaveLp += (this.gustHeave - this.heaveLp) * slow;
     s.gustMs = Math.hypot(g.e, g.n, g.u);
   }
 
@@ -1930,16 +2052,12 @@ export class LiveFlight {
     let bank = 0;
     let vz = 0;
     if (this.turb) {
-      vz = (planePhase ? GUST_VZ_PLANE : GUST_VZ_HOVER) * this.gust.u;
-      if (planePhase) {
-        const psi = s.headingDeg * RAD;
-        const lateral = this.gust.e * Math.cos(psi) - this.gust.n * Math.sin(psi);
-        this.rollLp += (lateral - this.rollLp) * (1 - Math.exp(-h / GUST_ROLL_TAU_S));
-        bank = GUST_ROLL_DEG * (lateral - this.rollLp);
-      } else {
-        // Висение: тяга против порывов, чем сильнее болтанка — тем больше.
-        power *= 1 + 0.03 * s.gustMs;
-      }
+      // Порывы — через отклик аппарата (sampleGust). На переходах кренят и несут тем сильнее, чем больше веса на крыле.
+      const w = planePhase ? this.wingShare() : 0;
+      vz = (GUST_VZ_PLANE * w + GUST_VZ_HOVER * (1 - w)) * this.gustHeave;
+      bank = w * GUST_ROLL_DEG * (this.gustSide - this.rollLp);
+      // Висение: тяга против порывов, чем сильнее болтанка — тем больше.
+      if (rotorPhase) power *= 1 + 0.03 * s.gustMs;
     }
     if (stab && planePhase) {
       // Контур стабилизации самолёта раскачивается всё сильнее; коптерный работает.
@@ -1955,6 +2073,86 @@ export class LiveFlight {
     s.up += vz * h;
     if (bank !== 0 && s.tasMs > 5) s.headingDeg = norm360(s.headingDeg + ((G * Math.tan(clamp(bank, -80, 80) * RAD)) / s.tasMs / RAD) * h);
     return power;
+  }
+
+  /** Доля веса на крыле: самолёт — 1, висение — 0, на переходах — сколько не держат роторы. */
+  private wingShare(): number {
+    const s = this.state;
+    if (s.mode === 'transition' || s.mode === 'backtransition') return clamp(1 - s.lift, 0, 1);
+    if (s.mode === 'failsafe') return s.failsafePhase === 'copter' ? this.copterWing : 1;
+    return AIRBORNE.includes(s.mode) || s.mode === 'falling' ? 1 : 0;
+  }
+
+  /** Аппарат держат роторы (висение, ручной коптер): его наклоном и задаётся движение. */
+  private rotorBorne(): boolean {
+    const s = this.state;
+    return s.mode === 'climb' || s.mode === 'descent' || s.mode === 'final' || (s.mode === 'failsafe' && s.failsafePhase === 'copter');
+  }
+
+  /**
+   * Углы корпуса. Тангаж на крыле — угол пути относительно воздуха плюс угол атаки по CL (медленнее и в
+   * вираже — нос выше); на роторах — наклон коптера: горизонтальную силу (разгон, торможение, сопротивление
+   * в потоке) роторы дают наклоном тяги; на переходах — смесь по доле веса на крыле. Крен на роторах —
+   * тот же наклон вбок (в самолёте крен ведёт fly()). Всё — с инерцией корпуса: без скачков при смене режима.
+   */
+  private attitude(h: number, rho: number) {
+    const s = this.state;
+    if (s.mode === 'landed') return this.settle(h);
+    const psi = s.headingDeg * RAD;
+    const fe = Math.sin(psi);
+    const fn = Math.cos(psi);
+    const rotor = this.rotorBorne();
+    // Горизонтальная сила роторов на единицу массы, м/с².
+    let ae = 0;
+    let an = 0;
+    if (rotor) {
+      const w = windVec(this.windNow());
+      const air = s.failsafePhase === 'copter' ? this.vAir : { e: this.lastVel.e - w.e - this.gustLp.e, n: this.lastVel.n - w.n - this.gustLp.n };
+      const k = (0.5 * rho * COPTER_DRAG_AREA_M2 * Math.hypot(air.e, air.n)) / this.mass;
+      ae = this.hoverAcc.e + k * air.e;
+      an = this.hoverAcc.n + k * air.n;
+    } else if (s.mode === 'backtransition') {
+      // Роторы дотормаживают: тяга назад — нос вверх.
+      ae = -this.rotorBrake * fe;
+      an = -this.rotorBrake * fn;
+    }
+    const tilt = (a: number) => clamp(Math.atan2(a, G) / RAD, -COPTER_TILT_MAX_DEG, COPTER_TILT_MAX_DEG);
+    let target = 0;
+    if (s.mode === 'falling' && (s.tasMs <= this.stallTas(rho) || this.noGlide)) {
+      // Кувырок: нос по траектории вниз; перед подхватом роторами — выравнивание.
+      target = this.levelLeft !== null ? 0 : clamp(Math.atan2(s.vzMs, Math.max(s.tasMs, 1)) / RAD, -80, 10);
+    } else if (s.mode !== 'ground' && s.mode !== 'spool') {
+      const w = this.wingShare();
+      let wing = 0;
+      if (w > 0) {
+        const tas = Math.max(s.tasMs, 5);
+        const n = 1 / Math.cos(clamp(s.bankDeg - this.bankGust, -80, 80) * RAD);
+        const cl = (w * n * this.mass * G) / (0.5 * rho * tas * tas * AIRCRAFT.wingAreaM2);
+        const alpha = clamp(PITCH_TRIM_DEG + (cl - this.clRef) / CL_ALPHA_DEG, PITCH_ALPHA_MIN_DEG, PITCH_ALPHA_MAX_DEG);
+        wing = Math.atan2(s.vzMs - this.vzGust, tas) / RAD + alpha - GUST_PITCH_DEG * (this.gustHeave - this.heaveLp);
+      }
+      target = w * wing - (1 - w) * tilt(ae * fe + an * fn);
+    }
+    const a = 1 - Math.exp(-h / ATTITUDE_LAG_S);
+    this.pitchLag += (target - this.pitchLag) * a;
+    s.pitchDeg += clamp((this.pitchLag - s.pitchDeg) * a, -PITCH_RATE_DEG_S * h, PITCH_RATE_DEG_S * h);
+    if (rotor) {
+      // Крен — к наклону вбок: коптер держит углы быстро, но не мгновенно (два звена — и скорость крена
+      // без скачков); крен самолёта после торможения гасит так же.
+      const b = 1 - Math.exp(-h / (COPTER_TILT_TAU_S / 2));
+      this.rollLag = wrap180(this.rollLag + wrap180(tilt(ae * fn - an * fe) - this.rollLag) * b);
+      const d = wrap180(this.rollLag - s.bankDeg) * b;
+      s.bankDeg = wrap180(s.bankDeg + clamp(d, -COPTER_TILT_RATE_DEG_S * h, COPTER_TILT_RATE_DEG_S * h));
+    } else this.rollLag = s.bankDeg;
+  }
+
+  /** На земле после касания корпус ложится на опоры. */
+  private settle(h: number) {
+    const s = this.state;
+    const k = Math.exp(-h / SETTLE_S);
+    s.pitchDeg *= k;
+    this.pitchLag = s.pitchDeg;
+    s.bankDeg = wrap180(s.bankDeg) * k;
   }
 
   /** Таймеры и медленные последствия отказов. */
@@ -2027,6 +2225,7 @@ export class LiveFlight {
    */
   private fall(h: number, rho: number) {
     const s = this.state;
+    this.vzFrame(true);
     s.lift = 0;
     s.pusher = 0;
     const wind = this.windNow();
@@ -2047,8 +2246,13 @@ export class LiveFlight {
     } else {
       s.vzMs += (-G + (G * s.vzMs * s.vzMs) / (TERMINAL_FALL_MS * TERMINAL_FALL_MS)) * h;
       s.tasMs = Math.max(0, tas - 4 * h);
-      s.bankDeg = wrap180(s.bankDeg + 70 * h);
-      s.headingDeg = norm360(s.headingDeg + 35 * h);
+      if (this.levelLeft !== null) {
+        // Выравнивание перед подхватом роторами: крен уходит к нулю ровно к концу, вращение остановлено.
+        s.bankDeg = wrap180(s.bankDeg) * (1 - Math.min(1, h / Math.max(this.levelLeft, h)));
+      } else {
+        s.bankDeg = wrap180(s.bankDeg + 70 * h);
+        s.headingDeg = norm360(s.headingDeg + 35 * h);
+      }
       // Горизонтально — остаток скорости и снос ветром.
       const along = s.groundSpeedMs * Math.exp(-h / 1.5);
       ve = along * Math.sin(s.trackDeg * RAD) + 0.7 * wind.speedMs * Math.sin(to) * (1 - Math.exp(-h));
@@ -2067,9 +2271,9 @@ export class LiveFlight {
       const impact = Math.hypot(s.vzMs, s.groundSpeedMs);
       s.up = g;
       if (-s.vzMs < SAFE_IMPACT_MS && s.groundSpeedMs < 3) {
+        // Крен и тангаж на земле гасит settle() — корпус ложится на опоры.
         s.vzMs = 0;
         s.groundSpeedMs = 0;
-        s.bankDeg = 0;
         this.setMode('landed', 'Жёсткая посадка без моторов');
       } else {
         this.crash(`Удар о землю на ${Math.round(impact)} м/с — ${this.fallCause}${this.restart ? '; запуск моторов в воздухе не успел' : ''}`);
@@ -2097,19 +2301,23 @@ export class LiveFlight {
       s.lift = 0;
       s.pusher = 0;
       s.groundSpeedMs = 0;
-      s.bankDeg = 0;
       s.iasMs = 0;
       s.tasMs = 0;
       this.setMode('landed', sink > HARD_LANDING_MS ? `Жёсткая посадка: касание ${sink.toFixed(1)} м/с` : 'Посадка выполнена');
     } else this.crash(`Удар о землю на ${Math.round(Math.hypot(sink, s.groundSpeedMs))} м/с — ${cause}`);
   }
 
-  /** Разворот на висении к курсу посадки (против ветра), не быстрее 20°/с. Без компаса — к ложному курсу. */
-  private hoverYaw(h: number) {
+  /**
+   * Разворот на висении к курсу (по умолчанию — посадки, против ветра), не быстрее 20°/с: вращение
+   * разгоняется и гаснет плавно, без перерегулирования. Без компаса — к ложному курсу.
+   */
+  private hoverYaw(h: number, targetDeg = this.hoverHeadingDeg) {
     const s = this.state;
-    const e = wrap180(this.hoverHeadingDeg + this.compassErrDeg - s.headingDeg);
-    s.headingDeg = norm360(s.headingDeg + clamp(e, -20 * h, 20 * h));
-    s.bankDeg = 0;
+    const e = wrap180(targetDeg + this.compassErrDeg - s.headingDeg);
+    const cmd = clamp(e / HOVER_YAW_TAU_S, -HOVER_YAW_DEG_S, HOVER_YAW_DEG_S);
+    this.yawRate += (cmd - this.yawRate) * (1 - Math.exp(-h / HOVER_YAW_LAG_S));
+    s.headingDeg = norm360(s.headingDeg + this.yawRate * h);
+    this.yawOn = true;
   }
 
   /** Без одного подъёмного винта реактивный момент не уравновешен — аппарат вращается; ветер (флюгер) немного гасит. */
@@ -2121,12 +2329,14 @@ export class LiveFlight {
   }
 
   /**
-   * Вертикальная на роторах: уставка vzCmd, пока тяги хватает. Без винта тяги меньше веса —
-   * аппарат проседает, пока сопротивление плашмя не уравновесит недостачу. wing — доля веса на крыле.
+   * Вертикальная на роторах: к уставке vzCmd с ускорением не больше ROTOR_VZ_ACCEL, пока тяги хватает.
+   * Без винта тяги меньше веса — аппарат проседает, пока сопротивление плашмя не уравновесит недостачу.
+   * wing — доля веса на крыле.
    */
   private rotorVz(h: number, vzCmd: number, wing = 0): number {
-    if (!this.failed.has('rotor') && !this.failed.has('vtol')) return vzCmd;
     const s = this.state;
+    this.vzFrame(false);
+    if (!this.failed.has('rotor') && !this.failed.has('vtol')) return s.vzMs + clamp(vzCmd - s.vzMs, -ROTOR_VZ_ACCEL * h, ROTOR_VZ_ACCEL * h);
     const aUp = G * (this.rotorAuthority() + wing - 1);
     const aDown = -G * (1 - wing);
     const drag = (0.5 * this.rho(s.up) * VERTICAL_DRAG_AREA_M2 * s.vzMs * Math.abs(s.vzMs)) / this.mass;
@@ -2134,59 +2344,66 @@ export class LiveFlight {
   }
 
   /**
-   * Горизонтальное перемещение на висении к точке, не быстрее HOVER_TRANSLATE_MS. Автопилот ведёт
-   * по своей навигации: без ГНСС точку не держит — сносит ветром; без компаса путает направление.
+   * Горизонтальное перемещение на висении к точке: не быстрее HOVER_TRANSLATE_MS, с ускорением не больше
+   * HOVER_ACCEL и торможением так, чтобы встать над точкой. Скорость с прошлого режима сохраняется —
+   * после торможения или разгона роторы гасят её плавно. Автопилот ведёт по своей навигации: без ГНСС
+   * точку не держит — сносит ветром; без компаса путает направление.
    */
   private hoverMove(h: number, target: { east: number; north: number }) {
     const s = this.state;
     const p = this.navPos();
-    const de = target.east - p.east;
-    const dn = target.north - p.north;
-    const d = Math.hypot(de, dn);
-    let v = Math.min(HOVER_TRANSLATE_MS, d / Math.max(h, 1e-6), d);
-    // Вращающийся аппарат точку держит плохо.
-    if (this.failed.has('rotor')) v *= 0.3;
-    let me = 0;
-    let mn = 0;
-    if (d > 0.01) {
-      const ue = de / d;
-      const un = dn / d;
-      const a = this.compassErrDeg * RAD;
-      if (a === 0) {
-        me = ue * v * h;
-        mn = un * v * h;
-      } else {
-        // Смещение в связанных осях по ложному курсу: на деле — повёрнуто на ошибку компаса.
-        me = (ue * Math.cos(a) + un * Math.sin(a)) * v * h;
-        mn = (un * Math.cos(a) - ue * Math.sin(a)) * v * h;
-        this.unknownE += me - ue * v * h;
-        this.unknownN += mn - un * v * h;
-      }
-      s.east += me;
-      s.north += mn;
-    }
-    s.groundSpeedMs = d > 0.01 ? v : 0;
-    s.iasMs = 0;
-    s.tasMs = 0;
+    // Снос, которого автопилот сразу не парирует: без ГНСС — ветер, порывы — с инерцией аппарата.
     let we = 0;
     let wn = 0;
     if (this.windEst) {
       const w = windVec(this.windNow());
-      we += 0.9 * w.e * h;
-      wn += 0.9 * w.n * h;
+      we += 0.9 * w.e;
+      wn += 0.9 * w.n;
     }
     if (this.turb) {
-      we += this.gustLp.e * h;
-      wn += this.gustLp.n * h;
+      we += this.gustLp.e;
+      wn += this.gustLp.n;
     }
-    if (we !== 0 || wn !== 0) {
-      s.east += we;
-      s.north += wn;
-      this.unknownE += we;
-      this.unknownN += wn;
-      // Путевая — по фактическому перемещению: поправка к точке вместе со сносом.
-      s.groundSpeedMs = Math.hypot(me + we, mn + wn) / h;
+    // Только что на роторах: скорость — та, что была (путевая минус снос), без скачка.
+    if (!this.hoverWas) this.hoverVel = { e: this.lastVel.e - we, n: this.lastVel.n - wn };
+    this.hoverOn = true;
+    const de = target.east - p.east;
+    const dn = target.north - p.north;
+    const d = Math.hypot(de, dn);
+    let v = Math.min(HOVER_TRANSLATE_MS, Math.sqrt(2 * HOVER_BRAKE * d), HOVER_GAIN * d);
+    // Вращающийся аппарат точку держит плохо.
+    if (this.failed.has('rotor')) v *= 0.3;
+    const ce = d > 0.01 ? (de / d) * v : 0;
+    const cn = d > 0.01 ? (dn / d) * v : 0;
+    let ae = (ce - this.hoverVel.e) / h;
+    let an = (cn - this.hoverVel.n) / h;
+    const am = Math.hypot(ae, an);
+    if (am > HOVER_ACCEL) {
+      ae *= HOVER_ACCEL / am;
+      an *= HOVER_ACCEL / am;
     }
+    this.hoverAcc = { e: ae, n: an };
+    const ve = this.hoverVel.e + ae * h;
+    const vn = this.hoverVel.n + an * h;
+    this.hoverVel = { e: ve, n: vn };
+    let me = ve * h;
+    let mn = vn * h;
+    const a = this.compassErrDeg * RAD;
+    if (a !== 0) {
+      // Смещение в связанных осях по ложному курсу: на деле — повёрнуто на ошибку компаса.
+      me = (ve * Math.cos(a) + vn * Math.sin(a)) * h;
+      mn = (vn * Math.cos(a) - ve * Math.sin(a)) * h;
+      this.unknownE += me - ve * h;
+      this.unknownN += mn - vn * h;
+    }
+    s.east += me + we * h;
+    s.north += mn + wn * h;
+    this.unknownE += we * h;
+    this.unknownN += wn * h;
+    // Путевая — по фактическому перемещению: поправка к точке вместе со сносом.
+    s.groundSpeedMs = Math.hypot(me + we * h, mn + wn * h) / h;
+    s.iasMs = 0;
+    s.tasMs = 0;
   }
 
   /**
@@ -2204,6 +2421,12 @@ export class LiveFlight {
     const toward = (q: { east: number; north: number }) => s.groundSpeedMs * Math.cos((s.trackDeg - bearing(q, target)) * RAD);
     // Роторы наклоняют аппарат и дотормаживают к точке.
     let { decel, lift } = brakeDecel(this.mass, tas, rho, toward(p), d);
+    // Ниже сваливания поляра (весь вес на крыле) даёт индуктивное сопротивление без предела — торможение
+    // в несколько g в последние метры. Столько не дадут ни крыло, ни наклон роторов назад.
+    decel = Math.min(decel, BRAKE_DECEL_MAX);
+    // Крыло больше CLmax не даёт: ниже сваливания его сопротивление — как на сваливании, по скоростному напору.
+    const stall = this.stallTas(rho);
+    const wingDrag = tas < stall ? (polar(this.mass, stall, rho).dragN * (tas / stall) ** 2) / this.mass : polar(this.mass, tas, rho).dragN / this.mass;
     if (this.failed.has('vtol')) {
       // Роторов нет — тормозит только сопротивление, а ниже сваливания крыло не держит.
       lift = 0;
@@ -2214,6 +2437,8 @@ export class LiveFlight {
         return 0;
       }
     }
+    // Что сверх сопротивления — тормозят роторы, наклоном назад (для тангажа).
+    this.rotorBrake = Math.max(0, decel - wingDrag);
     const tasNew = Math.max(0, tas - decel * h);
     s.iasMs = tasNew * Math.sqrt(rho / RHO0);
     // С выключенным маршевым аппарат планирует к высоте обратного перехода над точкой (как в плане),
@@ -2380,20 +2605,30 @@ export class LiveFlight {
    */
   private fly(h: number, trackCmd: number, alt: number, rho: number, windShare: number, steer = false, glide = false, stall = false) {
     const s = this.state;
+    this.vzFrame(true);
     const tas = tasFromIas(s.iasMs, rho);
     s.tasMs = tas;
     const wind = this.windNow();
     s.wind = wind;
     const aileron = this.failed.has('aileron');
+    // Крен: к уставке не быстрее rate, а скорость крена набирается и гаснет с инерцией по крену — вход в
+    // разворот и выход из него без мгновенного начала вращения. Из другого режима — с нуля.
+    if (!this.flyWas) this.rollRate = 0;
+    const roll = (cmd: number, rate: number, lo: number, hi: number) => {
+      const p = clamp((cmd - s.bankDeg) / ROLL_TAU_S, -rate, rate);
+      this.rollRate += (p - this.rollRate) * (1 - Math.exp(-h / ROLL_LAG_S));
+      s.bankDeg = clamp(s.bankDeg + this.rollRate * h, Math.min(lo, s.bankDeg), Math.max(hi, s.bankDeg));
+    };
+    const rate = aileron ? AILERON_RATE_DEG_S : 20;
+    const lo = this.rollLimit(-AIRCRAFT.maxBankDeg);
+    const hi = this.rollLimit(AIRCRAFT.maxBankDeg);
     if (steer && tas > 5) {
       const tri = windTriangle(tas, trackCmd, wind);
       const headingCmd = trackCmd + (tri ? tri.driftDeg : 0);
-      const bankCmd = this.rollLimit(clamp(wrap180(headingCmd - s.headingDeg) * 1.2, -AIRCRAFT.maxBankDeg, AIRCRAFT.maxBankDeg));
-      const rate = aileron ? AILERON_RATE_DEG_S : 20;
-      s.bankDeg += clamp(bankCmd - s.bankDeg, -rate * h, rate * h);
+      roll(this.rollLimit(clamp(wrap180(headingCmd - s.headingDeg) * 1.2, -AIRCRAFT.maxBankDeg, AIRCRAFT.maxBankDeg)), rate, lo, hi);
       s.headingDeg = norm360(s.headingDeg + ((G * Math.tan(s.bankDeg * RAD)) / tas / RAD) * h);
     } else {
-      s.bankDeg += clamp((aileron ? this.aileronBiasDeg : 0) - s.bankDeg, -20 * h, 20 * h);
+      roll(aileron ? this.aileronBiasDeg : 0, 20, lo, hi);
     }
     const stallIas = STALL_SHARE * AIRCRAFT.transitionLowIasMs;
     if (stall && (s.iasMs < stallIas || (this.stalled && s.iasMs < 1.15 * stallIas))) {
@@ -2424,6 +2659,17 @@ export class LiveFlight {
       this.unknownE += (ve - tas * Math.sin(s.headingDeg * RAD) - windShare * this.windEst.e) * h;
       this.unknownN += (vn - tas * Math.cos(s.headingDeg * RAD) - windShare * this.windEst.n) * h;
     }
+    // Из другого режима путевая скорость не скачет: расхождение с этой моделью (снос на висении, скорость
+    // коптера) гасится с ускорением роторов.
+    if (!this.flyWas) this.carry = { e: this.lastVel.e - ve, n: this.lastVel.n - vn };
+    this.flyOn = true;
+    const cm = Math.hypot(this.carry.e, this.carry.n);
+    if (cm > 0) {
+      const k = Math.max(0, cm - HOVER_ACCEL * h) / cm;
+      this.carry = { e: this.carry.e * k, n: this.carry.n * k };
+      ve += this.carry.e;
+      vn += this.carry.n;
+    }
     s.east += ve * h;
     s.north += vn * h;
     s.up += (s.vzMs + this.upflowMs) * h;
@@ -2446,6 +2692,7 @@ export class LiveFlight {
    */
   private manualPlane(h: number, st: Stick, rho: number): number {
     const s = this.state;
+    this.vzFrame(true);
     const L = AIRCRAFT.limits;
     const tas = Math.max(1, tasFromIas(s.iasMs, rho));
     const aileron = this.failed.has('aileron');
@@ -2498,7 +2745,6 @@ export class LiveFlight {
       if (sink <= BELLY_SINK_MS && gs <= BELLY_GROUND_MS && Math.abs(s.bankDeg) < BELLY_BANK_DEG) {
         s.vzMs = 0;
         s.groundSpeedMs = 0;
-        s.bankDeg = 0;
         s.iasMs = 0;
         s.tasMs = 0;
         s.pusher = 0;
@@ -2518,6 +2764,7 @@ export class LiveFlight {
    */
   private manualCopter(h: number, st: Stick, rho: number, hover: number): number {
     const s = this.state;
+    this.vzFrame(false);
     const wind = this.windNow();
     s.wind = wind;
     const w = windVec(wind);
@@ -2541,8 +2788,8 @@ export class LiveFlight {
       an *= FS_COPTER_ACCEL / am;
     }
     this.vAir = { e: this.vAir.e + ae * h, n: this.vAir.n + an * h };
-    // Наклон для отрисовки — по боковому ускорению.
-    s.bankDeg = clamp(Math.atan2(ae * fn - an * fe, G) / RAD, -30, 30);
+    // Наклон коптера (крен и тангаж) — по ускорению и сопротивлению в потоке: attitude().
+    this.hoverAcc = { e: ae, n: an };
     const ve = this.vAir.e + w.e + this.gustLp.e;
     const vn = this.vAir.n + w.n + this.gustLp.n;
     if (this.windEst) {
@@ -2554,6 +2801,7 @@ export class LiveFlight {
     // Крыло: доля веса по скорости вперёд относительно сваливания.
     const forward = Math.max(0, this.vAir.e * fe + this.vAir.n * fn);
     const wing = clamp((forward / this.stallTas(rho)) ** 2, 0, 1);
+    this.copterWing = wing;
     const vzCmd = st.throttle >= 0 ? st.throttle * FS_CLIMB_MS : st.throttle * FS_DESCENT_MS;
     const auth = this.rotorAuthority();
     const drag = (0.5 * rho * VERTICAL_DRAG_AREA_M2 * s.vzMs * Math.abs(s.vzMs)) / this.mass;

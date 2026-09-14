@@ -64,13 +64,19 @@ const GROUP_TITLE: Record<Group, string> = {
 };
 const EVENT_COLOR: Record<string, string> = { bad: '#d64545', warn: '#b7791f', cmd: '#ff8a1a' };
 
-type NumKey = { [K in keyof Sample]: Sample[K] extends number ? K : never }[keyof Sample];
+// Обязательные числовые поля отсчёта и необязательные ряды для графиков (связь есть не во всех записях).
+type NumKey = Exclude<{ [K in keyof Sample]: Sample[K] extends number ? K : never }[keyof Sample], undefined>;
+type ChartKey = NumKey | 'rxDbm';
+const valueOf = (s: Sample, key: ChartKey): number | undefined => s[key];
 interface PaneDef {
   title: string;
   unit: string;
-  series: { key: NumKey; color: string; label: string; k: number }[];
+  series: { key: ChartKey; color: string; label: string; k: number }[];
+  fixedMin?: number;
   fixedMax?: number;
   digits: number;
+  /** Панель — только у записей, где этот ряд есть. */
+  optional?: boolean;
 }
 const PANES: PaneDef[] = [
   { title: 'Высота', unit: 'м', series: [{ key: 'aglM', color: '#2563eb', label: '', k: 1 }], digits: 0 },
@@ -85,6 +91,7 @@ const PANES: PaneDef[] = [
   },
   { title: 'Мощность', unit: 'кВт', series: [{ key: 'powerW', color: '#7048e8', label: '', k: 0.001 }], digits: 1 },
   { title: 'Заряд', unit: '%', series: [{ key: 'soc', color: '#0b7285', label: '', k: 100 }], fixedMax: 100, digits: 0 },
+  { title: 'Приём на борту', unit: 'дБм', series: [{ key: 'rxDbm', color: '#c2255c', label: '', k: 1 }], fixedMin: -110, fixedMax: -10, digits: 0, optional: true },
 ];
 
 const fmt = (x: number, digits = 0) => x.toFixed(digits).replace('.', ',').replace('-', '−');
@@ -112,12 +119,19 @@ function timeStep(spanS: number, px: number): number {
   return 14400;
 }
 
-/** Открыть файл: запись симулятора (JSON) или, если профиль умеет, бортовой журнал аппарата. */
-export async function openRecordingFile(file: File): Promise<Recording> {
-  const head = new Uint8Array(await file.slice(0, 1).arrayBuffer());
-  if (head[0] === 0x7b) return parseRecording(await file.text());
+/**
+ * Открыть файлы: запись симулятора (JSON, одну) или, если профиль умеет, бортовые журналы одного
+ * полёта — основной и служебный можно выбрать вместе.
+ */
+export async function openRecordingFiles(files: File[]): Promise<Recording> {
+  if (!files.length) throw new Error('Файл не выбран');
+  const heads = await Promise.all(files.map(async (f) => new Uint8Array(await f.slice(0, 1).arrayBuffer())[0]));
+  if (heads.includes(0x7b)) {
+    if (files.length > 1) throw new Error('Запись симулятора открывается по одной — выберите один файл');
+    return parseRecording(await files[0]!.text());
+  }
   if (!PROFILE.importLog) throw new Error('Это не запись симулятора (JSON), а импорт бортовых журналов в этой сборке недоступен');
-  return PROFILE.importLog(await file.arrayBuffer(), file.name);
+  return PROFILE.importLog(await Promise.all(files.map(async (f) => ({ name: f.name, buf: await f.arrayBuffer() }))));
 }
 
 /** Имя файла записи по времени начала: запись-2026-09-12-1430.json. */
@@ -160,8 +174,8 @@ export class Debrief {
   onClose?: () => void;
   /** Не задан — запись скачивается файлом (downloadRecording). */
   onExport?: () => void;
-  /** Не задан — файл открывается здесь же (openRecordingFile) и показывается без оценки. */
-  onImport?: (file: File) => void;
+  /** Не задан — файлы открываются здесь же (openRecordingFiles) и показываются без оценки. */
+  onImport?: (files: File[]) => void;
   /** Готовое видео. Не задан — скачивается файлом (downloadBlob). */
   onVideo?: (video: VideoResult) => void;
 
@@ -180,6 +194,20 @@ export class Debrief {
   private layer: HTMLCanvasElement | null = null;
   private layerKey = '';
   private ranges: { min: number; max: number; y0: number; y1: number }[] = [];
+  // Панели графиков записи: необязательные (связь) — только если такой ряд в записи есть.
+  private panesOf: Recording | null = null;
+  private panesCache: PaneDef[] = PANES.filter((p) => !p.optional);
+
+  private get panes(): PaneDef[] {
+    const rec = this.rec;
+    if (rec && rec !== this.panesOf) {
+      this.panesOf = rec;
+      this.panesCache = PANES.filter((p) => !p.optional || rec.samples.some((s) => p.series.some((ser) => valueOf(s, ser.key) !== undefined)));
+      // Высота графиков — по числу панелей, чтобы панели не мельчали.
+      this.canvas.style.height = `${50 + 50 * this.panesCache.length}px`;
+    }
+    return this.panesCache;
+  }
   private nowEvent = -1;
   private assessment: Assessment | undefined;
   // Видео: хозяин 3D-повтора, параметры, проверенные кодировщики по размеру кадра, текущая запись.
@@ -194,7 +222,8 @@ export class Debrief {
     el.className = 'win debrief';
     el.hidden = true;
     el.tabIndex = -1;
-    const importTitle = PROFILE.importLog ? 'Открыть запись / журнал…' : 'Открыть запись…';
+    // Журналы одного полёта — основной и служебный — выбираются вместе.
+    const importTitle = PROFILE.importLog ? 'Открыть запись / журналы…' : 'Открыть запись…';
     el.innerHTML = `
       <div class="win-title"><span class="db-title">Разбор полёта</span><button class="x" data-db="close" title="Закрыть">✕</button></div>
       <div class="win-body">
@@ -216,7 +245,7 @@ export class Debrief {
           <button class="db-btn" data-db="export">Сохранить запись</button>
           <button class="db-btn" data-db="video" hidden>Сохранить видео…</button>
           <button class="db-btn" data-db="import">${importTitle}</button>
-          <input type="file" class="db-file" hidden>
+          <input type="file" class="db-file" multiple hidden>
         </div>
         <div class="db-video" hidden>
           <div class="dv-grid">
@@ -279,12 +308,12 @@ export class Debrief {
       }
     });
     this.fileInput.addEventListener('change', () => {
-      const file = this.fileInput.files?.[0];
+      const files = [...(this.fileInput.files ?? [])];
       this.fileInput.value = '';
-      if (!file) return;
-      if (this.onImport) return this.onImport(file);
+      if (!files.length) return;
+      if (this.onImport) return this.onImport(files);
       this.error(null);
-      openRecordingFile(file).then(
+      openRecordingFiles(files).then(
         (rec) => this.show(rec),
         (e: unknown) => this.error(e instanceof Error ? e.message : String(e)),
       );
@@ -579,6 +608,12 @@ export class Debrief {
     return this.el.querySelector<T>(sel)!;
   }
 
+  /** Ошибка в окне (null — убрать): для файлов, которые открывает хозяин окна (onImport). */
+  showError(text: string | null): void {
+    this.el.hidden = false;
+    this.error(text);
+  }
+
   private error(text: string | null) {
     const e = this.q<HTMLElement>('.db-error');
     e.hidden = !text;
@@ -659,7 +694,9 @@ export class Debrief {
       <dt>Высота</dt><dd>${fmt(s.aglM)} м</dd><dt>Верт.</dt><dd>${vz} м/с</dd>
       <dt>Приборная</dt><dd>${fmt(s.iasMs, 1)} м/с</dd><dt>Путевая</dt><dd>${fmt(s.gsMs, 1)} м/с</dd>
       <dt>Мощность</dt><dd>${fmt(s.powerW)} Вт</dd><dt>Заряд</dt><dd>${fmt(s.soc * 100)} %</dd>
-      <dt>Расход</dt><dd>${fmt(s.energyWh - e0)} Вт·ч</dd><dt>Крен / курс</dt><dd>${fmt(s.bankDeg)}° / ${fmt(s.headingDeg)}°</dd>`;
+      <dt>Расход</dt><dd>${fmt(s.energyWh - e0)} Вт·ч</dd><dt>Крен / курс</dt><dd>${fmt(s.bankDeg)}° / ${fmt(s.headingDeg)}°</dd>${
+        s.rxDbm !== undefined ? `<dt>Приём</dt><dd>${fmt(s.rxDbm)} дБм${s.linkPct !== undefined ? ` · ${fmt(s.linkPct)} %` : ''}</dd>` : ''
+      }`;
 
     // Подсветить последнее событие до текущего момента.
     let i = -1;
@@ -683,7 +720,7 @@ export class Debrief {
     const top = 12;
     const bottom = 16;
     const gap = 5;
-    const n = PANES.length;
+    const n = this.panes.length;
     return { left, right, top, bottom, gap, w, h, pw: Math.max(10, w - left - right), ph: Math.max(10, (h - top - bottom - gap * (n - 1)) / n) };
   }
 
@@ -728,11 +765,13 @@ export class Debrief {
     ctx.lineTo(x, g.h - g.bottom);
     ctx.stroke();
     const s = stateAt(rec, this.t);
-    PANES.forEach((p, i) => {
+    this.panes.forEach((p, i) => {
       const r = this.ranges[i];
       if (!r) return;
       for (const ser of p.series) {
-        const v = s[ser.key] * ser.k;
+        const raw = valueOf(s, ser.key);
+        if (raw === undefined) continue;
+        const v = raw * ser.k;
         const y = r.y1 - ((v - r.min) / (r.max - r.min)) * (r.y1 - r.y0);
         ctx.beginPath();
         ctx.arc(x, Math.min(r.y1, Math.max(r.y0, y)), 2.6, 0, Math.PI * 2);
@@ -758,7 +797,8 @@ export class Debrief {
     };
     const samples = rec.samples;
     const x = (t: number) => this.xOf(t, g);
-    const bottomY = g.top + PANES.length * g.ph + (PANES.length - 1) * g.gap;
+    const panes = this.panes;
+    const bottomY = g.top + panes.length * g.ph + (panes.length - 1) * g.gap;
 
     // Участки режимов.
     const runs: { group: Group; a: number; b: number }[] = [];
@@ -780,19 +820,21 @@ export class Debrief {
     this.ranges = [];
     // Прореживание рядов: не больше двух точек (минимум и максимум) на экранный пиксель.
     const step = Math.max(1, Math.floor(samples.length / (g.pw * dpr)));
-    PANES.forEach((p, i) => {
+    panes.forEach((p, i) => {
       const y0 = g.top + i * (g.ph + g.gap);
       const y1 = y0 + g.ph;
       let dataMax = 0;
       let dataMin = 0;
       for (const s of samples)
         for (const ser of p.series) {
-          const v = s[ser.key] * ser.k;
+          const raw = valueOf(s, ser.key);
+          if (raw === undefined) continue;
+          const v = raw * ser.k;
           if (v > dataMax) dataMax = v;
           if (v < dataMin) dataMin = v;
         }
       const max = p.fixedMax ?? niceMax(dataMax);
-      const min = dataMin < 0 ? -niceMax(-dataMin) : 0;
+      const min = p.fixedMin ?? (dataMin < 0 ? -niceMax(-dataMin) : 0);
       this.ranges.push({ min, max, y0, y1 });
       const y = (v: number) => y1 - ((v - min) / (max - min)) * g.ph;
 
@@ -825,19 +867,28 @@ export class Debrief {
       for (const ser of p.series) {
         c.strokeStyle = ser.color;
         c.beginPath();
+        // Нет данных у необязательного ряда — разрыв линии.
+        let pen = false;
         for (let k = 0; k < samples.length; k += step) {
           const end = Math.min(samples.length, k + step);
-          let lo = k;
-          let hi = k;
+          let lo = -1;
+          let hi = -1;
           for (let j = k; j < end; j++) {
-            if (samples[j]![ser.key] < samples[lo]![ser.key]) lo = j;
-            if (samples[j]![ser.key] > samples[hi]![ser.key]) hi = j;
+            const v = valueOf(samples[j]!, ser.key);
+            if (v === undefined) continue;
+            if (lo < 0 || v < valueOf(samples[lo]!, ser.key)!) lo = j;
+            if (hi < 0 || v > valueOf(samples[hi]!, ser.key)!) hi = j;
+          }
+          if (lo < 0) {
+            pen = false;
+            continue;
           }
           for (const j of lo <= hi ? [lo, hi] : [hi, lo]) {
             const px = x(samples[j]!.t);
-            const py = y(samples[j]![ser.key] * ser.k);
-            if (k === 0 && j === (lo <= hi ? lo : hi)) c.moveTo(px, py);
-            else c.lineTo(px, py);
+            const py = y(valueOf(samples[j]!, ser.key)! * ser.k);
+            if (pen) c.lineTo(px, py);
+            else c.moveTo(px, py);
+            pen = true;
           }
         }
         c.stroke();

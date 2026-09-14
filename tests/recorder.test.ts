@@ -215,4 +215,15 @@ describe('файл записи', () => {
     const back = JSON.parse(serialize(rec([sample(5), sample(1)])));
     expect(() => parseRecording(JSON.stringify(back))).toThrow(/назад/);
   });
+
+  it('журнал: рули, место полёта и ветер — туда и обратно; рули в повторе — между отсчётами', () => {
+    const r = rec([sample(0, { ailL: 0.5, ailR: -0.5, tailL: 0, tailR: 0.2 }), sample(1, { ailL: -0.5, ailR: 0.5, tailL: 0.4, tailR: 0 })]);
+    r.meta = { ...r.meta, source: 'log', origin: { lat: 55.1, lon: 38.2 }, wind: { speedMs: 4.2, fromDeg: 250 } };
+    const b = parseRecording(serialize(r));
+    expect(b).toEqual(r);
+    expect(stateAt(b, 0.5).ailL).toBeCloseTo(0, 6);
+    expect(stateAt(b, 0.5).tailL).toBeCloseTo(0.2, 6);
+    // Без рулей — и столбцов нет.
+    expect((JSON.parse(serialize(rec([sample(0), sample(1)]))) as { columns: string[] }).columns).not.toContain('ailL');
+  });
 });

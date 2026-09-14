@@ -6,7 +6,10 @@ import { parseOsm } from './sim/osm';
 import { loadQuality, QUALITY, saveQuality } from './ui/quality';
 import { Preparation, PREP_STEPS, type GroundTest, type PrepStepId } from './game/preparation';
 import { ACTIVE_REGION, buildMission, departure, forecastWeather, REGION, SCENARIOS, type Mission, type Scenario, type Settings } from './game/scenarios';
-import { REGIONS, setRegion } from './game/regions';
+import { LOG_REGION_ID, osmRegionFor, REGIONS, saveLogRegion, setRegion } from './game/regions';
+import { inBounds, placeRecording, regionFromRecording } from './game/logRegion';
+import { SurfaceMotion } from './game/surfaces';
+import { loadLastLog, saveLastLog } from './ui/logStore';
 import { osmUrlFor } from './ui/tileSource';
 import { createPacksPanel } from './ui/packsPanel';
 import { blocked, preflightChecks, type Check } from './game/preflight';
@@ -18,7 +21,7 @@ import { planReach, pointOfNoReturn, reachFrom, weatherWithMeasuredWind, type Re
 import { Sound, type SoundState } from './ui/audio';
 import { FlightRecorder, poseOf, stateAt, type Recording } from './game/recorder';
 import { assessFlight, FAILURE_TITLES, findDifficulty, planFailures, saveResult, type Assessment, type DifficultyId, type FailureEvent } from './game/scoring';
-import { Debrief } from './ui/debrief';
+import { Debrief, openRecordingFiles } from './ui/debrief';
 import { PilotInput } from './ui/pilotInput';
 import { failureInfo, LINK_TIMEOUT_S, type FailureId } from './sim/failures';
 import type { Alert } from './ui/gcs';
@@ -158,6 +161,9 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   let prepDoneCount = 0;
   /** Проверка подготовки, которая сейчас идёт, — для звука роторов по одному. */
   let lastTest: GroundTest | null = null;
+  // Рули на 3D-модели по движению: в полёте и в повторе записей без команд автопилота.
+  const motion = new SurfaceMotion();
+  const replayMotion = new SurfaceMotion();
 
   // Звук: браузер разрешает его только после щелчка или клавиши. Выключенный звук запоминается.
   const SOUND_KEY = 'vtol-sim.muted';
@@ -256,6 +262,38 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   let pausedBeforeDebrief = false;
   debrief.onSeek = (t) => (replayT = t);
   debrief.onClose = () => (paused = pausedBeforeDebrief);
+  // Бортовой журнал — на месте полёта. Внутри района — у площадки со сдвигом; иначе район строится
+  // по журналу (рельеф, снимки, маршрут повтора полёта) и страница перезагружается туда.
+  debrief.onImport = (files) => {
+    debrief.showError(null);
+    openRecordingFiles(files)
+      .then(async (rec) => {
+        const origin = rec.meta.origin;
+        if (!origin) return openDebrief(rec);
+        if (inBounds(ACTIVE_REGION.location.region, origin)) return openDebrief(placeRecording(rec, siteA, terrain.elevationM(origin) - siteA.elevationM));
+        if (started) {
+          gcs.toast('<b>Журнал записан в другом месте</b>Показываю его у площадки. Чтобы увидеть полёт на месте, нажмите «Начать заново» и откройте журнал снова.', 'warn');
+          return openDebrief(placeRecording(rec, siteA, 0));
+        }
+        gcs.toast('<b>Переношу сцену на место полёта</b>Журнал записан вне района — загружаю рельеф и снимки там, где летал аппарат.', 'good');
+        // Высоты маршрута повтора — над рельефом места полёта; без сети — над точкой взлёта.
+        let ground: Terrain | undefined;
+        try {
+          ground = await loadTerrain(regionFromRecording(rec).location.region, 11);
+        } catch (e) {
+          console.warn('Рельеф места полёта не загрузился, высоты маршрута — над точкой взлёта:', e);
+        }
+        const region = regionFromRecording(rec, ground);
+        try {
+          await saveLastLog(rec);
+        } catch (e) {
+          console.warn('Журнал не сохранился в браузере — после перезагрузки откройте его снова:', e);
+        }
+        saveLogRegion(region);
+        setRegion(LOG_REGION_ID);
+      })
+      .catch((e: unknown) => debrief.showError(e instanceof Error ? e.message : String(e)));
+  };
   // Пульт (ПДУ) для «Фэйлсейфа»: геймпад, без него — клавиатура.
   const pilot = new PilotInput();
 
@@ -504,7 +542,8 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     .then((model) => world.setAircraft(model))
     .catch((e) => console.warn('CAD-модель аппарата не загрузилась, остаётся упрощённая:', e));
   // Дома, леса и полосы из OpenStreetMap — из пакета района (работа без сети) или файл района.
-  void osmUrlFor(ACTIVE_REGION)
+  // Место полёта из журнала своего файла не имеет: дома — от готового района, если журнал внутри него.
+  void osmUrlFor(ACTIVE_REGION.id === LOG_REGION_ID ? (osmRegionFor(siteA) ?? ACTIVE_REGION) : ACTIVE_REGION)
     .then((url) => (url ? fetch(url) : null))
     .then((r) => (r === null ? null : r.ok ? r.arrayBuffer() : Promise.reject(new Error(`HTTP ${r.status}`))))
     .then((buf) => buf && world.setOsm(parseOsm(buf)))
@@ -1152,11 +1191,11 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   function evaluatePrep(id: PrepStepId): { ok: boolean; text: string } {
     switch (id) {
       case 'power':
-        return { ok: true, text: 'Автопилот загружен' };
+        return { ok: true, text: 'Автопилот загружен, БАНО горят' };
       case 'link':
         return { ok: true, text: 'Связь есть; крен, тангаж и координаты в норме' };
       case 'servos':
-        return { ok: true, text: 'Элероны ходят в обе стороны без заеданий' };
+        return { ok: true, text: 'Элероны и рули V-оперения ходят в обе стороны без заеданий' };
       case 'airdata':
         return { ok: true, text: 'Приборная растёт при обдуве ПВД и возвращается к нулю' };
       case 'vtol':
@@ -1191,9 +1230,18 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     if (replayRec) {
       const smp = stateAt(replayRec, replayT);
       const pose = poseOf(smp);
-      world.setSun(sunPosition(new Date(departure(scenario, settings).getTime() + smp.t * 1000), siteA));
+      // Солнце — на время полёта: у журнала — от включения автопилота, у записи симулятора — от вылета задания.
+      const logStart = replayRec.meta.source === 'log' ? Date.parse(replayRec.meta.startedAt) : NaN;
+      const t0 = Number.isNaN(logStart) ? departure(scenario, settings).getTime() : logStart;
+      world.setSun(sunPosition(new Date(t0 + smp.t * 1000), siteA));
       world.setPose(pose);
-      world.aircraft.animate(dt, smp.lift, smp.pusher, null);
+      // Рули: у журнала — команды автопилота, у записи симулятора — по движению.
+      const surfaces =
+        smp.ailL !== undefined && smp.ailR !== undefined && smp.tailL !== undefined && smp.tailR !== undefined
+          ? { ailL: smp.ailL, ailR: smp.ailR, tailL: smp.tailL, tailR: smp.tailR }
+          : replayMotion.update(smp.t, smp.bankDeg, smp.pitchDeg, ['transition', 'auto', 'guided', 'manual', 'hold', 'rtl', 'backtransition', 'falling'].includes(smp.mode));
+      world.aircraft.setLights(true);
+      world.aircraft.animate(dt, smp.lift, smp.pusher, null, surfaces);
       world.aircraft.setLandingLight(0);
       world.updateDust(dt, pose.position, smp.lift * Math.max(0, 1 - smp.aglM / 12));
       world.updateCamera(dt, pose);
@@ -1258,7 +1306,8 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     const pose = {
       position: { east: s.east, north: s.north, up: s.up },
       headingDeg: s.headingDeg,
-      pitchDeg: plane && s.groundSpeedMs > 3 ? (Math.atan2(s.vzMs, s.groundSpeedMs) * 180) / Math.PI + 2 : 0,
+      // Тангаж — из физики: на крыле — наклон траектории и угол атаки, на роторах — наклон коптера.
+      pitchDeg: s.pitchDeg,
       bankDeg: s.bankDeg,
     };
     if (s.mode === 'crashed') {
@@ -1276,7 +1325,11 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       const d = ((((w.fromDeg - s.headingDeg + 180) % 360) + 360) % 360) - 180;
       if (w.speedMs >= 1) flight.setGroundHeading(s.headingDeg + Math.max(-60 * dt, Math.min(60 * dt, d)));
     }
-    world.aircraft.animate(dt, s.lift, s.pusher, prep.running ? test : null);
+    // БАНО — только при поданном питании: после шага «Подать питание», заармленный или в полёте.
+    world.aircraft.setLights(prep.powered || s.armed || s.mode !== 'ground');
+    // Рули: в самолётном режиме — по движению, на висении и на земле — в нейтрали.
+    const surfaces = motion.update(s.t, pose.bankDeg, pose.pitchDeg, plane && s.mode !== 'falling');
+    world.aircraft.animate(dt, s.lift, s.pusher, prep.running ? test : null, surfaces);
     // Посадочная фара — ночью на взлёте, заходе, посадке и низко над землёй.
     const lowOrVertical = ['spool', 'climb', 'transition', 'backtransition', 'descent', 'final'].includes(s.mode) || s.failsafePhase === 'copter' || (s.armed && s.aglM < 150);
     world.aircraft.setLandingLight(lowOrVertical ? Math.min(1, world.nightFactor * 1.4) : 0);
@@ -1369,8 +1422,10 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
         alerts.push({ level: 'warn', text: `ФЭЙЛСЕЙФ · ${s.failsafePhase === 'copter' ? 'коптер' : 'самолёт'} · пульт: ${src}${flight.rcInRange() ? '' : ' · ПДУ НЕ ДОСТАЁТ'}` });
       }
       const soc = Math.max(0, tele.soc);
+      // Продув ПВД на проверке СВС: приборная в телеметрии растёт и возвращается к нулю.
+      const pitotMs = lastTest && prep.running === 'airdata' ? lastTest.airspeedMs : null;
       gcs.update({
-        state: tele,
+        state: pitotMs !== null ? { ...tele, iasMs: pitotMs, tasMs: pitotMs } : tele,
         alerts,
         frames: { total: frames.length, ok: frames.filter((f) => f.ok).length },
         altitudeMslM: tele.up + siteA.elevationM,
@@ -1431,7 +1486,15 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   };
   voice.onChange = showVoice;
   showVoice();
-  loadScenario(SCENARIOS[0]!);
+  // Место полёта из журнала: задание по умолчанию — повтор полёта по траектории журнала, разбор журнала открывается сам.
+  const logHere = ACTIVE_REGION.id === LOG_REGION_ID;
+  loadScenario((logHere && SCENARIOS.find((x) => x.id === 'route')) || SCENARIOS[0]!);
+  if (logHere)
+    void loadLastLog()
+      .then((r) => {
+        if (r?.meta.origin) openDebrief(placeRecording(r, siteA, terrain.elevationM(r.meta.origin) - siteA.elevationM));
+      })
+      .catch((e: unknown) => console.warn('Журнал места полёта не открылся:', e));
 
   let last = performance.now();
   function frame(now: number) {
