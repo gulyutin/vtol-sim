@@ -192,11 +192,30 @@ const env = () => globalThis as unknown as Env;
 export const LOG_REGION_ID = 'log';
 const LOG_REGION_KEY = 'vtol-sim.logRegion';
 
+/** Запас рельефа и снимков вокруг траектории журнала и наименьшая сторона области, м — как у готовых районов. */
+const LOG_MARGIN_M = 8000;
+const LOG_MIN_SIZE_M = 30_000;
+
+/**
+ * Область места полёта для сцены: траектория (область из журнала) с запасом, не меньше LOG_MIN_SIZE_M
+ * по стороне. С высоты полёта видно на десятки километров: иначе за краем области — плоская заглушка.
+ */
+function sceneBounds(b: LocationSpec['region']): LocationSpec['region'] {
+  const lat0 = (b.south + b.north) / 2;
+  const lon0 = (b.west + b.east) / 2;
+  const mLat = 111_320;
+  const mLon = 111_320 * Math.cos((lat0 * Math.PI) / 180);
+  const halfLat = Math.max((b.north - b.south) / 2 + LOG_MARGIN_M / mLat, LOG_MIN_SIZE_M / 2 / mLat);
+  const halfLon = Math.max((b.east - b.west) / 2 + LOG_MARGIN_M / mLon, LOG_MIN_SIZE_M / 2 / mLon);
+  return { south: lat0 - halfLat, north: lat0 + halfLat, west: lon0 - halfLon, east: lon0 + halfLon };
+}
+
 function storedLogRegion(): RegionPreset | null {
   try {
     const raw = env().localStorage?.getItem(LOG_REGION_KEY);
     const r = raw ? (JSON.parse(raw) as RegionPreset) : null;
-    return r && r.id === LOG_REGION_ID && typeof r.location?.site?.lat === 'number' && r.location.region ? r : null;
+    if (!(r && r.id === LOG_REGION_ID && typeof r.location?.site?.lat === 'number' && r.location.region)) return null;
+    return { ...r, location: { ...r.location, region: sceneBounds(r.location.region) } };
   } catch {
     return null;
   }
