@@ -5,7 +5,7 @@ import { CAMERAS } from '../sim/payload';
 import { loadQuality, QUALITY, type Quality } from './quality';
 import { PREP_STEPS, type Preparation, type PrepStepId } from '../game/preparation';
 import { DIFFICULTY } from '../game/scoring';
-import { FAILURES } from '../sim/failures';
+import { FAILURES, LINK_LOSS_ACTIONS, type LinkLossAction } from '../sim/failures';
 import { footprintM, type Coverage, type Frame, type SurveyCamera, type SurveyPlan } from '../sim/survey';
 import type { MissionResult, Wind } from '../sim/types';
 import { drawAttitude, drawProfile, type ProfileData } from './instruments';
@@ -247,8 +247,9 @@ const group = (cls: string, title: string, ...buttons: string[]) => `<div class=
 const WINDOWS = ['task', 'profile', 'prep', 'instructor', 'zones', 'telemetry', 'horizon', 'control', 'console'];
 const ZONE_HINT = 'Выберите вид и нарисуйте на карте. Зона РЭБ — круг: щелчок — центр, второй щелчок — граница. Запретная зона — многоугольник: щелчки по вершинам, двойной щелчок — завершить. Правый щелчок по зоне — удалить.';
 
-type NumKey = Exclude<keyof Settings, 'cameraId' | 'shutter'>;
+type NumKey = Exclude<keyof Settings, 'cameraId' | 'shutter' | 'linkLossAction'>;
 const FORMAT: Record<NumKey, (v: number) => string> = {
+  linkLossTimeoutS: (v) => `${v} с`,
   gsdCm: (v) => `${fmt(v, 2)} см`,
   forwardOverlapPct: (v) => `${v} %`,
   sideOverlapPct: (v) => `${v} %`,
@@ -770,6 +771,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     taskBody.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-k]').forEach((i) => {
       const k = i.dataset.k as keyof Settings;
       if (k === 'cameraId') s.cameraId = i.value;
+      else if (k === 'linkLossAction') s.linkLossAction = i.value as LinkLossAction;
       else (s as Record<string, number | string>)[k] = +i.value;
     });
     return s;
@@ -846,6 +848,13 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         <details open><summary>Полёт</summary>
           ${range('iasMs', 'Скорость (приборная)', 15, 28, 0.5, s.iasMs)}
           ${range('localHour', 'Время вылета (местное)', 5, 21, 0.25, s.localHour)}
+        </details>
+        <details><summary>Потеря связи</summary>
+          <label class="select"><span>Без связи</span><select data-k="linkLossAction">
+            ${LINK_LOSS_ACTIONS.map((a) => `<option value="${a.id}" ${a.id === s.linkLossAction ? 'selected' : ''}>${a.title}</option>`).join('')}
+          </select></label>
+          ${range('linkLossTimeoutS', 'Через', 5, 120, 5, s.linkLossTimeoutS)}
+          <p class="hint">Что делает автопилот, если связи с НСУ нет дольше заданного. Задание уже на борту: «Продолжать задание» доводит его до конца и садится по плану, «Посадка на месте» — вертикально там, где застала потеря связи.</p>
         </details>
         <details ${survey ? '' : 'open'}><summary>Погода — прогноз</summary>
           <label class="select"><span>Погода</span><select data-a="wsrc">

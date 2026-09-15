@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildMission, forecastWeather, SCENARIOS, type DeliveryScenario, type RouteScenario, type TransferScenario } from '../src/game/scenarios';
+import { AIRCRAFT } from '../src/sim/aircraft';
 import { LiveFlight, type Controls } from '../src/sim/flight';
 import { combineResults, distanceM, fromLocal, simulateMission, toLocal } from '../src/sim/mission';
 import { fillVoids, flatTerrain } from '../src/sim/terrain';
@@ -75,6 +76,29 @@ describe('построение маршрута', () => {
     expect(nearest(points[1]!).altitudeM).toBeCloseTo(560, -1);
     const between = wps.filter((w) => w.routeLeg === 1).map((w) => w.altitudeM);
     for (let i = 1; i < between.length; i++) expect(between[i]!).toBeGreaterThanOrEqual(between[i - 1]! - 1e-9);
+  });
+
+  it('склон за площадкой круче, чем успеваем набрать, — круги над площадкой, дальше не ниже половины заданной высоты, а не сквозь склон', () => {
+    // От 1 до 2,5 км на север рельеф поднимается на 900 м — 60 %.
+    const ground = (p: GeoPoint) => 260 + 900 * Math.min(1, Math.max(0, (toLocal(route.site, p).north - 1000) / 1500));
+    const hills = { elevationM: ground };
+    const points = [
+      { ...fromLocal(route.site, 0, 3000), heightAglM: 150 },
+      { ...fromLocal(route.site, 0, 6000), heightAglM: 150 },
+    ];
+    const sc: RouteScenario = { ...route, route: points };
+    const weather = calm(forecastWeather(sc, sc.defaults));
+    const m = buildMission(sc, sc.defaults, hills, weather);
+    const plan = m.stages[0]!;
+    expect(plan.legLabels?.[0]).toContain('набор высоты по кругу');
+    for (const w of plan.waypoints) expect(w.altitudeM - ground(w)).toBeGreaterThanOrEqual(AIRCRAFT.minClearanceM);
+    const nearest = (p: GeoPoint) => plan.waypoints.reduce((best, w) => (distanceM(w, p) < distanceM(best, p) ? w : best));
+    for (const p of points) expect(nearest(p).altitudeM - ground(p)).toBeGreaterThanOrEqual(p.heightAglM / 2 - 5);
+    const f = new LiveFlight({ plan, terrain: hills, weather, origin: m.site, home: m.site });
+    fly(f);
+    expect(f.state.mode).toBe('landed');
+    // План выполним: кругов по ходу полёта автопилоту добавлять не пришлось.
+    expect(f.events.some((e) => e.text.startsWith('Набор высоты по кругу'))).toBe(false);
   });
 });
 

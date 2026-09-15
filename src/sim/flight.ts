@@ -1,7 +1,7 @@
 import { AIRCRAFT, ASPECT_RATIO } from './aircraft';
 import { brakeDecel, climbPowerW, HOVER_TRANSLATE_MS, hoverPowerW, polar, takeoffMassKg } from './aero';
 import { airDensity, batteryCapacityWh, G, RHO0, tasFromIas, temperatureAt } from './atmosphere';
-import { failureInfo, FIRE_TO_POWER_S, LINK_TIMEOUT_S, RC_RANGE_M, type FailureId } from './failures';
+import { failureInfo, FIRE_TO_POWER_S, LINK_TIMEOUT_S, RC_RANGE_M, type FailureId, type LinkLossAction } from './failures';
 import { backTransitionAltitudeM, fromLocal, toLocal, transitionAltitudeM } from './mission';
 import { windProcedures } from './procedures';
 import { BOARD_ANTENNA_M, linkJamDb, RADIO, RadioLink, TELEMETRY_HZ, type LinkNetwork, type LinkState, type RadioParams, type Relay, type Station } from './radio';
@@ -206,6 +206,14 @@ const RTL_ORBIT_SLACK_M = 25;
 /** Шаг выборки рельефа по пути домой, м; пересчёт нужной высоты — раз в столько секунд. */
 const RTL_STEP_M = 100;
 const RTL_NEED_PERIOD_S = 1;
+/**
+ * Задание: насколько вперёд по маршруту смотреть на рельеф, м, и насколько можно отстать от нужной
+ * высоты, прежде чем уйти в набор по кругу, м.
+ */
+const AUTO_LOOKAHEAD_M = 2000;
+const AUTO_ORBIT_SLACK_M = 15;
+/** Над точкой посадки выше высоты обратного перехода больше чем на столько, м, — снижение по кругу на маршевом. */
+const DESCENT_ORBIT_SLACK_M = 40;
 
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 const wrap180 = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
@@ -510,6 +518,8 @@ export interface FlightSetup {
   relays?: readonly Relay[];
   /** Параметры радиолинии вместо RADIO (для тестов). */
   radio?: Partial<RadioParams>;
+  /** Реакция на потерю связи с НСУ; по умолчанию — ВОЗВРАТ через LINK_TIMEOUT_S. */
+  linkLoss?: { action: LinkLossAction; timeoutS: number };
 }
 
 export class LiveFlight {
@@ -665,6 +675,7 @@ export class LiveFlight {
   constructor(setup: FlightSetup) {
     const { plan } = setup;
     this.site = setup.origin ?? plan.takeoff;
+    if (setup.linkLoss) this.linkLoss = { ...setup.linkLoss };
     this.homeSite = setup.home ?? plan.landing;
     this.terrain = setup.terrain;
     this.weather = setup.weather;
@@ -1273,14 +1284,38 @@ export class LiveFlight {
     }
   }
 
-  /** Без связи LINK_TIMEOUT_S — типовая реакция автопилота: ВОЗВРАТ. */
+  /** Реакция на потерю связи (задаётся в задании) и потеря связи, на которую она уже сработала. */
+  private linkLoss: { action: LinkLossAction; timeoutS: number } = { action: 'rtl', timeoutS: LINK_TIMEOUT_S };
+  private linkActedAt = -1;
+
+  /**
+   * Без связи linkLoss.timeoutS — реакция по настройке, один раз на каждую потерю связи:
+   * ВОЗВРАТ; продолжать задание (оно на борту; из ручных режимов — ВОЗВРАТ: задание прервано);
+   * посадка на месте (в самолётном режиме — торможение по курсу, над точкой носом против ветра).
+   */
   private linkTimeout() {
     const s = this.state;
-    if (s.t - this.linkLostT < LINK_TIMEOUT_S) return;
-    if (['auto', 'guided', 'hold', 'manual'].includes(s.mode)) {
-      this.events.push({ t: s.t, text: `Нет связи ${LINK_TIMEOUT_S} с — ВОЗВРАТ` });
+    const { action, timeoutS } = this.linkLoss;
+    if (s.t - this.linkLostT < timeoutS || this.linkActedAt === this.linkLostT) return;
+    if (s.mode === 'transition') {
+      // Переход не прерывается: после него — ВОЗВРАТ; продолжение и посадка — когда выйдем в самолётный режим.
+      if (action === 'rtl') this.afterTransition = 'rtl';
+      return;
+    }
+    const manualModes = ['guided', 'hold', 'manual'];
+    if (s.mode !== 'auto' && !manualModes.includes(s.mode)) return;
+    this.linkActedAt = this.linkLostT;
+    if (action === 'rtl' || (action === 'continue' && manualModes.includes(s.mode))) {
+      this.events.push({ t: s.t, text: `Нет связи ${timeoutS} с — ВОЗВРАТ` });
       this.startRtl();
-    } else if (s.mode === 'transition') this.afterTransition = 'rtl';
+    } else if (action === 'continue') {
+      this.events.push({ t: s.t, text: `Нет связи ${timeoutS} с — продолжаю задание` });
+    } else {
+      this.events.push({ t: s.t, text: `Нет связи ${timeoutS} с — посадка на месте` });
+      this.landAt = null;
+      this.hoverHeadingDeg = s.wind.fromDeg;
+      this.setMode('backtransition');
+    }
   }
 
   /**
@@ -1454,7 +1489,81 @@ export class LiveFlight {
     return top + margin;
   }
 
+  /**
+   * Задание: набор высоты по кругу над местом — центр круга и высота, до которой набирать. Высота
+   * запоминается при входе: на дальней от склона стороне круга нужная высота «уменьшается», и без
+   * этого аппарат выходил бы из круга раньше времени.
+   */
+  private autoClimb: { east: number; north: number; up: number } | null = null;
+  private autoNeedCache = { t: -Infinity, up: -Infinity };
+
+  /**
+   * Задание: высота, нужная сейчас, чтобы дальше по маршруту (AUTO_LOOKAHEAD_M) пройти рельеф с
+   * запасом minClearanceM, если набирать с той скоростью, что выходит на самом деле: предельная
+   * Vz минус нисходящий поток у склона, на нынешней путевой. План считает набор без потоков.
+   */
+  private autoNeed(nav: { east: number; north: number }, credit = 1): number {
+    const c = this.autoNeedCache;
+    const s = this.state;
+    if (credit === 1 && s.t - c.t < RTL_NEED_PERIOD_S) return c.up;
+    const climb = Math.max(0.3, AIRCRAFT.planeClimbRateMaxMs + Math.min(0, this.upflowMs));
+    const grad = (credit * climb) / Math.max(10, s.groundSpeedMs);
+    let need = -Infinity;
+    let dist = 0;
+    let p = { east: nav.east, north: nav.north };
+    for (let k = s.wp; k < this.path.length && dist < AUTO_LOOKAHEAD_M; k++) {
+      const q = this.path[k]!;
+      const len = Math.hypot(q.east - p.east, q.north - p.north);
+      const n = Math.max(1, Math.ceil(len / 50));
+      for (let i = 1; i <= n; i++) {
+        const x = dist + (len * i) / n;
+        if (x > AUTO_LOOKAHEAD_M) break;
+        const f = i / n;
+        need = Math.max(need, this.groundUp(p.east + (q.east - p.east) * f, p.north + (q.north - p.north) * f) + AIRCRAFT.minClearanceM - grad * x);
+      }
+      dist += len;
+      p = q;
+    }
+    if (credit === 1) this.autoNeedCache = { t: s.t, up: need };
+    return need;
+  }
+
+  /** Снижение по кругу над точкой посадки на маршевом — центр круга (точка посадки). */
+  private descentOrbit: { east: number; north: number } | null = null;
+
+  /**
+   * Над точкой посадки выше высоты обратного перехода больше чем на DESCENT_ORBIT_SLACK_M (пришли
+   * из-за хребта, после набора по кругу) — сначала снижение по кругу над ней на маршевом:
+   * снижаться на роторах с сотен метров — минуты висения, это батарея. true — ещё снижаемся.
+   */
+  private descendFirst(p: { east: number; north: number }): boolean {
+    const s = this.state;
+    const floor = this.groundUp(p.east, p.north) + VT.backTransitionHeightM;
+    if (this.descentOrbit) {
+      if (s.up > floor + 10) return true;
+      this.descentOrbit = null;
+      this.events.push({ t: s.t, text: 'Снижение по кругу закончено — посадочная прямая' });
+      return false;
+    }
+    if (s.up <= floor + DESCENT_ORBIT_SLACK_M) return false;
+    this.descentOrbit = { east: p.east, north: p.north };
+    this.events.push({ t: s.t, text: `Снижение по кругу над точкой посадки до ${Math.round(this.site.elevationM + floor)} м — высоко для обратного перехода` });
+    return true;
+  }
+
+  /** Центр круга набора — под уклон от места: весь круг над рельефом не выше здешнего, а не в склон. */
+  private downslopeCenter(nav: { east: number; north: number }, r: number): { east: number; north: number } {
+    const ge = this.groundUp(nav.east + 100, nav.north) - this.groundUp(nav.east - 100, nav.north);
+    const gn = this.groundUp(nav.east, nav.north + 100) - this.groundUp(nav.east, nav.north - 100);
+    const gl = Math.hypot(ge, gn);
+    return gl > 1 ? { east: nav.east - (ge / gl) * r, north: nav.north - (gn / gl) * r } : { east: nav.east, north: nav.north };
+  }
+
   private setMode(m: LiveMode, text?: string) {
+    // Набор по кругу — только в задании: ВОЗВРАТ и прочие режимы ведут высоту сами.
+    if (m !== 'auto') this.autoClimb = null;
+    // Снижение по кругу — до смены режима: обратный переход, ВОЗВРАТ и прочие начинают с чистого листа.
+    this.descentOrbit = null;
     // Моторы встали в воздухе: запомнить, откуда, — туда и вернуться после запуска; маршевый стоит.
     if (m === 'falling' && this.state.mode !== 'falling') {
       this.stoppedFrom = this.resumeTarget();
@@ -2470,7 +2579,8 @@ export class LiveFlight {
     if (s.mode === 'auto') {
       let a = this.path[s.wp - 1]!;
       let b = this.path[s.wp]!;
-      for (;;) {
+      // Пока набираем высоту по кругу — точка маршрута та же.
+      while (!this.autoClimb) {
         const len = Math.hypot(b.east - a.east, b.north - a.north);
         const along = len > 0 ? ((nav.east - a.east) * (b.east - a.east) + (nav.north - a.north) * (b.north - a.north)) / len : 0;
         const next = this.path[s.wp + 1];
@@ -2491,7 +2601,7 @@ export class LiveFlight {
       const lastIdx = this.path.length - 1;
       const onFinal = s.wp === lastIdx || (this.finalLeg !== undefined && b.routeLeg === this.finalLeg);
       const toLanding = Math.hypot(this.landing.east - nav.east, this.landing.north - nav.north);
-      if (onFinal && (toLanding <= pusherOff || (s.wp === lastIdx && along >= len))) {
+      if (onFinal && (toLanding <= pusherOff || (s.wp === lastIdx && along >= len)) && !this.descendFirst(this.landing)) {
         this.landAt = { east: this.landing.east, north: this.landing.north };
         this.hoverHeadingDeg = bearing(this.path[lastIdx - 1] ?? a, this.path[lastIdx]!);
         this.setMode('backtransition', 'Посадочная прямая — маршевый выключен');
@@ -2501,6 +2611,30 @@ export class LiveFlight {
       const xte = de * (nav.north - a.north) - dn * (nav.east - a.east);
       track = norm360(bearing(a, b) + clamp(Math.atan2(xte, 60) / RAD, -45, 45));
       alt = a.up + (b.up - a.up) * clamp(along / (len || 1), 0, 1);
+      // Не успеваем набрать к склону впереди (нисходящий поток у склона, встречный ветер) — набор
+      // высоты по кругу над местом, как на ВОЗВРАТЕ; набрали — дальше по маршруту.
+      const orbitR = Math.max(1.3 * R, 150);
+      if (!this.autoClimb) {
+        const need = this.autoNeed(nav);
+        // Ниже нужной для склона впереди не снижаемся: иначе набранное на кругу терялось бы, едва
+        // вернувшись на маршрут к высоте плана, — и снова круг, и так до склона.
+        alt = Math.max(alt, need);
+        if (s.up < need - AUTO_ORBIT_SLACK_M) {
+          // Набирать — с запасом вдвое больше допуска: круг под уклон, выход с него не ближе к склону.
+          // И до высоты, с которой хватит половины расчётного набора по пути: у склона нисходящий
+          // поток бывает сильнее, чем здесь, — иначе круг за кругом по 30 м.
+          this.autoClimb = { ...this.downslopeCenter(nav, orbitR), up: Math.max(need, this.autoNeed(nav, 0.5)) + 2 * AUTO_ORBIT_SLACK_M };
+          this.events.push({ t: s.t, text: `Набор высоты по кругу до ${Math.round(this.site.elevationM + this.autoClimb.up)} м — впереди склон круче, чем успеваю набрать` });
+        }
+      } else if (s.up >= this.autoClimb.up) {
+        this.autoClimb = null;
+        this.autoNeedCache.t = -Infinity;
+        this.events.push({ t: s.t, text: 'Высота набрана — продолжаю маршрут' });
+      }
+      if (this.autoClimb) {
+        track = this.orbitTrack(this.autoClimb, orbitR);
+        alt = Math.max(this.autoClimb.up + 10, this.terrainFollow(RTL_CLEARANCE_M, track, tas));
+      }
       s.routeLeg = b.routeLeg ?? null;
     } else if (s.mode === 'guided' || s.mode === 'hold') {
       const center = s.mode === 'hold' ? this.home : (c.target ?? { east: nav.east, north: nav.north });
@@ -2544,12 +2678,17 @@ export class LiveFlight {
         const approachAgl = [Math.min(c.heightAglM, 150), 100, VT.backTransitionHeightM][this.rtlStage]!;
         const floor = this.rtlStage === 2 ? VT.backTransitionHeightM - 5 : RTL_CLEARANCE_M;
         alt = Math.max(this.groundUp(target.east, target.north) + approachAgl, need, this.terrainFollow(floor, track, tas));
-        if (this.rtlStage === 2 && d <= pusherOff) {
+        if (this.rtlStage === 2 && d <= pusherOff && !this.descendFirst(this.home)) {
           this.landAt = { east: this.home.east, north: this.home.north };
           this.setMode('backtransition', 'Посадочная прямая — маршевый выключен');
           return this.brake(h, rho, hoverPowerW(this.mass, rho));
         }
       }
+    }
+    // Снижение по кругу над точкой посадки на маршевом (descendFirst) — и в задании, и на ВОЗВРАТЕ.
+    if (this.descentOrbit && (s.mode === 'auto' || s.mode === 'rtl')) {
+      track = this.orbitTrack(this.descentOrbit, Math.max(1.3 * R, 150));
+      alt = Math.max(this.groundUp(this.descentOrbit.east, this.descentOrbit.north) + VT.backTransitionHeightM, this.terrainFollow(AIRCRAFT.minClearanceM, track, tas));
     }
 
     // Автопилот держит уставку по показаниям ПВД: при отказе — не ту скорость, что задана.

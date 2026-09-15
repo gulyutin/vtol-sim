@@ -1,8 +1,9 @@
 import { PROFILE } from '@profile';
 import { AIRCRAFT } from '../sim/aircraft';
 import { airDensity, G, tasFromIas } from '../sim/atmosphere';
-import { distanceM } from '../sim/mission';
-import { roundSharpCorners } from '../sim/dubins';
+import { distanceM, fromLocal, toLocal } from '../sim/mission';
+import { roundSharpCorners, type LegPart } from '../sim/dubins';
+import { LINK_TIMEOUT_S, type LinkLossAction } from '../sim/failures';
 import { CAMERAS } from '../sim/payload';
 import { windProcedures, type WindProcedures } from '../sim/procedures';
 import { heightForGsdM, planSurvey, type SurveyCamera, type SurveyParams, type SurveyPlan } from '../sim/survey';
@@ -34,6 +35,9 @@ export interface Settings {
   temperatureC: number;
   /** Местное время вылета, ч — для Солнца и освещённости. */
   localHour: number;
+  /** Потеря связи с НСУ: что делает автопилот и через сколько секунд без связи. */
+  linkLossAction: LinkLossAction;
+  linkLossTimeoutS: number;
 }
 
 export type ScenarioKind = 'transfer' | 'survey' | 'delivery' | 'route' | 'search';
@@ -147,6 +151,8 @@ export function buildScenarios(L: LocationSpec): Scenario[] {
     windFromDeg: L.windFromDeg,
     temperatureC: L.temperatureC,
     localHour: L.localHour ?? 11,
+    linkLossAction: 'rtl',
+    linkLossTimeoutS: LINK_TIMEOUT_S,
   };
   const list: Scenario[] = [
     {
@@ -297,6 +303,10 @@ const TAKEOFF_LEG = 'Взлётный маршрут: разгон против 
 const MAX_EXTRA_VERTICAL_M = 200;
 /** Запас к минимальной высоте над рельефом: профиль строится по точкам через 100 м, а между ними рельеф бывает выше, м. */
 const BETWEEN_SAMPLES_M = 15;
+/** Не хватает высоты меньше этого, м, — без кругов над площадкой: разница в пределах допуска автопилота. */
+const LOOP_MIN_SHORT_M = 15;
+/** Больше кругов над площадкой не ставим: дальше пусть покажет проверка запаса высоты. */
+const MAX_LOOPS = 30;
 
 /**
  * Радиус разворота — по наибольшей путевой скорости (по ветру) с 10 % запаса, иначе на
@@ -310,10 +320,50 @@ function turnRadius(tas: number, windMs: number): number {
 /** Высота над рельефом по узлам маршрута, между узлами — линейно. */
 const byNodes = (heights: number[]) => (leg: number, f: number) => heights[leg]! + (heights[leg + 1]! - heights[leg]!) * f;
 
+/** Витки радиуса r вокруг c, точки через ~15 м; начало и конец — со стороны towards. */
+function orbitAround(c: GeoPoint, towards: GeoPoint, r: number, turns: number): GeoPoint[] {
+  const t = toLocal(c, towards);
+  const a0 = Math.atan2(t.north, t.east);
+  const steps = Math.ceil((2 * Math.PI * r) / 15) * turns;
+  return Array.from({ length: steps + 1 }, (_, k) => {
+    const a = a0 + (2 * Math.PI * turns * k) / steps;
+    return fromLocal(c, Math.cos(a) * r, Math.sin(a) * r);
+  });
+}
+
+/**
+ * Маршрут со скруглёнными углами и кругами над площадками: набор — после взлётного разгона
+ * (base[1]), снижение — перед посадочным маршрутом (base[n − 3]). Номера исходных участков (parts)
+ * те же, что без кругов: набор — часть взлётного участка, снижение — последнего участка оператора.
+ */
+function withOrbits(base: GeoPoint[], radiusM: number, loops: { start: number; end: number }): { points: GeoPoint[]; parts: LegPart[] } {
+  const pts: GeoPoint[] = [];
+  // Исходный участок и доли пути по нему — для каждого отрезка pts[k] → pts[k + 1].
+  const seg: LegPart[] = [];
+  const add = (p: GeoPoint, part: LegPart) => {
+    if (pts.length) seg.push(part);
+    pts.push(p);
+  };
+  const approach = base.length - 3;
+  base.forEach((p, k) => {
+    if (k === approach && loops.end > 0) for (const q of orbitAround(base[base.length - 1]!, base[k - 1]!, radiusM, loops.end)) add(q, { leg: k - 1, f0: 0, f1: 0 });
+    add(p, { leg: k - 1, f0: 0, f1: 1 });
+    if (k === 1 && loops.start > 0) for (const q of orbitAround(base[0]!, base[2]!, radiusM, loops.start)) add(q, { leg: 0, f0: 1, f1: 1 });
+  });
+  const r = roundSharpCorners(pts, radiusM);
+  const parts = r.parts.map((p) => {
+    const s = seg[p.leg]!;
+    return { leg: s.leg, f0: s.f0 + (s.f1 - s.f0) * p.f0, f1: s.f0 + (s.f1 - s.f0) * p.f1 };
+  });
+  return { points: r.points, parts };
+}
+
 /**
  * Полёт по точкам оператора с огибанием рельефа. Маршрут по РЛЭ: взлётный (разгон против ветра
  * к точке в 300 м), точки оператора, посадочный (три точки против ветра, последняя — площадка).
- * Высота над рельефом своя у каждой точки, между точками — плавно.
+ * Высота над рельефом своя у каждой точки, между точками — плавно. Если склон за площадкой круче,
+ * чем успеваем набрать по пути (или перед посадкой — снизиться), — круги над площадкой: без них
+ * профиль прошёл бы ниже заданной высоты, а то и сквозь склон.
  */
 function routeStage(
   from: Site,
@@ -333,11 +383,32 @@ function routeStage(
   const mean = heights.reduce((a, b) => a + b, 0) / heights.length;
   const tas = tasFromIas(s.iasMs, airDensity({ altitudeM: from.elevationM + mean, temperatureC: weather.groundTemperatureC }));
   const wind = windAt(weather, mean);
-  const rounded = roundSharpCorners([from, proc.departure, ...points, proc.approach[0], proc.approach[1], to], turnRadius(tas, wind.speedMs));
-  const follow = { heightAglM: byNodes(heights), groundSpeedMs: (track: number) => windTriangle(tas, track, wind)?.groundSpeedMs ?? tas, stepM: 100, parts: rounded.parts };
-  const ends = terrainEndAltitudes(rounded.points, terrain, from.elevationM + VT.transitionHeightM, to.elevationM + VT.backTransitionHeightM, CLIMB(), DESCENT(), follow, AIRCRAFT.minClearanceM + BETWEEN_SAMPLES_M, MAX_EXTRA_VERTICAL_M);
-  const waypoints = followTerrain(rounded.points, terrain, ends.startAltitudeM, ends.endAltitudeM, CLIMB(), DESCENT(), follow);
+  const radius = turnRadius(tas, wind.speedMs);
+  const base = [from, proc.departure, ...points, proc.approach[0], proc.approach[1], to];
   const userLegs = points.length + 1;
+  // Круги — чтобы от первой точки оператора до последней нигде не пройти ниже половины заданной
+  // высоты над рельефом: добрать до полной по пути — обычное дело, а сквозь склон — нет. Разгон
+  // после взлёта и снижение к посадке — без этого требования.
+  const hold = (leg: number, f: number) => (leg + f >= 2 && leg + f <= userLegs ? byNodes(heights)(leg, f) / 2 : 0);
+  const loops = { start: 0, end: 0 };
+  const build = () => {
+    const r = withOrbits(base, radius, loops);
+    const follow = { heightAglM: byNodes(heights), groundSpeedMs: (track: number) => windTriangle(tas, track, wind)?.groundSpeedMs ?? tas, stepM: 100, parts: r.parts };
+    const ends = terrainEndAltitudes(r.points, terrain, from.elevationM + VT.transitionHeightM, to.elevationM + VT.backTransitionHeightM, CLIMB(), DESCENT(), follow, AIRCRAFT.minClearanceM + BETWEEN_SAMPLES_M, MAX_EXTRA_VERTICAL_M, hold);
+    return { points: r.points, follow, ends };
+  };
+  // Витков — сколько не хватает высоты, делённое на набор (снижение) за виток.
+  const turnsFor = (shortM: number, rateMs: number) => (shortM > LOOP_MIN_SHORT_M ? Math.ceil(shortM / ((rateMs * 2 * Math.PI * radius) / tas)) : 0);
+  let route = build();
+  for (let pass = 0; pass < 4; pass++) {
+    const start = Math.min(MAX_LOOPS, loops.start + turnsFor(route.ends.startShortM, CLIMB()));
+    const end = Math.min(MAX_LOOPS, loops.end + turnsFor(route.ends.endShortM, DESCENT()));
+    if (start === loops.start && end === loops.end) break;
+    Object.assign(loops, { start, end });
+    route = build();
+  }
+  const { ends } = route;
+  const waypoints = followTerrain(route.points, terrain, ends.startAltitudeM, ends.endAltitudeM, CLIMB(), DESCENT(), route.follow);
   return {
     plan: {
       takeoff: from,
@@ -349,8 +420,8 @@ function routeStage(
       payload,
       terrain,
       legLabels: [
-        TAKEOFF_LEG,
-        ...Array.from({ length: userLegs }, (_, i) => label(i, userLegs)),
+        loops.start ? `${TAKEOFF_LEG}, набор высоты по кругу над площадкой` : TAKEOFF_LEG,
+        ...Array.from({ length: userLegs }, (_, i) => label(i, userLegs) + (loops.end && i === userLegs - 1 ? ', снижение по кругу над площадкой посадки' : '')),
         `Посадочный маршрут${landingName}: выравнивание`,
         `Посадочный маршрут${landingName}: на точку посадки`,
       ],

@@ -37,8 +37,26 @@ export interface FailureInfo {
   rleActions: string[];
 }
 
-/** Без связи с НСУ столько секунд — автопилот уходит на ВОЗВРАТ. */
+/** Без связи с НСУ столько секунд — автопилот уходит на ВОЗВРАТ (по умолчанию; настраивается в задании). */
 export const LINK_TIMEOUT_S = 30;
+
+/**
+ * Что делает автопилот, когда связи с НСУ нет дольше заданного: rtl — ВОЗВРАТ; continue —
+ * продолжает задание (оно уже на борту) и садится по плану; land — садится на месте.
+ */
+export type LinkLossAction = 'rtl' | 'continue' | 'land';
+
+export const LINK_LOSS_ACTIONS: readonly { id: LinkLossAction; title: string }[] = [
+  { id: 'rtl', title: 'ВОЗВРАТ домой' },
+  { id: 'continue', title: 'Продолжать задание' },
+  { id: 'land', title: 'Посадка на месте' },
+];
+
+/** Что сделает автопилот без связи — одной фразой для подсказок и тревог. */
+export function linkLossText(action: LinkLossAction, timeoutS: number): string {
+  const what = action === 'rtl' ? 'уходит на ВОЗВРАТ' : action === 'continue' ? 'продолжает задание и садится по плану' : 'садится на месте';
+  return `через ${timeoutS} с без связи автопилот ${what}`;
+}
 /** Через столько секунд после возгорания отказывает питание. */
 export const FIRE_TO_POWER_S = 60;
 /**

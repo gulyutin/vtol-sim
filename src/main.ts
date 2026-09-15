@@ -25,7 +25,7 @@ import { FlightRecorder, poseOf, stateAt, type Recording } from './game/recorder
 import { assessFlight, FAILURE_TITLES, findDifficulty, planFailures, saveResult, type Assessment, type DifficultyId, type FailureEvent } from './game/scoring';
 import { Debrief, openRecordingFiles } from './ui/debrief';
 import { PilotInput } from './ui/pilotInput';
-import { failureInfo, LINK_TIMEOUT_S, type FailureId } from './sim/failures';
+import { failureInfo, linkLossText, type FailureId } from './sim/failures';
 import type { Alert } from './ui/gcs';
 import { AIRCRAFT } from './sim/aircraft';
 import { LiveFlight, MODE_NAMES, type Controls } from './sim/flight';
@@ -887,6 +887,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       gcs: siteA,
       relays,
       terrainWind: windActual ?? undefined,
+      linkLoss: { action: settings.linkLossAction, timeoutS: settings.linkLossTimeoutS },
     });
     trigger = mission.survey && mission.camera && mission.params ? new FrameTrigger(mission.camera, mission.params, captureContext()) : null;
     callouts.setRoute(routeInfo(i));
@@ -1473,7 +1474,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
         airborne() && tele.groundSpeedMs > 3 ? fromLocal(siteA, tele.east + Math.sin(tr) * ahead, tele.north + Math.cos(tr) * ahead) : undefined,
       );
       const alerts: Alert[] = [];
-      if (s.linkLost) alerts.push({ level: 'bad', text: `НЕТ СВЯЗИ с бортом ${fmtTime(s.t - tele.t)} — через ${LINK_TIMEOUT_S} с без связи автопилот уходит на ВОЗВРАТ` });
+      if (s.linkLost) alerts.push({ level: 'bad', text: `НЕТ СВЯЗИ с бортом ${fmtTime(s.t - tele.t)} — ${linkLossText(settings.linkLossAction, settings.linkLossTimeoutS)}` });
       for (const id of s.failures) {
         const f = failureInfo(id);
         alerts.push({ level: 'bad', text: `ОТКАЗ: ${f.title}`, actions: f.rleActions });

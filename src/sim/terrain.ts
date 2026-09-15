@@ -123,7 +123,11 @@ function sampleRoute(points: GeoPoint[], climbRateMs: number, descentRateMs: num
  * поднимается быстрее предельного набора (или перед площадкой посадки — быстрее предельного
  * снижения), профиль followTerrain прошёл бы ниже рельефа. Тогда переход в самолётный режим
  * выше: вертикальный набор (снижение) на роторах длиннее — но не больше maxExtraM сверх
- * startAltitudeM и endAltitudeM; остальное покажет проверка запаса высоты в simulateMission.
+ * startAltitudeM и endAltitudeM.
+ *
+ * startShortM и endShortM — на сколько и так не хватает, чтобы пройти весь маршрут не ниже
+ * holdAglM над рельефом (по умолчанию — o.heightAglM; и не ниже clearanceM): столько надо набрать
+ * (снизиться) по кругу над площадкой, иначе профиль пройдёт ниже или сквозь склон.
  */
 export function terrainEndAltitudes(
   points: GeoPoint[],
@@ -135,23 +139,35 @@ export function terrainEndAltitudes(
   o: TerrainFollowing,
   clearanceM: number,
   maxExtraM: number,
-): { startAltitudeM: number; endAltitudeM: number } {
+  holdAglM: TerrainFollowing['heightAglM'] = o.heightAglM,
+): { startAltitudeM: number; endAltitudeM: number; startShortM: number; endShortM: number } {
   const samples = sampleRoute(points, climbRateMs, descentRateMs, o);
   const last = samples.length - 1;
-  if (last < 2) return { startAltitudeM, endAltitudeM };
+  if (last < 2) return { startAltitudeM, endAltitudeM, startShortM: 0, endShortM: 0 };
   const dd = (i: number) => samples[i + 1]!.d - samples[i]!.d;
-  const req = (i: number) => terrain.elevationM(samples[i]!) + clearanceM;
-  // Наименьшая высота в точке i, с которой набором не круче предельного проходим над всеми следующими.
-  let start = -Infinity;
-  for (let i = last - 1; i >= 1; i--) start = Math.max(req(i), start - samples[i + 1]!.climb * dd(i));
-  start -= samples[1]!.climb * dd(0);
+  const ground = samples.map((s) => terrain.elevationM(s));
+  const req = (i: number) => ground[i]! + clearanceM;
+  const hold = (s: RouteSample) => (typeof holdAglM === 'number' ? holdAglM : holdAglM(s.leg, s.f));
+  const want = (i: number) => Math.max(req(i), ground[i]! + hold(samples[i]!));
+  // Наименьшая высота над площадкой взлёта, с которой набором не круче предельного проходим над всеми точками на h(i).
+  const startFor = (h: (i: number) => number) => {
+    let v = -Infinity;
+    for (let i = last - 1; i >= 1; i--) v = Math.max(h(i), v - samples[i + 1]!.climb * dd(i));
+    return v - samples[1]!.climb * dd(0);
+  };
   // То же к площадке посадки — со снижением не круче предельного.
-  let end = -Infinity;
-  for (let i = 1; i <= last - 1; i++) end = Math.max(req(i), end - samples[i]!.descent * dd(i - 1));
-  end -= samples[last]!.descent * dd(last - 1);
+  const endFor = (h: (i: number) => number) => {
+    let v = -Infinity;
+    for (let i = 1; i <= last - 1; i++) v = Math.max(h(i), v - samples[i]!.descent * dd(i - 1));
+    return v - samples[last]!.descent * dd(last - 1);
+  };
+  const start = Math.min(startAltitudeM + maxExtraM, Math.max(startAltitudeM, startFor(req)));
+  const end = Math.min(endAltitudeM + maxExtraM, Math.max(endAltitudeM, endFor(req)));
   return {
-    startAltitudeM: Math.min(startAltitudeM + maxExtraM, Math.max(startAltitudeM, start)),
-    endAltitudeM: Math.min(endAltitudeM + maxExtraM, Math.max(endAltitudeM, end)),
+    startAltitudeM: start,
+    endAltitudeM: end,
+    startShortM: Math.max(0, startFor(want) - start),
+    endShortM: Math.max(0, endFor(want) - end),
   };
 }
 
