@@ -11,6 +11,7 @@ import type { Zone } from '../sim/zones';
 import { OPEN_METEO_ATTRIBUTION, type AbortSignalLike, type HourlyWeather } from './liveWeather';
 import { linkCheck, preflightChecks, zoneChecks, type Check } from './preflight';
 import { atDeparture, buildMission, departure, findCamera, type Mission, type Scenario, type Settings } from './scenarios';
+import { contrastFactor, thermalContrastK } from './search';
 import { PRECIPITATION_NAME } from './weather';
 
 /*
@@ -373,6 +374,17 @@ function evaluateHour(ctx: Context, hw: HourlyWeather): Evaluated {
     const iso = isoNeeded(mission.camera, 1 / s.shutter, illuminanceLux(darkest, w.cloudCover ?? sc.cloudCover));
     if (iso > mission.camera.isoMax) add(checks, 'block', `Мало света для съёмки: Солнце на ${fmt(darkest)}°, нужна ISO ${fmt(Math.round(iso / 10) * 10)} при выдержке 1/${s.shutter} — камера годна до ISO ${fmt(mission.camera.isoMax)}`);
   } else if (darkest < DARK_SUN_DEG) add(cautions, 'warn', `Темно: Солнце на ${fmt(-darkest)}° под горизонтом — визуального контроля борта не будет`);
+  // Поиск тепловизором: в жаркий солнечный день человек почти не теплее прогретой земли.
+  if (sc.kind === 'search') {
+    const sunHigh = Math.max(sunTakeoff, sunLanding);
+    const dT = thermalContrastK('person', { airTemperatureC: w.groundTemperatureC, sunElevationDeg: sunHigh, cloudCover: w.cloudCover ?? sc.cloudCover });
+    if (contrastFactor(dT) < 0.5)
+      add(
+        cautions,
+        'warn',
+        `Слабый тепловой контраст: человек ${dT >= 0 ? 'теплее' : 'холоднее'} фона всего на ${fmt(Math.abs(dT), 1)} K (воздух ${fmt(w.groundTemperatureC)} °C, Солнце на ${fmt(sunHigh)}°) — на прогретой земле люди теряются, лучше утром, вечером или ночью`,
+      );
+  }
 
   // Энергия: не хватает — нельзя; впритык — ошибка прогноза ветра съест запас.
   const energy: ForecastEnergy = {

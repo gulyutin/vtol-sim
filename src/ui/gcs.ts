@@ -841,6 +841,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         }
         ${sc.kind === 'transfer' ? '<details open><summary>Пункт «Б»</summary><p class="hint">Точку «Б» можно перетащить на карте до взлёта; посадка — в «Б». Промежуточные точки — в маршруте ниже, заход на посадку строится по ветру.</p></details>' : ''}
         ${sc.kind === 'delivery' ? `<details open><summary>Груз</summary>${range('cargoKg', 'Масса груза', 0, 2, 0.1, s.cargoKg)}<p class="hint">Пункт «Б» можно перетащить на карте. Обратный путь — те же точки в обратном порядке.</p></details>` : ''}
+        ${sc.kind === 'search' ? '<details open><summary>Поиск тепловизором</summary><p class="hint">Галсы над районом поиска построены по полосе тепловизора; точки маршрута можно менять. В полёте внизу 3D-вида — окно тепловизора: щелчок по тёплому пятну ставит на земле отметку «здесь человек». Звери тоже тёплые: медведь крупный и приземистый, волки ходят стаей, лось высокий, на длинных ногах.</p></details>' : ''}
         ${survey ? '' : '<details open><summary>Маршрут</summary><div class="route-box"></div></details>'}
         <details open><summary>Полёт</summary>
           ${range('iasMs', 'Скорость (приборная)', 15, 28, 0.5, s.iasMs)}

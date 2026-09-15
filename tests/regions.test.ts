@@ -31,7 +31,8 @@ describe('районы', () => {
     expect(new Set(REGIONS.map((r) => r.id)).size).toBe(REGIONS.length);
     expect(REGIONS.length).toBeGreaterThanOrEqual(4);
     for (const r of REGIONS) expect(r.title && r.hint).toBeTruthy();
-    for (const r of REGION_PRESETS.slice(1)) expect(r.osmUrl).toMatch(/\.bin/);
+    // Кутурчин без готового файла: дома и лес собираются в браузере (src/ui/placeOsm.ts).
+    for (const r of REGION_PRESETS.slice(1)) if (r.id !== 'kuturchin') expect(r.osmUrl).toMatch(/\.bin/);
   });
 
   it('без адреса и хранилища (тесты) — домашний район; задания и область — из него', () => {
@@ -65,11 +66,11 @@ describe.each(REGION_PRESETS.map((r) => [r.id, r] as const))('район %s', (i
   const terrain = flatTerrain(siteElevationM(id));
   const scenarios = buildScenarios(L);
 
-  it('четыре задания, первое — перелёт; все точки внутри области не больше 0,3° × 0,5°', () => {
-    expect(scenarios.map((s) => s.kind)).toEqual(['transfer', 'route', 'survey', 'delivery']);
+  it('четыре задания (и поиск, если он есть в районе), первое — перелёт; все точки внутри области не больше 0,3° × 0,5°', () => {
+    expect(scenarios.map((s) => s.kind)).toEqual(['transfer', 'route', 'survey', 'delivery', ...(L.search ? ['search'] : [])]);
     expect(L.region.north - L.region.south).toBeLessThanOrEqual(0.33);
     expect(L.region.east - L.region.west).toBeLessThanOrEqual(0.51);
-    const points = [L.site, L.transfer.destination, L.delivery.destination, ...L.transfer.route, ...L.delivery.route, ...L.route.route, ...L.survey.area];
+    const points = [L.site, L.transfer.destination, L.delivery.destination, ...L.transfer.route, ...L.delivery.route, ...L.route.route, ...L.survey.area, ...(L.search?.area ?? [])];
     for (const p of points) expect(inside(L.region, p), `${p.lat}, ${p.lon}`).toBe(true);
   });
 

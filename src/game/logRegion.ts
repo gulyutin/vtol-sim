@@ -128,9 +128,10 @@ export function regionFromRecording(rec: Recording, terrain?: Terrain): RegionSp
   if (!route.length && farFromSite(farP)) route = [routePoint({ ...farP, up: Math.max(farP.up, 100) })];
 
   // Посадка: последняя точка записи.
+  // Полёт кончился аварией — место падения не пункт Б.
   const last = s[s.length - 1]!;
   const landing = geo(pointOf(last));
-  const landedElsewhere = distanceM(origin, landing) > LANDED_ELSEWHERE_M;
+  const landedElsewhere = last.mode !== 'crashed' && distanceM(origin, landing) > LANDED_ELSEWHERE_M;
   const farGeo = farFromSite(farP) ? geo(farP) : fromLocal(origin, 0, 2000);
   const destination = landedElsewhere ? landing : farGeo;
 

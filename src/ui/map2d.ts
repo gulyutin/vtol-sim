@@ -608,6 +608,26 @@ export class Map2D {
     }).addTo(this.map);
   }
 
+  private searchLayer: L.LayerGroup | null = null;
+
+  /**
+   * Отметки поиска людей: человек найден — зелёная, зверь (ложная тревога) — оранжевая, пусто —
+   * серый ромб; подпись — во всплывающей подсказке. Пусто или null — убрать.
+   */
+  setSearchMarks(marks: readonly { lat: number; lon: number; result: 'person' | 'animal' | 'empty'; label: string }[] | null) {
+    this.searchLayer?.remove();
+    this.searchLayer = null;
+    if (!marks?.length) return;
+    this.searchLayer = L.layerGroup(
+      marks.map((m) =>
+        L.marker(ll(m), {
+          icon: L.divIcon({ className: `search-mark ${m.result}`, html: '<div></div>', iconSize: [18, 18], iconAnchor: [9, 9] }),
+          keyboard: false,
+        }).bindTooltip(m.label, { direction: 'top', offset: [0, -8] }),
+      ),
+    ).addTo(this.map);
+  }
+
   zoom(delta: number) {
     this.map.setZoom(this.map.getZoom() + delta);
   }

@@ -97,4 +97,11 @@ describe('место полёта из бортового журнала', () =>
     delete rec.meta.origin;
     expect(() => regionFromRecording(rec)).toThrow(/места полёта/);
   });
+
+  it('полёт кончился аварией — пункт Б не место падения', () => {
+    const rec = flight(2000, -1500);
+    rec.samples[rec.samples.length - 1]!.mode = 'crashed';
+    const t = regionFromRecording(rec).location.transfer;
+    expect(near(t.destination, fromLocal(ORIGIN, 4000, 4000), 5)).toBe(true);
+  });
 });

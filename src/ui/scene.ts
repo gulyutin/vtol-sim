@@ -14,6 +14,7 @@ import type { GeoPoint, Site, Terrain, Weather } from '../sim/types';
 import type { Zone } from '../sim/zones';
 import { ACTIVE_REGION } from '../game/scenarios';
 import { createAircraft, type AircraftModel } from './aircraftModel';
+import { HEAT_THERMAL_M, HEAT_VIEW_M, HeatBodies, type HeatBody } from './heat';
 import { Landmarks } from './landmarks';
 import { OsmLayer } from './osmLayer';
 import { createGroundStation, createLandingPad, createLandingZone, createVehicle, createWaypointMarker, RotorDust } from './props';
@@ -22,7 +23,10 @@ import { SkyDome } from './skyDome';
 import { fogFor, overcastFactor, Precipitation } from './precipitation';
 import type { Bounds } from './terrainData';
 import { TerrainLod } from './terrainLod';
+import { ThermalView, type ThermalKind } from './thermal';
 import { ZoneWalls } from './zones3d';
+
+export type { HeatBody, HeatKind, HeatPose } from './heat';
 
 /** follow — облёт мышью; chase — за хвостом (тоже можно вращать); pad — с площадки; cinema — смена ракурсов. */
 export type CameraMode = 'follow' | 'chase' | 'tail' | 'pad' | 'cinema';
@@ -81,6 +85,16 @@ function canvasTexture(size: number, draw: (g: CanvasRenderingContext2D) => void
   return tex;
 }
 
+/** Род поверхности частей слоя OpenStreetMap в тепловом кадре — по имени группы (osmLayer.ts). */
+function osmThermalKind(name: string): ThermalKind {
+  if (name.startsWith('osm-conifers') || name.startsWith('osm-broadleaves')) return 'tree';
+  if (name.startsWith('osm-buildings') || name.startsWith('osm-tall')) return 'building';
+  if (name.startsWith('osm-water')) return 'water';
+  if (name.startsWith('osm-roads') || name.startsWith('osm-runways')) return 'road';
+  if (name.startsWith('osm-strips')) return 'terrain';
+  return 'generic';
+}
+
 const CLOUD_VERTEX = `varying vec3 vWorld;
 void main() { vec4 w = modelMatrix * vec4(position, 1.0); vWorld = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }`;
 
@@ -137,6 +151,15 @@ export class World {
   private readonly zoneWalls = new ZoneWalls((e, n) => this.groundAt(e, n));
   private areaLine: THREE.LineLoop | null = null;
   private pads: THREE.Group[] = [];
+  private readonly homePad: THREE.Group;
+  private readonly groundFill: THREE.Mesh;
+  private readonly camp: THREE.Group;
+  /** Люди и звери для поиска тепловизором (heat.ts). */
+  private readonly heat = new HeatBodies((e, n) => this.groundAt(e, n));
+  /** Тепловизор — создаётся при первом кадре (thermal.ts). */
+  private thermal: ThermalView | null = null;
+  private readonly thermalMap = new Map<THREE.Object3D, ThermalKind>();
+  private sunElevationDeg = 30;
   private readonly trail: THREE.Line;
   private trailCount = 0;
   private readonly frameLines: THREE.LineSegments;
@@ -227,8 +250,11 @@ export class World {
     this.frameLines = new THREE.LineSegments(frameGeo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.75, depthWrite: false }));
     this.frameLines.frustumCulled = false;
 
-    this.scene.add(this.lod.group, this.createGroundFill(env.bounds), this.routeGroup, this.markerGroup, this.trail, this.frameLines, this.createPad(0, 0));
-    this.scene.add(this.createWindsock({ east: 8, north: 6 }), this.createCamp(), this.zoneWalls.group);
+    this.groundFill = this.createGroundFill(env.bounds);
+    this.homePad = this.createPad(0, 0);
+    this.camp = this.createCamp();
+    this.scene.add(this.lod.group, this.groundFill, this.routeGroup, this.markerGroup, this.trail, this.frameLines, this.homePad);
+    this.scene.add(this.createWindsock({ east: 8, north: 6 }), this.camp, this.zoneWalls.group, this.heat.group);
     const loc = ACTIVE_REGION.location;
     if (loc.landmarks?.length) {
       this.landmarks = new Landmarks(loc.landmarks, this.site, (e, n) => this.groundAt(e, n), { date: new Date(`${loc.date}T12:00:00Z`), utcOffsetH: loc.utcOffsetH });
@@ -398,6 +424,7 @@ export class World {
   setSun(sun: SunPosition) {
     // Часы на ориентирах идут каждый кадр, небо пересчитывается реже.
     this.landmarks?.setSun(sun);
+    this.sunElevationDeg = sun.elevationDeg;
     if (this.lastSun && Math.abs(this.lastSun.elevationDeg - sun.elevationDeg) < 0.2 && Math.abs(this.lastSun.azimuthDeg - sun.azimuthDeg) < 0.2) return;
     this.lastSun = sun;
     const el = sun.elevationDeg * DEG;
@@ -695,6 +722,7 @@ export class World {
     this.osm?.update(this.camera.position, { time: this.clock, nightFactor: this.nightFactor, wind: this.groundWind });
     this.landmarks?.update(this.nightFactor);
     this.precip.update(dt, this.camera);
+    this.heat.cull(this.camera.position, HEAT_VIEW_M);
     if (post) this.composer.render(dt);
     else this.renderer.render(this.scene, this.camera);
   }
@@ -719,6 +747,96 @@ export class World {
     this.renderer.render(this.scene, cam);
     this.renderer.setScissorTest(false);
     this.renderer.setViewport(0, 0, size.x, size.y);
+  }
+
+  /**
+   * Люди и звери для поиска (heat.ts): создаются, обновляются и убираются по id, ставятся на
+   * рельеф. Звать при каждом изменении — для ходьбы каждый кадр (фаза шага).
+   */
+  setHeatBodies(bodies: readonly HeatBody[]) {
+    this.heat.set(bodies);
+  }
+
+  /**
+   * Окно тепловизора поверх 3D-вида, как renderPip: камера в eye смотрит на look. Звать каждый
+   * кадр после render(). По умолчанию белое — горячее; whiteHot: false — чёрное — горячее.
+   */
+  renderThermal(
+    rect: { right: number; bottom: number; width: number; height: number },
+    eye: LocalPoint,
+    look: LocalPoint,
+    fovDeg: number,
+    up?: THREE.Vector3,
+    opts: { whiteHot?: boolean } = {},
+  ) {
+    const view = (this.thermal ??= new ThermalView(this.renderer));
+    const cam = view.camera;
+    toScene(eye, cam.position);
+    cam.up.copy(up ?? UP);
+    cam.fov = fovDeg;
+    cam.aspect = rect.width / rect.height;
+    cam.updateProjectionMatrix();
+    cam.lookAt(toScene(look, this.tmp));
+    // Нагрев Солнцем: по высоте Солнца (к полудню до ~50° — полный), облачность его режет.
+    const el = this.sunElevationDeg;
+    const solar =
+      THREE.MathUtils.smoothstep(el, -2, 12) * (0.45 + 0.55 * Math.min(1, Math.sin(Math.max(0, el) * DEG) / Math.sin(50 * DEG))) * (1 - 0.65 * this.overcast);
+    // ИК видит сквозь дымку дальше глаза, но дальний контраст всё равно тает.
+    const airRangeM = THREE.MathUtils.clamp((this.scene.fog as THREE.Fog).far * 0.7, 1500, 30000);
+    this.heat.cull(cam.position, HEAT_THERMAL_M);
+    try {
+      view.render(this.scene, this.thermalKinds(), rect, {
+        sunDir: this.sunDir,
+        solar,
+        night: this.nightFactor,
+        overcast: this.overcast,
+        airRangeM,
+        whiteHot: opts.whiteHot ?? true,
+      });
+    } finally {
+      this.heat.cull(this.camera.position, HEAT_VIEW_M);
+    }
+  }
+
+  /**
+   * Точка на рельефе под щелчком в последнем кадре тепловизора: x, y — CSS-пиксели от левого
+   * верхнего угла его окна. null — кадра не было, щелчок вне окна или луч в небо.
+   */
+  thermalPick(xCss: number, yCss: number): LocalPoint | null {
+    return this.thermal?.pick(xCss, yCss, (e, n) => this.groundAt(e, n)) ?? null;
+  }
+
+  /** Род поверхности узлов сцены для тепловизора; потомки наследуют. Прочее — generic. */
+  private thermalKinds(): ReadonlyMap<THREE.Object3D, ThermalKind> {
+    const k = this.thermalMap;
+    k.clear();
+    k.set(this.lod.group, 'terrain').set(this.groundFill, 'terrain');
+    // Свой аппарат камера не видит; линии, подписи, облака, осадки, пыль — не тепловые.
+    const hide: (THREE.Object3D | null)[] = [
+      this.sky.mesh,
+      this.clouds,
+      this.precip.object,
+      this.dust.object,
+      this.blob,
+      this.trail,
+      this.frameLines,
+      this.routeGroup,
+      this.markerGroup,
+      this.zoneWalls.group,
+      this.areaLine,
+      this.coverage,
+      this.aircraft.group,
+    ];
+    for (const o of hide) if (o) k.set(o, 'hide');
+    if (this.osm) for (const c of this.osm.group.children) k.set(c, osmThermalKind(c.name));
+    if (this.landmarks) k.set(this.landmarks.group, 'building');
+    k.set(this.camp, 'machine');
+    for (const pad of [this.homePad, ...this.pads]) {
+      k.set(pad, 'road');
+      for (const c of pad.children) if (c.name === 'landing-zone') k.set(c, 'hide');
+    }
+    k.set(this.heat.group, 'body');
+    return k;
   }
 
   private setFov(fov: number) {

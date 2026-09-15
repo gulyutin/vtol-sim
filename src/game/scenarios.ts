@@ -12,6 +12,7 @@ import type { Relay } from '../sim/radio';
 import type { GeoPoint, MissionPlan, PayloadLoad, Site, Terrain, Weather } from '../sim/types';
 import { windAt, windTriangle } from '../sim/wind';
 import { activeRegion } from './regions';
+import { searchPattern, THERMAL_CAMERA, type AnimalWeights, type ThermalCamera } from './search';
 
 /** То, что игрок выбирает на планировании. Часть полей нужна не всем заданиям. */
 export interface Settings {
@@ -35,7 +36,7 @@ export interface Settings {
   localHour: number;
 }
 
-export type ScenarioKind = 'transfer' | 'survey' | 'delivery' | 'route';
+export type ScenarioKind = 'transfer' | 'survey' | 'delivery' | 'route' | 'search';
 
 export type { RoutePoint };
 
@@ -92,7 +93,27 @@ export interface TransferScenario extends ScenarioBase {
   route: RoutePoint[];
 }
 
-export type Scenario = TransferScenario | SurveyScenario | DeliveryScenario | RouteScenario;
+/**
+ * Поиск людей тепловизором (src/game/search.ts): облёт по точкам, как маршрут, — по умолчанию
+ * галсы над районом поиска; взлёт и посадка на площадке.
+ */
+export interface SearchScenario extends ScenarioBase {
+  kind: 'search';
+  /** Район поиска — многоугольник. */
+  area: GeoPoint[];
+  route: RoutePoint[];
+  camera: ThermalCamera;
+  /** Высота галсов по умолчанию над рельефом, м, и наклон подвеса (угол оси ниже горизонта), °. */
+  heightAglM: number;
+  tiltDeg: number;
+  /** Веса видов зверей района; нет — обычная тайга. */
+  animals?: AnimalWeights;
+}
+
+export type Scenario = TransferScenario | SurveyScenario | DeliveryScenario | RouteScenario | SearchScenario;
+
+/** Высота поиска по умолчанию над рельефом, м: со 100 м полоса тепловизора под 45° — 84 м. */
+const SEARCH_HEIGHT_AGL_M = 100;
 
 /** Брифинг и ретрансляторы района одной фразой. */
 export function withRelays(briefing: string, relays: readonly Relay[] = []): string {
@@ -127,7 +148,7 @@ export function buildScenarios(L: LocationSpec): Scenario[] {
     temperatureC: L.temperatureC,
     localHour: L.localHour ?? 11,
   };
-  return [
+  const list: Scenario[] = [
     {
       ...common,
       id: 'transfer',
@@ -173,6 +194,28 @@ export function buildScenarios(L: LocationSpec): Scenario[] {
       defaults: { ...defaults },
     },
   ];
+  if (L.search) {
+    // Галсы по умолчанию: высота SEARCH_HEIGHT_AGL_M, радиус разворота — по крейсерской скорости
+    // (истинная у земли ≈ приборная + 5 %) и ветру по умолчанию.
+    const camera = THERMAL_CAMERA;
+    const heightAglM = Math.max(SEARCH_HEIGHT_AGL_M, AIRCRAFT.minClearanceM + 50);
+    const pattern = searchPattern(L.search.area, L.site, { heightAglM, camera, tiltDeg: camera.tiltDeg, turnRadiusM: turnRadius(AIRCRAFT.cruiseIasMs * 1.05, L.windSpeedMs) });
+    list.push({
+      ...common,
+      id: 'search',
+      kind: 'search',
+      title: L.search.title,
+      briefing: withRelays(L.search.briefing, L.relays),
+      area: L.search.area,
+      route: pattern.route,
+      camera,
+      heightAglM,
+      tiltDeg: camera.tiltDeg,
+      ...(L.search.animals ? { animals: L.search.animals } : {}),
+      defaults: { ...defaults },
+    });
+  }
+  return list;
 }
 
 /** Район заданий — выбранный оператором (src/game/regions.ts); переключение — перезагрузкой страницы. */
@@ -257,9 +300,12 @@ const BETWEEN_SAMPLES_M = 15;
 
 /**
  * Радиус разворота — по наибольшей путевой скорости (по ветру) с 10 % запаса, иначе на
- * подветренной части дуги предельного крена не хватит и аппарат вынесет.
+ * подветренной части дуги предельного крена не хватит и аппарат вынесет. Объявление функцией:
+ * buildScenarios зовёт её ещё при загрузке модуля (SCENARIOS), раньше этой строки.
  */
-const turnRadius = (tas: number, windMs: number) => (1.1 * (tas + windMs) ** 2) / (G * Math.tan((AIRCRAFT.maxBankDeg * Math.PI) / 180));
+function turnRadius(tas: number, windMs: number): number {
+  return (1.1 * (tas + windMs) ** 2) / (G * Math.tan((AIRCRAFT.maxBankDeg * Math.PI) / 180));
+}
 
 /** Высота над рельефом по узлам маршрута, между узлами — линейно. */
 const byNodes = (heights: number[]) => (leg: number, f: number) => heights[leg]! + (heights[leg + 1]! - heights[leg]!) * f;
@@ -428,6 +474,22 @@ export function buildMission(sc: Scenario, s: Settings, terrain: Terrain, weathe
         kind: 'route',
         stages: [r.plan],
         stageNames: ['Облёт'],
+        procedures: [r.proc],
+        site,
+        destination: null,
+        camera: null,
+        params: null,
+        survey: null,
+      };
+    }
+    case 'search': {
+      // Как облёт по маршруту, нагрузка — тепловизор (масса и питание).
+      const payload = { massKg: sc.camera.massKg, powerW: sc.camera.powerW };
+      const r = routeStage(site, site, sc.route, payload, s, terrain, weather, (i, n) => (i === 0 ? 'К району поиска' : i === n - 1 ? 'К посадочному маршруту' : `Поиск: точка ${i} → ${i + 1}`), '');
+      return {
+        kind: 'search',
+        stages: [r.plan],
+        stageNames: ['Поиск'],
         procedures: [r.proc],
         site,
         destination: null,

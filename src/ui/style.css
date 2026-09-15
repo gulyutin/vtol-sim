@@ -701,6 +701,35 @@ ul.log li.bad {
   color: #e8ffe8;
 }
 
+/* Окно тепловизора: щелчок по картинке — отметить находку. */
+.pip.thermal {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+/* Отметки поиска людей (map2d.setSearchMarks). */
+.search-mark div {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
+}
+
+.search-mark.person div {
+  background: #2f9e44;
+}
+
+.search-mark.animal div {
+  background: #f08c00;
+}
+
+.search-mark.empty div {
+  background: #868e96;
+  border-radius: 2px;
+  transform: rotate(45deg);
+}
+
 .pip.flash {
   animation: flash 0.35s ease-out;
 }

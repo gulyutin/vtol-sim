@@ -245,6 +245,12 @@ export interface LocationSpec {
   /** Перелёт из А в Б: взлёт на площадке, посадка в другой точке. */
   transfer: { title: string; briefing: string; destination: GeoPoint; destinationName: string; route: RoutePoint[] };
   /**
+   * Поиск людей тепловизором (src/game/search.ts): район поиска — многоугольник; звери района —
+   * относительные веса видов (нет вида или вес 0 — такого зверя в районе нет). Без animals —
+   * обычная тайга: медведи, волки, лоси, олени. Нет поля — задания поиска в районе нет.
+   */
+  search?: { title: string; briefing: string; area: GeoPoint[]; animals?: Partial<Record<'bear' | 'wolf' | 'moose' | 'deer', number>> };
+  /**
    * Ретрансляторы связи района (radio.ts) — для всех заданий: чтобы задания по умолчанию не теряли
    * связь за рельефом дольше таймаута и борт на земле в пункте Б был на связи.
    */

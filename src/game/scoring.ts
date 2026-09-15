@@ -32,9 +32,22 @@ export interface FailureEvent {
   id: string;
 }
 
+/** Итог поиска людей (src/game/search.ts, SearchWorld.result). */
+export interface SearchOutcome {
+  /** Сколько людей найдено и сколько было. */
+  found: number;
+  total: number;
+  /** Отметки на звере или на пустом месте. */
+  falseMarks: number;
+  /** Первая находка — через столько после взлёта, с; null — никого не нашли. */
+  firstFoundS: number | null;
+  /** Доля района, побывавшая в кадре тепловизора, 0…1. */
+  coverage: number;
+}
+
 export interface AssessInput {
   rec: Recording;
-  scenarioKind: 'transfer' | 'survey' | 'delivery' | 'route';
+  scenarioKind: 'transfer' | 'survey' | 'delivery' | 'route' | 'search';
   /** Точка посадки задания, локальные метры. */
   landing: { east: number; north: number };
   landingZoneRadiusM: number;
@@ -51,6 +64,8 @@ export interface AssessInput {
   surveyCoverage?: number;
   /** Груз доставлен (доставка). */
   delivered?: boolean;
+  /** Итог поиска людей (поиск): без него пункты поиска — по нулям. */
+  search?: SearchOutcome;
   /**
    * Зоны задания: есть запретные — в оценке пункт «Запретные зоны» и без нарушений. Сами
    * нарушения берутся из событий среды в записи (LiveFlight.envEvents).
@@ -190,6 +205,52 @@ function ewSummary(events: readonly RecordingEvent[], t0: number, t1: number): s
   return parts.join('; ');
 }
 
+/**
+ * Поиск людей: общие пункты (задание и посадка, точность, энергия, РЛЭ, ограничения, отказы)
+ * сжимаются до 60 баллов, остальные 40 — поиск: люди 20, первая находка 6, ложные отметки 8,
+ * покрытие района 6.
+ */
+const SEARCH_BASE_SHARE = 0.6;
+/** Покрытие района, за которое пункт — полностью. */
+const SEARCH_COVERAGE_FULL = 0.9;
+/** Штраф за ложную отметку (зверь или пусто), баллов. */
+const SEARCH_FALSE_PENALTY = 3;
+
+function searchItems(r: SearchOutcome | undefined, plannedS: number): AssessmentItem[] {
+  const out: AssessmentItem[] = [];
+  // Найдены люди — главное: баллы пропорционально найденным.
+  {
+    const max = 20;
+    if (!r) out.push({ title: 'Найдены люди', points: 0, max, note: 'итога поиска нет' });
+    else if (r.total <= 0) out.push({ title: 'Найдены люди', points: max, max, note: 'искать было некого' });
+    else out.push({ title: 'Найдены люди', points: max * clamp01(r.found / r.total), max, note: `найдено ${r.found} из ${r.total}${r.found >= r.total ? ' — все' : ''}` });
+  }
+  // Время до первой находки: до 40 % планового времени полёта — полностью, к 100 % — 2 балла, позже — 1.
+  {
+    const max = 6;
+    if (!r || r.firstFoundS === null) out.push({ title: 'Время до первой находки', points: 0, max, note: 'никого не нашли' });
+    else {
+      const ref = plannedS > 0 ? plannedS : 1800;
+      const k = r.firstFoundS / ref;
+      const points = k <= 0.4 ? max : k <= 1 ? lerp(max, 2, (k - 0.4) / 0.6) : 1;
+      out.push({ title: 'Время до первой находки', points, max, note: `первая находка на T+${clock(r.firstFoundS)} — ${fmt(k * 100)} % планового времени ${clock(ref)}` });
+    }
+  }
+  // Ложные отметки: зверь или пустое место — минус 3 балла за каждую.
+  {
+    const max = 8;
+    const n = r?.falseMarks ?? 0;
+    out.push({ title: 'Ложные отметки', points: Math.max(0, max - SEARCH_FALSE_PENALTY * n), max, note: n ? `ложных отметок: ${n}` : 'ложных отметок нет' });
+  }
+  // Покрытие района кадрами тепловизора: 90 % — полностью.
+  {
+    const max = 6;
+    const cov = r?.coverage ?? 0;
+    out.push({ title: 'Покрытие района', points: max * clamp01(cov / SEARCH_COVERAGE_FULL), max, note: `осмотрено ${fmt(cov * 100)} % района (нужно ${fmt(SEARCH_COVERAGE_FULL * 100)} %)` });
+  }
+  return out;
+}
+
 export function assessFlight(input: AssessInput): Assessment {
   const { rec, landing, landingZoneRadiusM: R, failures } = input;
   const samples = rec.samples;
@@ -223,6 +284,10 @@ export function assessFlight(input: AssessInput): Assessment {
       } else if (input.scenarioKind === 'delivery') {
         task = input.delivered ? 1 : 0;
         taskNote = input.delivered ? 'груз доставлен' : 'груз не доставлен';
+      } else if (input.scenarioKind === 'search') {
+        // Итог поиска — своими пунктами ниже; здесь только полёт и посадка.
+        const r = input.search;
+        taskNote = r ? `поиск проведён, найдено ${r.found} из ${r.total}` : 'поиск проведён';
       } else taskNote = input.scenarioKind === 'transfer' ? 'перелёт выполнен' : 'маршрут пройден';
       let land: number;
       let landNote: string;
@@ -370,6 +435,15 @@ export function assessFlight(input: AssessInput): Assessment {
       if (crashed) notes.push('аппарат потерян');
       items.push({ title: 'Действия при отказах', points: (max * score) / occurred.length, max, note: notes.join('; ') });
     }
+  }
+
+  // Поиск людей: общие пункты — 60 баллов из ста, поиск — 40.
+  if (input.scenarioKind === 'search') {
+    for (const it of items) {
+      it.points *= SEARCH_BASE_SHARE;
+      it.max = Math.round(it.max * SEARCH_BASE_SHARE * 10) / 10;
+    }
+    items.push(...searchItems(input.search, input.plannedS));
   }
 
   // 7. Запретные зоны: вход — грубое нарушение, штраф сверх сотни и потолок итога.
