@@ -40,7 +40,7 @@ export interface Settings {
   linkLossTimeoutS: number;
 }
 
-export type ScenarioKind = 'transfer' | 'survey' | 'delivery' | 'route' | 'search';
+export type ScenarioKind = 'transfer' | 'survey' | 'delivery' | 'route' | 'search' | 'fire';
 
 export type { RoutePoint };
 
@@ -114,10 +114,27 @@ export interface SearchScenario extends ScenarioBase {
   animals?: AnimalWeights;
 }
 
-export type Scenario = TransferScenario | SurveyScenario | DeliveryScenario | RouteScenario | SearchScenario;
+/**
+ * Лесопожарный патруль (src/game/fire.ts): облёт зоны патрулирования, как маршрут. Дымы видно в
+ * 3D-виде за километры, очаги и огневые точки — тепловизором.
+ */
+export interface FireScenario extends ScenarioBase {
+  kind: 'fire';
+  /** Зона патрулирования — многоугольник. */
+  area: GeoPoint[];
+  route: RoutePoint[];
+  camera: ThermalCamera;
+  /** Высота патруля над рельефом, м, и наклон подвеса, °. */
+  heightAglM: number;
+  tiltDeg: number;
+}
+
+export type Scenario = TransferScenario | SurveyScenario | DeliveryScenario | RouteScenario | SearchScenario | FireScenario;
 
 /** Высота поиска по умолчанию над рельефом, м: со 100 м полоса тепловизора под 45° — 84 м. */
 const SEARCH_HEIGHT_AGL_M = 100;
+/** Высота патруля по умолчанию над рельефом, м: дым виден дальше, а очаг в кадре ещё различим. */
+const PATROL_HEIGHT_AGL_M = 250;
 
 /** Брифинг и ретрансляторы района одной фразой. */
 export function withRelays(briefing: string, relays: readonly Relay[] = []): string {
@@ -218,6 +235,22 @@ export function buildScenarios(L: LocationSpec): Scenario[] {
       heightAglM,
       tiltDeg: camera.tiltDeg,
       ...(L.search.animals ? { animals: L.search.animals } : {}),
+      defaults: { ...defaults },
+    });
+  }
+  if (L.fire) {
+    const camera = THERMAL_CAMERA;
+    list.push({
+      ...common,
+      id: 'fire',
+      kind: 'fire',
+      title: L.fire.title,
+      briefing: withRelays(L.fire.briefing, L.relays),
+      area: L.fire.area,
+      route: L.fire.route,
+      camera,
+      heightAglM: L.fire.route[0]?.heightAglM ?? PATROL_HEIGHT_AGL_M,
+      tiltDeg: camera.tiltDeg,
       defaults: { ...defaults },
     });
   }
@@ -561,6 +594,31 @@ export function buildMission(sc: Scenario, s: Settings, terrain: Terrain, weathe
         kind: 'search',
         stages: [r.plan],
         stageNames: ['Поиск'],
+        procedures: [r.proc],
+        site,
+        destination: null,
+        camera: null,
+        params: null,
+        survey: null,
+      };
+    }
+    case 'fire': {
+      const payload = { massKg: sc.camera.massKg, powerW: sc.camera.powerW };
+      const r = routeStage(
+        site,
+        site,
+        sc.route,
+        payload,
+        s,
+        terrain,
+        weather,
+        (i, n) => (i === 0 ? 'К зоне патрулирования' : i === n - 1 ? 'К посадочному маршруту' : `Патруль: точка ${i} → ${i + 1}`),
+        '',
+      );
+      return {
+        kind: 'fire',
+        stages: [r.plan],
+        stageNames: ['Патрулирование'],
         procedures: [r.proc],
         site,
         destination: null,

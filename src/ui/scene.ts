@@ -12,15 +12,17 @@ import type { Coverage, Frame } from '../sim/survey';
 import type { LocalPoint } from '../sim/timeline';
 import type { GeoPoint, Site, Terrain, Weather } from '../sim/types';
 import type { Zone } from '../sim/zones';
+import type { FireFlame, FirePlume } from '../game/fire';
 import { ACTIVE_REGION } from '../game/scenarios';
 import { createAircraft, type AircraftModel } from './aircraftModel';
-import { HEAT_THERMAL_M, HEAT_VIEW_M, HeatBodies, type HeatBody } from './heat';
+import { HEAT_THERMAL_M, HEAT_VIEW_M, HeatBodies, marchToGround, type HeatBody } from './heat';
 import { Landmarks } from './landmarks';
 import { OsmLayer } from './osmLayer';
 import { createGroundStation, createLandingPad, createLandingZone, createVehicle, createWaypointMarker, RotorDust } from './props';
 import { QUALITY, type QualitySettings } from './quality';
 import { SkyDome } from './skyDome';
 import { fogFor, overcastFactor, Precipitation } from './precipitation';
+import { FirePlumes } from './smoke';
 import type { Bounds } from './terrainData';
 import { TerrainLod } from './terrainLod';
 import { ThermalView, type ThermalKind } from './thermal';
@@ -158,6 +160,8 @@ export class World {
   private readonly heat = new HeatBodies((e, n) => this.groundAt(e, n));
   /** Тепловизор — создаётся при первом кадре (thermal.ts). */
   private thermal: ThermalView | null = null;
+  /** Дым и пламя лесных пожаров (smoke.ts) — только в задании патруля. */
+  private plumes: FirePlumes | null = null;
   private readonly thermalMap = new Map<THREE.Object3D, ThermalKind>();
   private sunElevationDeg = 30;
   private readonly trail: THREE.Line;
@@ -758,6 +762,53 @@ export class World {
   }
 
   /**
+   * Дымы и горящая кромка лесных пожаров (smoke.ts). null — убрать совсем.
+   * prewarmS — прокрутить дым перед первым кадром, чтобы столбы уже стояли.
+   */
+  setFire(
+    fire: { plumes: readonly FirePlume[]; flames: readonly FireFlame[] } | null,
+    windAt: (heightAglM: number) => { east: number; north: number } = () => ({ east: 0, north: 0 }),
+    prewarmS = 0,
+  ) {
+    if (!fire) {
+      if (this.plumes) {
+        this.scene.remove(this.plumes.object);
+        this.plumes.dispose();
+        this.plumes = null;
+      }
+      return;
+    }
+    if (!this.plumes) {
+      this.plumes = new FirePlumes();
+      this.scene.add(this.plumes.object);
+    }
+    this.plumes.setSources(fire.plumes, fire.flames, (e, n) => this.groundAt(e, n));
+    if (prewarmS > 0) this.plumes.prewarm(prewarmS, windAt);
+  }
+
+  /** Дым идёт по времени полёта, пламя мерцает по настоящему. */
+  fireTick(dtSim: number, dtReal: number, windAt: (heightAglM: number) => { east: number; north: number }) {
+    this.plumes?.update(dtSim, dtReal, windAt);
+  }
+
+  /**
+   * Куда показал оператор в 3D-виде: луч из камеры вида через точку экрана (координаты окна) и
+   * точка рельефа под ним (null — луч ушёл в небо). null — щелчок мимо холста.
+   */
+  viewPick(clientX: number, clientY: number): { origin: LocalPoint; dir: LocalPoint; ground: LocalPoint | null } | null {
+    const r = this.renderer.domElement.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    const x = ((clientX - r.left) / r.width) * 2 - 1;
+    const y = -((clientY - r.top) / r.height) * 2 + 1;
+    if (Math.abs(x) > 1 || Math.abs(y) > 1) return null;
+    const p = new THREE.Vector3(x, y, 0.5).unproject(this.camera);
+    const c = this.camera.position;
+    const origin = { east: c.x, north: -c.z, up: c.y };
+    const dir = { east: p.x - c.x, north: -(p.z - c.z), up: p.y - c.y };
+    return { origin, dir, ground: marchToGround(origin, dir, (e, n) => this.groundAt(e, n), 40000) };
+  }
+
+  /**
    * Окно тепловизора поверх 3D-вида, как renderPip: камера в eye смотрит на look. Звать каждый
    * кадр после render(). По умолчанию белое — горячее; whiteHot: false — чёрное — горячее.
    */
@@ -817,6 +868,7 @@ export class World {
       this.clouds,
       this.precip.object,
       this.dust.object,
+      this.plumes?.object ?? null,
       this.blob,
       this.trail,
       this.frameLines,

@@ -251,6 +251,11 @@ export interface LocationSpec {
    */
   search?: { title: string; briefing: string; area: GeoPoint[]; animals?: Partial<Record<'bear' | 'wolf' | 'moose' | 'deer', number>> };
   /**
+   * Лесопожарный патруль (src/game/fire.ts): зона патрулирования — многоугольник, маршрут облёта —
+   * точки оператора с высотой над рельефом. Нет поля — задания патруля в районе нет.
+   */
+  fire?: { title: string; briefing: string; area: GeoPoint[]; route: RoutePoint[] };
+  /**
    * Ретрансляторы связи района (radio.ts) — для всех заданий: чтобы задания по умолчанию не теряли
    * связь за рельефом дольше таймаута и борт на земле в пункте Б был на связи.
    */

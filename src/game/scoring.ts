@@ -45,9 +45,24 @@ export interface SearchOutcome {
   coverage: number;
 }
 
+/** Итог лесопожарного патруля (src/game/fire.ts, FireWorld.result). */
+export interface FireOutcome {
+  /** Сколько пожаров в районе, о скольких доложено по дыму и сколько очагов подтверждено тепловизором. */
+  fires: number;
+  reported: number;
+  located: number;
+  /** Огневые точки (угли, перебросы, тлеющие деревья): сколько их и сколько найдено. */
+  spots: number;
+  spotsFound: number;
+  /** Отметки не по огню и донесения не по дыму. */
+  falseMarks: number;
+  /** Первое донесение (или подтверждённый очаг) — через столько после взлёта, с. */
+  firstReportS: number | null;
+}
+
 export interface AssessInput {
   rec: Recording;
-  scenarioKind: 'transfer' | 'survey' | 'delivery' | 'route' | 'search';
+  scenarioKind: 'transfer' | 'survey' | 'delivery' | 'route' | 'search' | 'fire';
   /** Точка посадки задания, локальные метры. */
   landing: { east: number; north: number };
   landingZoneRadiusM: number;
@@ -66,6 +81,8 @@ export interface AssessInput {
   delivered?: boolean;
   /** Итог поиска людей (поиск): без него пункты поиска — по нулям. */
   search?: SearchOutcome;
+  /** Итог лесопожарного патруля: без него пункты патруля — по нулям. */
+  fire?: FireOutcome;
   /**
    * Зоны задания: есть запретные — в оценке пункт «Запретные зоны» и без нарушений. Сами
    * нарушения берутся из событий среды в записи (LiveFlight.envEvents).
@@ -211,6 +228,8 @@ function ewSummary(events: readonly RecordingEvent[], t0: number, t1: number): s
  * покрытие района 6.
  */
 const SEARCH_BASE_SHARE = 0.6;
+/** Штраф за ложную отметку или донесение в патруле, баллов. */
+const FIRE_FALSE_PENALTY = 2;
 /** Покрытие района, за которое пункт — полностью. */
 const SEARCH_COVERAGE_FULL = 0.9;
 /** Штраф за ложную отметку (зверь или пусто), баллов. */
@@ -247,6 +266,40 @@ function searchItems(r: SearchOutcome | undefined, plannedS: number): Assessment
     const max = 6;
     const cov = r?.coverage ?? 0;
     out.push({ title: 'Покрытие района', points: max * clamp01(cov / SEARCH_COVERAGE_FULL), max, note: `осмотрено ${fmt(cov * 100)} % района (нужно ${fmt(SEARCH_COVERAGE_FULL * 100)} %)` });
+  }
+  return out;
+}
+
+/**
+ * Лесопожарный патруль: общие пункты тоже сжимаются до 60 баллов, остальные 40 — патруль:
+ * доложенные дымы 10, подтверждённые очаги 10, огневые точки 10, время до первого донесения 5,
+ * ложные отметки и донесения 5.
+ */
+function fireItems(r: FireOutcome | undefined, plannedS: number): AssessmentItem[] {
+  const out: AssessmentItem[] = [];
+  const share = (title: string, max: number, done: number, total: number, note: (d: number, t: number) => string) => {
+    if (!r) out.push({ title, points: 0, max, note: 'итога патруля нет' });
+    else if (total <= 0) out.push({ title, points: max, max, note: 'искать было нечего' });
+    else out.push({ title, points: max * clamp01(done / total), max, note: note(done, total) });
+  };
+  share('Дымы доложены', 10, r?.reported ?? 0, r?.fires ?? 0, (d, t) => `доложено ${d} из ${t} пожаров${d >= t ? ' — все' : ''}`);
+  share('Очаги подтверждены', 10, r?.located ?? 0, r?.fires ?? 0, (d, t) => `подтверждено тепловизором ${d} из ${t}`);
+  share('Огневые точки', 10, r?.spotsFound ?? 0, r?.spots ?? 0, (d, t) => `найдено ${d} из ${t}`);
+  // Время до первого донесения: до 20 % планового времени полёта — полностью, к 100 % — 1 балл.
+  {
+    const max = 5;
+    if (!r || r.firstReportS === null) out.push({ title: 'Время до первого донесения', points: 0, max, note: 'донесений не было' });
+    else {
+      const ref = plannedS > 0 ? plannedS : 1800;
+      const k = r.firstReportS / ref;
+      const points = k <= 0.2 ? max : k <= 1 ? lerp(max, 1, (k - 0.2) / 0.8) : 1;
+      out.push({ title: 'Время до первого донесения', points, max, note: `первое донесение на T+${clock(r.firstReportS)} — ${fmt(k * 100)} % планового времени ${clock(ref)}` });
+    }
+  }
+  {
+    const max = 5;
+    const n = r?.falseMarks ?? 0;
+    out.push({ title: 'Ложные отметки', points: Math.max(0, max - FIRE_FALSE_PENALTY * n), max, note: n ? `ложных отметок и донесений: ${n}` : 'ложных отметок нет' });
   }
   return out;
 }
@@ -288,6 +341,9 @@ export function assessFlight(input: AssessInput): Assessment {
         // Итог поиска — своими пунктами ниже; здесь только полёт и посадка.
         const r = input.search;
         taskNote = r ? `поиск проведён, найдено ${r.found} из ${r.total}` : 'поиск проведён';
+      } else if (input.scenarioKind === 'fire') {
+        const r = input.fire;
+        taskNote = r ? `патруль проведён, доложено ${r.reported} из ${r.fires} пожаров` : 'патруль проведён';
       } else taskNote = input.scenarioKind === 'transfer' ? 'перелёт выполнен' : 'маршрут пройден';
       let land: number;
       let landNote: string;
@@ -437,13 +493,13 @@ export function assessFlight(input: AssessInput): Assessment {
     }
   }
 
-  // Поиск людей: общие пункты — 60 баллов из ста, поиск — 40.
-  if (input.scenarioKind === 'search') {
+  // Поиск людей и лесопожарный патруль: общие пункты — 60 баллов из ста, само задание — 40.
+  if (input.scenarioKind === 'search' || input.scenarioKind === 'fire') {
     for (const it of items) {
       it.points *= SEARCH_BASE_SHARE;
       it.max = Math.round(it.max * SEARCH_BASE_SHARE * 10) / 10;
     }
-    items.push(...searchItems(input.search, input.plannedS));
+    items.push(...(input.scenarioKind === 'search' ? searchItems(input.search, input.plannedS) : fireItems(input.fire, input.plannedS)));
   }
 
   // 7. Запретные зоны: вход — грубое нарушение, штраф сверх сотни и потолок итога.

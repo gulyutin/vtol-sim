@@ -611,10 +611,11 @@ export class Map2D {
   private searchLayer: L.LayerGroup | null = null;
 
   /**
-   * Отметки поиска людей: человек найден — зелёная, зверь (ложная тревога) — оранжевая, пусто —
-   * серый ромб; подпись — во всплывающей подсказке. Пусто или null — убрать.
+   * Отметки поиска и патруля: человек найден — зелёная, огонь — красная, дым доложен — синяя,
+   * зверь или ложная цель — оранжевая, пусто — серый ромб; подпись — во всплывающей подсказке.
+   * Пусто или null — убрать.
    */
-  setSearchMarks(marks: readonly { lat: number; lon: number; result: 'person' | 'animal' | 'empty'; label: string }[] | null) {
+  setSearchMarks(marks: readonly { lat: number; lon: number; result: 'person' | 'animal' | 'empty' | 'fire' | 'smoke'; label: string }[] | null) {
     this.searchLayer?.remove();
     this.searchLayer = null;
     if (!marks?.length) return;

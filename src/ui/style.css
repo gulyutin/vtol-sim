@@ -707,7 +707,32 @@ ul.log li.bad {
   cursor: crosshair;
 }
 
-/* Отметки поиска людей (map2d.setSearchMarks). */
+/* Донесение о дыме: кнопка над окном тепловизора (fireMode.ts). */
+.smoke-btn {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 3;
+  padding: 4px 10px;
+  border: 1px solid #5c6470;
+  border-radius: 4px;
+  background: rgba(20, 24, 30, 0.8);
+  color: #e6edf3;
+  font: 12px/1.2 system-ui, sans-serif;
+  cursor: pointer;
+}
+
+.pip.thermal ~ .smoke-btn {
+  right: auto;
+  left: 12px;
+}
+
+.smoke-btn.armed {
+  border-color: #ffd43b;
+  color: #ffd43b;
+}
+
+/* Отметки поиска людей и патруля (map2d.setSearchMarks). */
 .search-mark div {
   width: 14px;
   height: 14px;
@@ -722,6 +747,15 @@ ul.log li.bad {
 
 .search-mark.animal div {
   background: #f08c00;
+}
+
+.search-mark.fire div {
+  background: #e03131;
+}
+
+.search-mark.smoke div {
+  background: #4c6ef5;
+  border-radius: 3px;
 }
 
 .search-mark.empty div {

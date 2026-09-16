@@ -352,7 +352,7 @@ export function swathOf(cam: ThermalCamera, heightAglM: number, tiltDeg = cam.ti
 
 /* ------------------------------ Многоугольник ------------------------------ */
 
-function insidePolygon(e: number, n: number, poly: readonly LocalPoint[]): boolean {
+export function insidePolygon(e: number, n: number, poly: readonly LocalPoint[]): boolean {
   let inside = false;
   for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
     const a = poly[i]!;
@@ -378,7 +378,7 @@ export function distanceOutside(p: LocalPoint, poly: readonly LocalPoint[]): num
   return best;
 }
 
-const centroid = (poly: readonly LocalPoint[]): LocalPoint => ({
+export const centroid = (poly: readonly LocalPoint[]): LocalPoint => ({
   east: poly.reduce((s, p) => s + p.east, 0) / poly.length,
   north: poly.reduce((s, p) => s + p.north, 0) / poly.length,
 });
@@ -740,7 +740,7 @@ interface Herd {
 }
 
 /** Генератор mulberry32: один seed — одна и та же последовательность. */
-function mulberry32(seed: number): () => number {
+export function mulberry32(seed: number): () => number {
   let s = seed | 0;
   return () => {
     s = (s + 0x6d2b79f5) | 0;

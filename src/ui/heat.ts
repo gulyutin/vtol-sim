@@ -10,7 +10,10 @@ import type { LocalPoint } from '../sim/timeline';
  * Модуль без DOM — модели и помощники проверяются тестами в node.
  */
 
-export type HeatKind = 'person' | 'bear' | 'wolf' | 'moose' | 'deer';
+export type BodyHeatKind = 'person' | 'bear' | 'wolf' | 'moose' | 'deer';
+/** Лесопожарный патруль (src/game/fire.ts): огонь, угли и ложные цели. */
+export type FireHeatKind = 'flame' | 'ember' | 'rocks' | 'hut';
+export type HeatKind = BodyHeatKind | FireHeatKind;
 export type HeatPose = 'standing' | 'sitting' | 'lying' | 'walking';
 
 export interface HeatBody {
@@ -26,7 +29,10 @@ export interface HeatBody {
   phase?: number;
 }
 
-export const HEAT_KINDS: readonly HeatKind[] = ['person', 'bear', 'wolf', 'moose', 'deer'];
+export const HEAT_KINDS: readonly BodyHeatKind[] = ['person', 'bear', 'wolf', 'moose', 'deer'];
+export const FIRE_HEAT_KINDS: readonly FireHeatKind[] = ['flame', 'ember', 'rocks', 'hut'];
+/** Эти модели не кладутся по склону: огонь и сруб стоят отвесно. */
+const UPRIGHT_KINDS = new Set<HeatKind>(['flame', 'hut']);
 
 /**
  * Натуральные габариты стоя, м. Звери: длина — от носа до хвоста, высота — в холке (голова и рога
@@ -38,6 +44,11 @@ export const HEAT_SIZE: Readonly<Record<HeatKind, { lengthM: number; heightM: nu
   wolf: { lengthM: 1.3, heightM: 0.8, widthM: 0.32 },
   moose: { lengthM: 2.8, heightM: 2.0, widthM: 0.76 },
   deer: { lengthM: 1.6, heightM: 1.1, widthM: 0.34 },
+  // Огонь и ложные цели патруля: кострище кромки, тлеющее место, развал камней, зимовье с трубой.
+  flame: { lengthM: 3.2, heightM: 2.4, widthM: 3.2 },
+  ember: { lengthM: 1.4, heightM: 0.5, widthM: 1.2 },
+  rocks: { lengthM: 6, heightM: 1.8, widthM: 4.5 },
+  hut: { lengthM: 4.6, heightM: 4.2, widthM: 4.2 },
 };
 
 /** Дальше этого от камеры 3D-вида тела не рисуются, м. */
@@ -334,7 +345,82 @@ function deerRig(): HeatRig {
   return { body: b.build(), limbs: quadLegs(leg, 0.76, -0.38, 0.4, 0.1) };
 }
 
-const RIG_BUILDERS: Record<HeatKind, () => HeatRig> = { person: personRig, bear: bearRig, wolf: wolfRig, moose: mooseRig, deer: deerRig };
+
+/**
+ * Горящая кромка: выгоревшая земля и языки пламени. Нагрев больше единицы — пламя в тепловом
+ * кадре уходит в насыщение и даёт ореол, как настоящий огонь у матрицы.
+ */
+function flameRig(): HeatRig {
+  const BURN = 0x1c1512;
+  const ASH = 0x555049;
+  const FIRE = 0xff6a15;
+  const CORE = 0xffd15c;
+  const b = new Part();
+  b.add(new THREE.CylinderGeometry(1.6, 1.6, 0.08, 10), BURN, 1.05, tf(0, 0.04, 0));
+  b.add(new THREE.CylinderGeometry(0.9, 1.2, 0.06, 9), ASH, 0.95, tf(0.4, 0.09, -0.3));
+  const tongue = (x: number, z: number, h: number, r: number, hot: number) => {
+    b.add(new THREE.ConeGeometry(r, h, 6), FIRE, hot, tf(x, h / 2 + 0.05, z));
+    b.add(new THREE.ConeGeometry(r * 0.45, h * 0.55, 5), CORE, hot + 0.15, tf(x, h * 0.3, z));
+  };
+  tongue(0, 0, 2.3, 0.55, 1.45);
+  tongue(-0.75, 0.4, 1.5, 0.4, 1.35);
+  tongue(0.8, -0.35, 1.7, 0.42, 1.4);
+  tongue(0.15, 0.9, 1.1, 0.34, 1.3);
+  tongue(-0.5, -0.8, 1.3, 0.36, 1.32);
+  return { body: b.build(), limbs: [] };
+}
+
+/** Тлеющее место: прогоревший валежник, угли и слабый язычок пламени. */
+function emberRig(): HeatRig {
+  const CHAR = 0x241812;
+  const COAL = 0xc23a12;
+  const FIRE = 0xff8a2a;
+  const b = new Part();
+  b.add(ell(0.7, 0.12, 0.6), CHAR, 1.0, tf(0, 0.1, 0));
+  b.add(ell(0.34, 0.09, 0.3), COAL, 1.2, tf(0.1, 0.16, -0.05));
+  b.add(ell(0.2, 0.07, 0.22), COAL, 1.15, tf(-0.25, 0.14, 0.18));
+  b.add(new THREE.ConeGeometry(0.16, 0.45, 5), FIRE, 1.25, tf(0.08, 0.36, -0.03));
+  return { body: b.build(), limbs: [] };
+}
+
+/** Курумник: развал глыб, нагретых солнцем, — в тепловом кадре тёплое пятно без формы. */
+function rocksRig(): HeatRig {
+  const STONE = 0x8b8880;
+  const SHADE = 0x6d6a63;
+  const LICHEN = 0x8f9470;
+  const b = new Part();
+  const place: [number, number, number, number, number][] = [
+    [0, 0.55, 0, 1.1, 0.62],
+    [1.6, 0.42, 0.6, 0.85, 0.6],
+    [-1.5, 0.48, -0.5, 0.95, 0.64],
+    [0.9, 0.3, -1.3, 0.7, 0.58],
+    [-1.0, 0.32, 1.2, 0.72, 0.6],
+    [2.2, 0.26, -0.9, 0.55, 0.56],
+  ];
+  place.forEach(([x, y, z, r, heat], i) => {
+    b.add(new THREE.DodecahedronGeometry(r, 0), i % 2 ? STONE : SHADE, heat, tf(x, y, z, i * 0.7, i * 0.4, i * 0.3));
+  });
+  b.add(ell(0.5, 0.05, 0.45), LICHEN, 0.5, tf(-0.6, 0.06, -1.5));
+  return { body: b.build(), limbs: [] };
+}
+
+/** Зимовье: сруб, двускатная крыша и горячая труба — печь топится. */
+function hutRig(): HeatRig {
+  const LOG = 0x6d5436;
+  const ROOF = 0x4a4038;
+  const DOOR = 0x3a2c1c;
+  const PIPE = 0x3a3733;
+  const HOT = 0x8a3a1a;
+  const b = new Part();
+  b.add(box(3.8, 2.1, 3.4), LOG, 0.52, tf(0, 1.05, 0));
+  b.add(box(1.0, 1.7, 0.12), DOOR, 0.6, tf(0, 0.85, -1.73));
+  b.add(new THREE.ConeGeometry(3.0, 1.2, 4), ROOF, 0.58, tf(0, 2.7, 0, 0, Math.PI / 4));
+  b.add(box(0.46, 1.3, 0.46), PIPE, 0.8, tf(1.1, 3.2, 0.7));
+  b.add(box(0.56, 0.16, 0.56), HOT, 1.3, tf(1.1, 3.9, 0.7));
+  return { body: b.build(), limbs: [] };
+}
+
+const RIG_BUILDERS: Record<HeatKind, () => HeatRig> = { person: personRig, bear: bearRig, wolf: wolfRig, moose: mooseRig, deer: deerRig, flame: flameRig, ember: emberRig, rocks: rocksRig, hut: hutRig };
 const rigs = new Map<HeatKind, HeatRig>();
 
 /** Геометрия вида — общая для всех особей (строится один раз). */
@@ -580,7 +666,7 @@ export class HeatBodies {
     const m = it.model;
     const pose = b.pose ?? 'standing';
     applyPose(m, pose, b.phase ?? 0);
-    const upright = m.kind === 'person' && pose !== 'lying';
+    const upright = m.kind === 'person' ? pose !== 'lying' : UPRIGHT_KINDS.has(m.kind);
     if (b.east === it.east && b.north === it.north && b.headingDeg === it.headingDeg && upright === it.upright) return;
     it.east = b.east;
     it.north = b.north;

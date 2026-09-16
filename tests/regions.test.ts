@@ -66,11 +66,11 @@ describe.each(REGION_PRESETS.map((r) => [r.id, r] as const))('район %s', (i
   const terrain = flatTerrain(siteElevationM(id));
   const scenarios = buildScenarios(L);
 
-  it('четыре задания (и поиск, если он есть в районе), первое — перелёт; все точки внутри области не больше 0,3° × 0,5°', () => {
-    expect(scenarios.map((s) => s.kind)).toEqual(['transfer', 'route', 'survey', 'delivery', ...(L.search ? ['search'] : [])]);
+  it('четыре задания (и поиск с патрулём, если они есть в районе), первое — перелёт; все точки внутри области не больше 0,3° × 0,5°', () => {
+    expect(scenarios.map((s) => s.kind)).toEqual(['transfer', 'route', 'survey', 'delivery', ...(L.search ? ['search'] : []), ...(L.fire ? ['fire'] : [])]);
     expect(L.region.north - L.region.south).toBeLessThanOrEqual(0.33);
     expect(L.region.east - L.region.west).toBeLessThanOrEqual(0.51);
-    const points = [L.site, L.transfer.destination, L.delivery.destination, ...L.transfer.route, ...L.delivery.route, ...L.route.route, ...L.survey.area, ...(L.search?.area ?? [])];
+    const points = [L.site, L.transfer.destination, L.delivery.destination, ...L.transfer.route, ...L.delivery.route, ...L.route.route, ...L.survey.area, ...(L.search?.area ?? []), ...(L.fire?.area ?? []), ...(L.fire?.route ?? [])];
     for (const p of points) expect(inside(L.region, p), `${p.lat}, ${p.lon}`).toBe(true);
   });
 

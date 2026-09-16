@@ -9,6 +9,7 @@ import { ACTIVE_REGION, buildMission, departure, forecastWeather, REGION, SCENAR
 import { LOG_REGION_ID, osmRegionFor, REGIONS, saveLogRegion, setRegion } from './game/regions';
 import { inBounds, placeRecording, regionFromRecording, settleOnTerrain } from './game/logRegion';
 import { SurfaceMotion } from './game/surfaces';
+import { FireMode } from './ui/fireMode';
 import { SearchMode } from './ui/searchMode';
 import { loadLastLog, saveLastLog } from './ui/logStore';
 import { placeOsm } from './ui/placeOsm';
@@ -65,6 +66,7 @@ function cloneScenario(sc: Scenario): Scenario {
     case 'route':
       return { ...sc, route: sc.route.map((p) => ({ ...p })), defaults: { ...sc.defaults } };
     case 'search':
+    case 'fire':
       return { ...sc, area: sc.area.map((p) => ({ ...p })), route: sc.route.map((p) => ({ ...p })), defaults: { ...sc.defaults } };
   }
 }
@@ -570,7 +572,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     const what = ACTIVE_REGION.id === LOG_REGION_ID ? 'места полёта' : 'района';
     let building = false;
     return placeOsm(
-      { site: siteA, bounds: loc.region, track: [loc.site, ...(loc.search?.area ?? []), ...loc.route.route, loc.transfer.destination] },
+      { site: siteA, bounds: loc.region, track: [loc.site, ...(loc.search?.area ?? []), ...(loc.fire?.area ?? []), ...loc.route.route, loc.transfer.destination] },
       {
         // Прогресс приходит, только когда собираем заново; из кэша — сразу готово.
         onProgress: (done, total, label) => {
@@ -706,7 +708,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     if (weatherSource === 'forecast' && applied) ({ scenario, settings } = applyForecastHour(scenario, settings, applied.hour));
     relays = [...scenario.relays];
     gcs.loadScenario(scenario, settings, forecastError);
-    world.setArea(scenario.kind === 'survey' || scenario.kind === 'search' ? scenario.area : []);
+    world.setArea(scenario.kind === 'survey' || scenario.kind === 'search' || scenario.kind === 'fire' ? scenario.area : []);
     replan();
     map.setRelays(relays);
     gcs.setRelays(relayItems());
@@ -839,7 +841,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       for (let i = 1; i < pts.length; i++) leg(pts[i - 1]!, pts[i]!);
     }
     map.setRoute(path, pins, labels);
-    map.setArea(scenario.kind === 'survey' || scenario.kind === 'search' ? scenario.area : null);
+    map.setArea(scenario.kind === 'survey' || scenario.kind === 'search' || scenario.kind === 'fire' ? scenario.area : null);
     map.setEditableRoute(scenario.kind === 'survey' ? null : scenario.route);
     map.setDestination(destinationOf(scenario));
     map.setEditing({ area: !started, route: true, destination: !started });
@@ -917,6 +919,14 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
 
   // Поиск людей тепловизором: люди и звери, окно тепловизора, отметки (src/ui/searchMode.ts).
   let searchMode: SearchMode | null = null;
+  // Лесопожарный патруль: пожары, дымы, отметки и донесения (src/ui/fireMode.ts).
+  let fireMode: FireMode | null = null;
+  /** Ветер на высоте над землёй: куда дует, м/с — для дыма и его сноса. */
+  const windTo = (heightAglM: number) => {
+    const w = windAt(actual, heightAglM);
+    const to = ((w.fromDeg + 180) * Math.PI) / 180;
+    return { east: Math.sin(to) * w.speedMs, north: Math.cos(to) * w.speedMs };
+  };
 
   function resetFlight() {
     rec.reset();
@@ -948,6 +958,37 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
               },
             },
             { difficulty: difficultyId, seed: Math.floor(Math.random() * 2 ** 31) },
+          )
+        : null;
+    // Пожары — тоже заново на каждую попытку.
+    fireMode?.dispose();
+    fireMode =
+      scenario.kind === 'fire'
+        ? new FireMode(
+            scenario,
+            {
+              world,
+              map,
+              site: siteA,
+              pipEl: gcs.viewEl.parentElement!.querySelector<HTMLElement>('.pip')!,
+              viewEl: gcs.viewEl,
+              windAt: windTo,
+              onMark: (m, reveal) => {
+                const t = flight.state.t;
+                const good = m.result === 'found' || m.result === 'located';
+                rec.event(t, `Отметка: ${m.text}`, good ? 'info' : 'warn');
+                gcs.log(t, reveal ? m.text : 'Отметка поставлена — что под ней, покажет разбор', reveal && !good ? 'warn' : 'info');
+                sound.alarm(reveal && good ? 'prepStep' : 'shutter');
+              },
+              onReport: (r, reveal) => {
+                const t = flight.state.t;
+                const good = r.result === 'reported';
+                rec.event(t, `Донесение: ${r.text}`, good ? 'info' : 'warn');
+                gcs.log(t, reveal ? r.text : 'Донесение отправлено — разбор покажет, был ли там дым', reveal && !good ? 'warn' : 'info');
+                sound.alarm(reveal && good ? 'prepStep' : 'shutter');
+              },
+            },
+            { difficulty: difficultyId, seed: Math.floor(Math.random() * 2 ** 31), wind: windAt(actual, 10) },
           )
         : null;
     announced = false;
@@ -1166,6 +1207,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       failures: injected,
       surveyCoverage: scenario.kind === 'survey' ? coverageOf(frames, scenario.area, siteA).atLeast5 : undefined,
       search: searchMode ? searchMode.result(takeoffT) : undefined,
+      fire: fireMode ? fireMode.result(takeoffT) : undefined,
       delivered: scenario.kind === 'delivery' ? stage >= 1 : undefined,
       zones,
     });
@@ -1395,6 +1437,11 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       searchMode.setTime(s.t);
       searchMode.update(paused ? 0 : dt * (manual ? 1 : rate), s, airborne());
     }
+    // Патруль: пожары растут, дым идёт по ветру, тепловизор смотрит из-под фюзеляжа.
+    if (fireMode) {
+      fireMode.setTime(s.t);
+      fireMode.update(paused ? 0 : dt * (manual ? 1 : rate), paused ? 0 : dt, s, airborne());
+    }
     // Предполётная подготовка: проверки на земле видны на модели; разворот носом против ветра — плавно.
     const test = s.mode === 'ground' && !s.armed ? prep.update(performance.now() / 1000, evaluatePrep) : null;
     if (test && test.turnToWind !== null) {
@@ -1532,6 +1579,8 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       gcs.pip(
         searchMode?.active
           ? searchMode.label()
+          : fireMode?.active
+          ? fireMode.label()
           : pip
           ? lastFrame
             ? `Кадр ${frames.length} · ${fmt(lastFrame.aglM)} м · GSD ${fmt(lastFrame.gsdM * 100, 2)} см · смаз ${fmt(lastFrame.blurPx, 2)} px · ISO ${fmt(lastFrame.iso)}${lastFrame.ok ? '' : ` · БРАК: ${lastFrame.reason}`}`
@@ -1545,6 +1594,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     world.render(dt);
     // Поиск: окно тепловизора вместо окна фотокамеры.
     if (searchMode?.active) searchMode.render(gcs.viewEl.clientWidth);
+    else if (fireMode?.active) fireMode.render(gcs.viewEl.clientWidth);
     else if (pip && mission.camera) {
       const w = Math.round(Math.min(260, gcs.viewEl.clientWidth * 0.4));
       const r = { right: 12, bottom: 12, width: w, height: Math.round((w * 2) / 3) };
@@ -1622,6 +1672,12 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
         map,
         get flight() {
           return flight;
+        },
+        get search() {
+          return searchMode;
+        },
+        get fire() {
+          return fireMode;
         },
         command,
         scenario(id: string) {
