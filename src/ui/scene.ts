@@ -23,6 +23,41 @@ import { QUALITY, type QualitySettings } from './quality';
 import { SkyDome } from './skyDome';
 import { fogFor, overcastFactor, Precipitation } from './precipitation';
 import { FirePlumes } from './smoke';
+import { createCloudLayer, setCloudLight, setCloudSteps, setCloudWeather, type CloudLayer } from './clouds';
+import { atmosphereFor, fogUniforms, installAtmosphereFog, RAYLEIGH, updateFogCamera } from './atmosphere';
+
+// Дымка по модели рассеяния встраивается в куски шейдеров до сборки первых материалов.
+installAtmosphereFog();
+
+/**
+ * Осень по дате района: лиственные желтеют с начала сентября, к концу месяца — почти все,
+ * с середины октября листва облетает (деревья остаются, жёлтого меньше). 0…1.
+ */
+export function autumnOf(date: string): number {
+  const d = new Date(`${date}T12:00:00Z`);
+  if (Number.isNaN(d.getTime())) return 0;
+  const doy = (d.getTime() - Date.UTC(d.getUTCFullYear(), 0, 1)) / 86_400_000;
+  const up = THREE.MathUtils.clamp((doy - 243) / 28, 0, 1);
+  const down = THREE.MathUtils.clamp((doy - 288) / 20, 0, 1);
+  return up * (1 - 0.7 * down);
+}
+
+/** Прямой свет Солнца в зените и рассеянный свет неба — множители к модели атмосферы. */
+const SUN_INTENSITY = 3.4;
+const SKY_LIGHT = 1.35;
+/** Экспозиция при дневном небе; в сумерках глаз и камера подстраиваются — до ×4. */
+const EXPOSURE = 0.5;
+const EXPOSURE_REF = 0.62;
+/** Рассеянный свет в дымке — доля яркости горизонта; подсветка Солнцем — доля его света. */
+const HAZE_AMBIENT = 0.42;
+/** Свечение: порог в яркости экрана (после экспозиции) — светится Солнце и огни, а не всё светлое небо. */
+const BLOOM_DISPLAY = 1.6;
+/** Облака: множители к свету Солнца и неба. */
+const CLOUD_SUN = 9;
+const CLOUD_SKY = 0.9;
+const HAZE_SUN = 0.33;
+/** Видимость, если погода её не задаёт, м: ясный день. */
+const CLEAR_VISIBILITY_M = 80_000;
 import type { Bounds } from './terrainData';
 import { TerrainLod } from './terrainLod';
 import { ThermalView, type ThermalKind } from './thermal';
@@ -97,25 +132,6 @@ function osmThermalKind(name: string): ThermalKind {
   return 'generic';
 }
 
-const CLOUD_VERTEX = `varying vec3 vWorld;
-void main() { vec4 w = modelMatrix * vec4(position, 1.0); vWorld = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }`;
-
-const CLOUD_FRAGMENT = `uniform vec2 offset; uniform float cover; uniform vec3 lit; uniform vec3 shade; uniform vec3 cam; uniform float fadeFar;
-varying vec3 vWorld;
-float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-float noise(vec2 p) { vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
-  return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), u.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x), u.y); }
-float fbm(vec2 p) { float v = 0.0, a = 0.5; for (int i = 0; i < 6; i++) { v += a * noise(p); p = p * 2.03 + 17.0; a *= 0.5; } return v; }
-void main() {
-  vec2 p = (vWorld.xz + offset) / 2600.0;
-  float d = fbm(p);
-  float c = smoothstep(1.0 - cover, 1.0 - cover + 0.22, d);
-  float fade = 1.0 - smoothstep(fadeFar * 0.45, fadeFar, distance(cam.xz, vWorld.xz));
-  vec3 col = mix(shade, lit, smoothstep(0.35, 0.85, fbm(p * 1.7 + 3.0)));
-  gl_FragColor = vec4(col, c * fade * 0.95);
-  #include <colorspace_fragment>
-}`;
-
 export class World {
   readonly renderer: THREE.WebGLRenderer;
   readonly scene = new THREE.Scene();
@@ -142,7 +158,7 @@ export class World {
   private readonly sun = new THREE.DirectionalLight(0xffffff, 2);
   private readonly hemi = new THREE.HemisphereLight(0xdcecff, 0x6a6a55, 0.7);
   private readonly sunDir = new THREE.Vector3(0, 1, 0);
-  private readonly clouds: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
+  private readonly clouds: CloudLayer;
   /** Дождь и снег вокруг камеры. */
   private readonly precip: Precipitation;
   /** 0 — ясно, 1 — сплошная облачность: гасит Солнце и серит небо. */
@@ -204,7 +220,7 @@ export class World {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.q.pixelRatio));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 0.55;
+    this.renderer.toneMappingExposure = EXPOSURE;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
     container.appendChild(this.renderer.domElement);
@@ -223,6 +239,8 @@ export class World {
 
     // Дымка: чем дальше, тем больше рельеф уходит в цвет неба.
     this.scene.fog = new THREE.Fog(0xbfd0e0, 4000, 34000);
+    // Дымка считается в системе той камеры, которой рисуется кадр: главный вид, окно камеры, видео.
+    this.scene.onBeforeRender = (_r, _s, camera) => updateFogCamera(camera, this.sunDir);
     this.scene.add(this.hemi);
     this.sun.castShadow = true;
     this.sun.shadow.mapSize.set(this.q.shadowMapSize, this.q.shadowMapSize);
@@ -266,26 +284,7 @@ export class World {
     }
     this.setArea(env.area);
 
-    this.clouds = new THREE.Mesh(
-      new THREE.PlaneGeometry(120000, 120000),
-      new THREE.ShaderMaterial({
-        vertexShader: CLOUD_VERTEX,
-        fragmentShader: CLOUD_FRAGMENT,
-        transparent: true,
-        depthWrite: false,
-        side: THREE.DoubleSide,
-        uniforms: {
-          offset: { value: this.windOffset },
-          cover: { value: env.cloudCover },
-          lit: { value: new THREE.Color(0xffffff) },
-          shade: { value: new THREE.Color(0x9aa6b4) },
-          cam: { value: new THREE.Vector3() },
-          fadeFar: { value: 40000 },
-        },
-      }),
-    );
-    this.clouds.rotation.x = -Math.PI / 2;
-    this.clouds.position.y = env.cloudBaseM;
+    this.clouds = createCloudLayer({ baseM: env.cloudBaseM, cover: env.cloudCover, offset: this.windOffset, fogColor: (this.scene.fog as THREE.Fog).color });
     this.precip = new Precipitation(this.q.precipParticles);
     this.scene.add(this.precip.object);
     this.scene.add(this.clouds);
@@ -339,6 +338,7 @@ export class World {
   /** Качество графики: разрешение, тени, постобработка, детальность рельефа, дома и деревья, пыль. */
   setQuality(q: QualitySettings) {
     this.q = q;
+    setCloudSteps(this.clouds, q.cloudSteps);
     const ratio = Math.min(window.devicePixelRatio, q.pixelRatio);
     this.renderer.setPixelRatio(ratio);
     this.composer.setPixelRatio(ratio);
@@ -361,15 +361,18 @@ export class World {
     const s = w.wind.speedMs;
     this.precip.setWeather(w.precipitation ?? null, new THREE.Vector2(Math.sin(to) * s, -Math.cos(to) * s));
     const f = fogFor(w.visibilityM);
+    // Аэрозоль у земли — по видимости (формула Кошмидера), за вычетом чистого воздуха.
+    fogUniforms.fogSun.value[3] = Math.max(2e-6, 3.912 / Math.max(50, w.visibilityM ?? CLEAR_VISIBILITY_M) - RAYLEIGH[1]);
     const fog = this.scene.fog as THREE.Fog;
     fog.near = f.near;
     fog.far = f.far;
     this.overcast = overcastFactor(w);
-    const cu = this.clouds.material.uniforms;
-    if (w.cloudCover !== undefined) cu['cover']!.value = w.cloudCover;
-    if (w.cloudBaseM !== undefined) this.clouds.position.y = w.cloudBaseM;
     // В тумане облака дальше видимости не видны.
-    cu['fadeFar']!.value = Math.min(40000, Math.max(3000, f.far * 1.2));
+    setCloudWeather(this.clouds, {
+      ...(w.cloudBaseM !== undefined ? { baseM: w.cloudBaseM } : {}),
+      ...(w.cloudCover !== undefined ? { cover: w.cloudCover } : {}),
+      fadeFarM: Math.min(40000, Math.max(3000, f.far * 1.2)),
+    });
     // Небо и свет пересчитаются с новой пасмурностью на следующем setSun.
     this.lastSun = null;
   }
@@ -382,7 +385,7 @@ export class World {
     }
     // Дом под моделью ориентира не рисуется — не будет двойного объёма.
     if (this.landmarks) data = this.landmarks.withoutReplaced(data);
-    this.osm = new OsmLayer(data, (e, n) => this.groundAt(e, n), this.q);
+    this.osm = new OsmLayer(data, (e, n) => this.groundAt(e, n), this.q, { autumn: autumnOf(ACTIVE_REGION.location.date) });
     this.scene.add(this.osm.group);
   }
 
@@ -436,19 +439,37 @@ export class World {
     this.sunDir.set(Math.cos(el) * Math.sin(az), Math.sin(el), -Math.cos(el) * Math.cos(az));
 
     const day = THREE.MathUtils.smoothstep(sun.elevationDeg, -4, 12);
-    const warm = 1 - THREE.MathUtils.smoothstep(sun.elevationDeg, 2, 30);
     // Ночь: окна домов, огни, посадочная фара и звёзды берут этот коэффициент.
     this.nightFactor = 1 - day;
-    this.sun.color.setRGB(1, 0.96 - 0.25 * warm, 0.9 - 0.45 * warm);
-    // Под сплошной облачностью прямого Солнца почти нет — свет рассеянный, тени бледные.
     const oc = this.overcast;
-    this.sun.intensity = 3.2 * day * (1 - 0.75 * oc);
-    this.hemi.intensity = (0.35 + 0.9 * day) * (1 - 0.2 * oc);
-    // Дымка — цвет неба у горизонта: вдали рельеф уходит в небо без шва.
-    (this.scene.fog as THREE.Fog).color.copy(this.sky.setSun(this.sunDir, day, warm, oc));
-    const clouds = this.clouds.material.uniforms;
-    (clouds['lit']!.value as THREE.Color).setRGB(1, 1 - 0.15 * warm, 1 - 0.3 * warm).multiplyScalar((0.4 + 0.6 * day) * (1 - 0.35 * oc));
-    (clouds['shade']!.value as THREE.Color).setRGB(0.55, 0.6, 0.68).multiplyScalar((0.4 + 0.6 * day) * (1 - 0.3 * oc));
+    const a = atmosphereFor(sun.elevationDeg, oc);
+    const lum = (v: THREE.Vector3) => 0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z;
+    // Прямой свет — цвет и сила Солнца за атмосферой; под сплошной облачностью его почти нет.
+    this.sun.color.copy(a.sunColor);
+    this.sun.intensity = SUN_INTENSITY * a.sunStrength;
+    // Рассеянный свет: сверху — небо (в сумерках синее), снизу — отражённый землёй свет.
+    const skyMix = a.zenith.clone().multiplyScalar(0.55).addScaledVector(a.horizon, 0.45);
+    const skyLum = Math.max(lum(skyMix), 1e-4);
+    this.hemi.color.setRGB(skyMix.x / skyLum, skyMix.y / skyLum, skyMix.z / skyLum).multiplyScalar(0.7);
+    const bounce = new THREE.Vector3(a.sunColor.r, a.sunColor.g, a.sunColor.b).multiplyScalar(a.sunStrength * 0.5).add(skyMix.clone().multiplyScalar(0.25 / skyLum));
+    const bl = Math.max(lum(bounce), 1e-4);
+    this.hemi.groundColor.setRGB((0.42 * bounce.x) / bl, (0.4 * bounce.y) / bl, (0.3 * bounce.z) / bl);
+    this.hemi.intensity = SKY_LIGHT * Math.min(1.2, Math.pow(skyLum / EXPOSURE_REF, 0.75)) + 0.03;
+    // Дымка: рассеянный свет неба у горизонта и подсветка Солнцем — те же формулы, что у неба.
+    const haze = a.horizon.clone().multiplyScalar(HAZE_AMBIENT);
+    (this.scene.fog as THREE.Fog).color.setRGB(haze.x, haze.y, haze.z);
+    const fs = fogUniforms.fogSun.value;
+    fs[0] = a.sunLight.x * HAZE_SUN * (1 - 0.7 * oc);
+    fs[1] = a.sunLight.y * HAZE_SUN * (1 - 0.7 * oc);
+    fs[2] = a.sunLight.z * HAZE_SUN * (1 - 0.7 * oc);
+    this.sky.setSun(this.sunDir, sun.elevationDeg, a, haze, oc);
+    // Экспозиция: в сумерках подстраивается, чтобы рельеф не уходил в черноту.
+    this.renderer.toneMappingExposure = EXPOSURE * THREE.MathUtils.clamp(Math.pow(EXPOSURE_REF / skyLum, 0.5), 0.8, 4);
+    this.bloom.threshold = BLOOM_DISPLAY / this.renderer.toneMappingExposure;
+    // Облака: Солнце сквозь атмосферу, сверху — небо, снизу — свет, отражённый землёй.
+    const cloudSun = new THREE.Vector3(a.sunColor.r, a.sunColor.g, a.sunColor.b).multiplyScalar(a.sunStrength * CLOUD_SUN * (1 - 0.6 * oc));
+    const cloudBottom = new THREE.Vector3(this.hemi.groundColor.r, this.hemi.groundColor.g, this.hemi.groundColor.b).multiplyScalar(this.hemi.intensity * 0.35);
+    setCloudLight(this.clouds, this.sunDir, cloudSun, skyMix.clone().multiplyScalar(CLOUD_SKY), cloudBottom);
 
     this.envTarget?.dispose();
     this.envTarget = this.pmrem.fromScene(this.skyEnv);
@@ -707,7 +728,6 @@ export class World {
     this.sky.follow(this.camera.position);
     this.windOffset.addScaledVector(this.cloudWind, -dt);
     const cu = this.clouds.material.uniforms;
-    (cu['cam']!.value as THREE.Vector3).copy(this.camera.position);
     this.clouds.position.x = this.camera.position.x;
     this.clouds.position.z = this.camera.position.z;
     // Направление взгляда — что впереди, то рельеф и загружает раньше.

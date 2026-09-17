@@ -3,7 +3,7 @@ import { buildMission, forecastWeather, SCENARIOS, type DeliveryScenario, type R
 import { AIRCRAFT } from '../src/sim/aircraft';
 import { LiveFlight, type Controls } from '../src/sim/flight';
 import { combineResults, distanceM, fromLocal, simulateMission, toLocal } from '../src/sim/mission';
-import { fillVoids, flatTerrain } from '../src/sim/terrain';
+import { fillVoids, flatTerrain, removeSpikes } from '../src/sim/terrain';
 import type { GeoPoint, Weather } from '../src/sim/types';
 
 const terrain = flatTerrain(260);
@@ -103,6 +103,31 @@ describe('построение маршрута', () => {
 });
 
 describe('данные рельефа', () => {
+  it('узкий шпиль-выброс срезается, широкая гора и крутой склон остаются', () => {
+    const w = 120;
+    const cell = 15;
+    const g = new Float32Array(w * w);
+    for (let y = 0; y < w; y++) {
+      for (let x = 0; x < w; x++) {
+        // Широкая гора 600 м (радиус ~700 м), шпиль 260 м шириной ~120 м и склон-уступ.
+        const hill = 600 * Math.exp(-(((x - 40) * cell) ** 2 + ((y - 40) * cell) ** 2) / (2 * 450 ** 2));
+        const spike = 260 * Math.max(0, 1 - Math.hypot((x - 85) * cell, (y - 85) * cell) / 60);
+        const step = x > 100 ? 300 * Math.min(1, (x - 100) / 6) : 0;
+        g[y * w + x] = 200 + hill + spike + step;
+      }
+    }
+    const hillTop = g[40 * w + 40]!;
+    const cliff = g[60 * w + 110]!;
+    const spikeTop = g[85 * w + 85]!;
+    // Там же без шпиля: шпиль стоит на склоне горы.
+    const ground = 200 + 600 * Math.exp(-(((85 - 40) * cell) ** 2 * 2) / (2 * 450 ** 2));
+    expect(removeSpikes(g, w, w, cell)).toBeGreaterThan(0);
+    expect(spikeTop - g[85 * w + 85]!).toBeGreaterThan(100);
+    expect(g[85 * w + 85]! - ground).toBeLessThan(130);
+    expect(g[40 * w + 40]).toBe(hillTop);
+    expect(g[60 * w + 110]).toBe(cliff);
+  });
+
   it('пустоты заполняются соседями, настоящая ложбина остаётся', () => {
     const w = 40;
     const g = new Float32Array(w * w).fill(200);

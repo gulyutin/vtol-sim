@@ -136,27 +136,40 @@ class Geo {
   }
 }
 
-/** Ель: ствол и три конуса; высота TREE_REF_H; 52 треугольника. */
+/**
+ * Ель или пихта таёжная: невысокий ствол и пять ярусов узкого конуса — силуэт «свечой»; нижние
+ * ярусы темнее (внутри кроны тень), кончики светлее. Высота TREE_REF_H; ~90 треугольников.
+ */
 function coniferGeometry(): THREE.BufferGeometry {
   const g = new Geo();
-  g.trunk(5, 0.38, 0.26, 0, 4.2, new THREE.Color(0x4a3728));
-  const crown = new THREE.Color(0x2f4b2c);
+  g.trunk(5, 0.34, 0.2, 0, 3.2, new THREE.Color(0x3f3024));
+  const crown = new THREE.Color(0x27402a);
   const tiers: [number, number, number][] = [
-    [2.6, 3.5, 9.4],
-    [6.2, 2.8, 12.8],
-    [9.6, 2.0, TREE_REF_H],
+    [2.0, 3.0, 7.4],
+    [4.6, 2.5, 9.9],
+    [7.2, 2.0, 12.2],
+    [9.8, 1.45, 14.4],
+    [12.3, 0.9, TREE_REF_H],
   ];
-  for (const [yb, r, yt] of tiers) g.cone(7, r, yb, yt, crown.clone().multiplyScalar(0.72), crown.clone().multiplyScalar(1.1));
+  tiers.forEach(([yb, r, yt], i) => {
+    const k = 0.62 + 0.09 * i;
+    g.cone(8, r, yb, yt, crown.clone().multiplyScalar(k), crown.clone().multiplyScalar(k + 0.45));
+  });
   return g.build();
 }
 
-/** Лиственное: ствол и две неровные кроны; высота TREE_REF_H; 50 треугольников. */
+/**
+ * Берёза или осина: светлый тонкий ствол и крона из четырёх неровных клубов, вытянутая вверх.
+ * Высота TREE_REF_H; ~90 треугольников. Осенью цвет кроны меняет цвет экземпляра.
+ */
 function broadleafGeometry(): THREE.BufferGeometry {
   const g = new Geo();
-  g.trunk(5, 0.42, 0.3, 0, 7.5, new THREE.Color(0x5b4a3a));
-  const crown = new THREE.Color(0x4e7b35);
-  g.blob(0, 10.6, 0, 5.0, 4.4, crown, 0);
-  g.blob(1.7, 12.8, -1.1, 3.4, 3.0, crown.clone().multiplyScalar(1.08), 2.1);
+  g.trunk(5, 0.3, 0.16, 0, 10.5, new THREE.Color(0xbdb6a6));
+  const crown = new THREE.Color(0x4f7a33);
+  g.blob(0, 10.4, 0, 3.0, 3.3, crown.clone().multiplyScalar(0.85), 0);
+  g.blob(1.4, 12.5, 0.6, 2.4, 2.6, crown, 2.1);
+  g.blob(-1.2, 12.1, -0.8, 2.3, 2.5, crown.clone().multiplyScalar(0.95), 4.3);
+  g.blob(0.2, 14.3, 0.1, 1.8, 1.8, crown.clone().multiplyScalar(1.12), 1.3);
   return g.build();
 }
 
@@ -457,7 +470,11 @@ export class OsmLayer {
 
   private readonly runwayParts: { mesh: THREE.Mesh; tex?: THREE.Texture }[] = [];
 
-  constructor(data: OsmData, groundAt: (east: number, north: number) => number, quality: QualitySettings) {
+  /** Осень 0…1: доля пожелтевших лиственных и насколько они жёлтые. */
+  private readonly autumn: number;
+
+  constructor(data: OsmData, groundAt: (east: number, north: number) => number, quality: QualitySettings, season: { autumn?: number } = {}) {
+    this.autumn = Math.min(1, Math.max(0, season.autumn ?? 0));
     this.data = data;
     this.groundAt = groundAt;
     this.quality = quality;
@@ -682,9 +699,20 @@ export class OsmLayer {
           M[o + 15] = 1;
           const l = 0.78 + 0.4 * hash3(i, j, 9);
           const warm = hash3(i, j, 10);
-          C[k * 3] = l * (0.92 + 0.2 * warm);
-          C[k * 3 + 1] = l;
-          C[k * 3 + 2] = l * (0.97 - 0.12 * warm);
+          let r = l * (0.92 + 0.2 * warm);
+          let gr = l;
+          let b = l * (0.97 - 0.12 * warm);
+          // Осень: лиственные желтеют не разом — у каждого своя доля, некоторые уже рыжие.
+          if (!conifer && this.autumn > 0) {
+            const turn = this.autumn * (0.35 + 0.65 * hash3(i, j, 11));
+            const orange = hash3(i, j, 12) < 0.25;
+            r *= 1 + turn * (orange ? 4.6 : 3.8);
+            gr *= 1 + turn * (orange ? 0.0 : 0.32);
+            b *= 1 - turn * 0.6;
+          }
+          C[k * 3] = r;
+          C[k * 3 + 1] = gr;
+          C[k * 3 + 2] = b;
         }
       }
       if (performance.now() >= deadline) return;

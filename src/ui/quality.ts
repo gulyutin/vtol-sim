@@ -27,6 +27,8 @@ export interface QualitySettings {
   dustParticles: number;
   /** Капель дождя и снежинок вокруг камеры. */
   precipParticles: number;
+  /** Объёмные облака: шагов по лучу и шагов самозатенения к Солнцу. */
+  cloudSteps: [number, number];
 }
 
 export const QUALITY: Record<Quality, QualitySettings> = {
@@ -44,7 +46,7 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     treeRadiusM: 0,
     treeSpacingM: 14,
     dustParticles: 150,
-    precipParticles: 6000,
+    precipParticles: 6000, cloudSteps: [18, 1],
   },
   medium: {
     label: 'Среднее',
@@ -60,7 +62,7 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     treeRadiusM: 700,
     treeSpacingM: 11,
     dustParticles: 400,
-    precipParticles: 12000,
+    precipParticles: 12000, cloudSteps: [32, 2],
   },
   high: {
     label: 'Высокое',
@@ -76,7 +78,7 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     treeRadiusM: 1400,
     treeSpacingM: 8,
     dustParticles: 900,
-    precipParticles: 20000,
+    precipParticles: 20000, cloudSteps: [48, 3],
   },
 };
 

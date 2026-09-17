@@ -1,4 +1,4 @@
-import { fillVoids, GridTerrain, mercatorPixel } from '../sim/terrain';
+import { fillVoids, GridTerrain, mercatorPixel, removeSpikes } from '../sim/terrain';
 import type { PackBounds } from './packFormat';
 import { activePack, fetchWithRetry, terrainTile, tileEnv } from './tileSource';
 
@@ -74,5 +74,9 @@ export async function loadTerrain(b: Bounds, zoom = 12, onProgress?: (done: numb
   if (failed > 0 && tileEnv().offline) console.warn(`Без сети: рельефа нет для ${failed} из ${tiles.length} тайлов — там высоты достроены по соседним`);
   const voids = fillVoids(heights, width, rows * 256);
   if (voids > 0) console.info(`Рельеф: заполнено пустот в данных — ${voids} клеток`);
+  // Клетка Меркатора на широте середины области, м.
+  const cellM = (40_075_016.686 * Math.cos((((b.north + b.south) / 2) * Math.PI) / 180)) / (256 * 2 ** zoom);
+  const spikes = removeSpikes(heights, width, rows * 256, cellM);
+  if (spikes > 0) console.info(`Рельеф: срезано выбросов-шпилей — ${spikes} клеток`);
   return new GridTerrain(heights, width, rows * 256, zoom, tx0 * 256, ty0 * 256);
 }

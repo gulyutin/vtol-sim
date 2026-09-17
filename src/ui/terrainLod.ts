@@ -119,7 +119,7 @@ const SHADER_FRAGMENT = /* glsl */ `
 if (tSunDir.y > 0.05) {
   // Тень облака: точка облачного слоя на луче к Солнцу, та же функция, что у облаков.
   vec2 p = vTerrainWorld.xz + tSunDir.xz / tSunDir.y * (tCloudBase - vTerrainWorld.y);
-  float d = tFbm6((p + tCloudOffset) / 2600.0);
+  float d = tFbm4((p + tCloudOffset) / 2600.0);
   float c = smoothstep(1.0 - tCloudCover, 1.0 - tCloudCover + 0.22, d);
   diffuseColor.rgb *= 1.0 - 0.42 * c;
 }

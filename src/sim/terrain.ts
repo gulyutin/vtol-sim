@@ -265,6 +265,42 @@ export function fillVoids(heights: Float32Array, width: number, height: number, 
   return filled;
 }
 
+/**
+ * Выбросы в данных высот: узкий «шпиль», который во все восемь сторон выше точек на расстоянии
+ * radiusM больше чем на riseM (уклон круче ~36° по кругу — на настоящем рельефе так не бывает,
+ * вершины шире). Такой пик срезается до высоты окружения плюс половина порога; за несколько
+ * проходов срезается и основание конуса. Широкие горы и хребты не трогаются.
+ * cellM — размер клетки сетки, м. Возвращает число исправленных клеток.
+ */
+export function removeSpikes(heights: Float32Array, width: number, height: number, cellM: number, riseM = 110, radiusM = 150): number {
+  const r = Math.max(1, Math.round(radiusM / cellM));
+  const d = Math.max(1, Math.round(r * Math.SQRT1_2));
+  const offs = [
+    [r, 0], [-r, 0], [0, r], [0, -r],
+    [d, d], [d, -d], [-d, d], [-d, -d],
+  ] as const;
+  let fixed = 0;
+  for (let pass = 0; pass < 6; pass++) {
+    const writes: [number, number][] = [];
+    for (let y = r; y < height - r; y++) {
+      const row = y * width;
+      for (let x = r; x < width - r; x++) {
+        const h = heights[row + x]!;
+        let ring = -Infinity;
+        for (const [dx, dy] of offs) {
+          ring = Math.max(ring, heights[(y + dy) * width + x + dx]!);
+          if (h - ring <= riseM) break;
+        }
+        if (h - ring > riseM) writes.push([row + x, ring + riseM * 0.5]);
+      }
+    }
+    if (!writes.length) break;
+    for (const [i, v] of writes) heights[i] = v;
+    fixed += writes.length;
+  }
+  return fixed;
+}
+
 /** Ровная местность на одной высоте. */
 export function flatTerrain(elevationM: number): Terrain {
   return { elevationM: () => elevationM };
