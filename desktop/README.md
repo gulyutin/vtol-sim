@@ -1,155 +1,110 @@
-# Настольное приложение
+# Desktop app
 
-Симулятор в отдельном окне на Electron, с установщиками для macOS, Windows и Linux. Страница та
-же, что в браузере (сборка Vite), главный процесс добавляет к ней протокол `app://`, пакеты
-районов, режим без сети, меню и запоминание окна.
+The simulator in its own Electron window, with installers for macOS, Windows and Linux. The page is the same as in the browser (Vite build); the main process adds the `app://` protocol, region packs, offline mode, a menu and window state persistence.
 
-## Команды
+## Commands
 
-| Команда | Что делает |
+| Command | What it does |
 | --- | --- |
-| `npm run desktop:dev` | Vite (текущий профиль) и Electron поверх него; `PROFILE=demo npm run desktop:dev` — демо |
-| `npm run desktop:build` | установщик текущего профиля для этой ОС |
-| `npm run desktop:build:demo` | то же для демо-профиля |
-| `npm run desktop:icons` | только значки из `desktop/icon.svg` → `desktop/build/` |
+| `npm run desktop:dev` | Vite (current profile) with Electron on top; `PROFILE=demo npm run desktop:dev` — demo |
+| `npm run desktop:build` | installer of the current profile for this OS |
+| `npm run desktop:build:demo` | the same for the demo profile |
+| `npm run desktop:icons` | icons only, from `desktop/icon.svg` → `desktop/build/` |
 
-К сборке можно добавить ключи после `--`: `--mac`, `--win`, `--linux` (платформа), `--x64`,
-`--arm64`, `--universal` (архитектура), `--dir` (без установщика, только распакованное приложение —
-быстро для проверки). Пример: `npm run desktop:build:demo -- --mac --arm64 --dir`.
+Build flags can be added after `--`: `--mac`, `--win`, `--linux` (platform), `--x64`, `--arm64`, `--universal` (architecture), `--dir` (no installer, just the unpacked app — quick for testing). Example: `npm run desktop:build:demo -- --mac --arm64 --dir`.
 
-Установщики складываются в `release/demo/` и `release/private/` (папка в `.gitignore`):
+Installers go to `release/demo/` and `release/private/` (the folder is in `.gitignore`):
 
-- macOS — `*.dmg` для arm64 и x64;
-- Windows — `*-win-x64.exe`, установщик NSIS на русском, с выбором папки и ярлыками на рабочем
-  столе и в меню «Пуск»;
-- Linux — `*.AppImage` и `*.deb` для x64.
+- macOS — `*.dmg` for arm64 and x64;
+- Windows — `*-win-x64.exe`, a Russian-language NSIS installer with a choice of folder and shortcuts on the desktop and in the Start menu;
+- Linux — `*.AppImage` and `*.deb` for x64.
 
-Название приложения берётся из профиля (`PROFILE.title`) во время сборки. **Установщики закрытого
-профиля собираются только локально и никуда не загружаются**; публиковать можно только демо.
-Демо-сборка перед упаковкой проверяется по `private/export/forbidden.txt` (если он есть) — нашлось
-совпадение, и сборка останавливается.
+The app name comes from the profile (`PROFILE.title`) at build time. **Installers of a private profile are built locally only and are never uploaded**; only the demo may be published. Before packaging, the demo build is checked against `private/export/forbidden.txt` (if present) — any match stops the build.
 
-## Устройство
+## Layout
 
-| Файл | Назначение |
+| File | Purpose |
 | --- | --- |
-| `main.cts` | главный процесс: окно, протокол `app://`, сеть, меню, настройки, журнал |
-| `preload.cts` | мост `window.vtolDesktop` (тип — `src/desktop.d.ts`) |
-| `build.mjs` | сборка: профиль → Vite → `desktop/.stage/<demo\|private>/app` → electron-builder |
-| `dev.mjs` | режим разработки |
-| `icon.svg`, `make-icons.mjs` | собственный значок и растеризатор в PNG / ICO / ICNS без внешних программ |
+| `main.cts` | main process: window, `app://` protocol, network, menu, settings, log file |
+| `preload.cts` | the `window.vtolDesktop` bridge (type in `src/desktop.d.ts`) |
+| `build.mjs` | build: profile → Vite → `desktop/.stage/<demo\|private>/app` → electron-builder |
+| `dev.mjs` | development mode |
+| `icon.svg`, `make-icons.mjs` | the app icon and a rasteriser to PNG / ICO / ICNS without external tools |
 
-**Протокол `app://`.** Страница открывается как `app://app/index.html`, файлы — из `dist` внутри
-`app.asar` (Vite собирает с `base: '/'`). Пакеты районов — `app://packs/<regionId>/…`: сначала
-`<userData>/packs/`, затем `<resources>/packs/` (вшитые в установщик). Нет файла — 404. MIME-типы
-выставляются по расширению, заголовок `Access-Control-Allow-Origin: *` — у всех ответов.
+**The `app://` protocol.** The page opens as `app://app/index.html`; files come from `dist` inside `app.asar` (Vite builds with `base: '/'`). Region packs are served as `app://packs/<regionId>/…`: first from `<userData>/packs/`, then from `<resources>/packs/` (bundled with the installer). A missing file is a 404. MIME types are set by extension; every response has `Access-Control-Allow-Origin: *`.
 
-**Вшитые пакеты.** В установщик закрытого профиля попадает всё, что лежит в папке `packs/` проекта
-(`scripts/region-pack.mjs --out packs/<id>`; папка в `.gitignore`), — в `<resources>/packs/`. Другую
-папку можно задать переменной `VTOL_BUNDLED_PACKS`. Демо-установщик вшивает пакеты **только** из
-`VTOL_BUNDLED_PACKS`: в `packs/` могут лежать районы закрытого профиля; их `manifest.json` при
-демо-сборке проверяются по списку запрещённого. Пакеты из `public/packs/` (раскладка для браузера)
-в приложение не попадают. При разработке вшитыми считаются пакеты из `packs/` проекта.
+**Bundled packs.** The private-profile installer bundles everything in the project's `packs/` folder (`scripts/region-pack.mjs --out packs/<id>`; the folder is in `.gitignore`) into `<resources>/packs/`. Another folder can be set with the `VTOL_BUNDLED_PACKS` variable. The demo installer bundles packs **only** from `VTOL_BUNDLED_PACKS`: `packs/` may hold private-profile regions, and their `manifest.json` files are checked against the forbidden list during a demo build. Packs in `public/packs/` (the browser layout) do not go into the app. In development, packs from the project's `packs/` count as bundled.
 
-**Мост.** `window.vtolDesktop = { version, platform: 'win' | 'mac' | 'linux', packsBaseUrl:
-'app://packs/', offline }` — замороженный объект, только для чтения. В браузере его нет.
+**The bridge.** `window.vtolDesktop = { version, platform: 'win' | 'mac' | 'linux', packsBaseUrl: 'app://packs/', offline }` — a frozen, read-only object. It does not exist in the browser.
 
-**Режим без сети.** «Файл → Работать без сети» или ключ запуска `--offline` (`--online` —
-выключить); выбор запоминается. Главный процесс отменяет в `session.webRequest` всё, кроме `app://`,
-`data:` и `blob:` — `fetch` падает сразу с `net::ERR_BLOCKED_BY_CLIENT`. При переключении
-страница перезагружается, чтобы `offline` в мосте совпадал с тем, что происходит на самом деле.
+**Offline mode.** The menu item «Файл → Работать без сети» (File → Work offline) or the `--offline` launch flag (`--online` turns it off); the choice is remembered. The main process cancels everything in `session.webRequest` except `app://`, `data:` and `blob:`, so `fetch` fails immediately with `net::ERR_BLOCKED_BY_CLIENT`. Switching reloads the page so that `offline` in the bridge matches what actually happens.
 
-**Безопасность.** `contextIsolation`, `sandbox` (для всех окон — `app.enableSandbox()`), без
-`nodeIntegration`; CSP в заголовке страницы: скрипты только свои, картинки и `fetch` — свои,
-`app:` и `https:` (карты, рельеф, погода). Переход на чужие адреса и новые окна запрещены (ссылки
-`https:` открываются в браузере, в режиме без сети — никак), `<webview>` запрещён, из разрешений
-страницы — только полноэкранный режим, захват указателя и запись в буфер обмена.
+**Security.** `contextIsolation`, `sandbox` (for all windows — `app.enableSandbox()`), no `nodeIntegration`; a CSP header on the page: only own scripts; images and `fetch` — own, `app:` and `https:` (maps, terrain, weather). Navigating to other origins and opening new windows is blocked (`https:` links open in the browser, and not at all in offline mode), `<webview>` is blocked, and the page may only request fullscreen, pointer lock and clipboard write.
 
-**Настройки и журнал.** `<userData>/settings.json` — размер, положение, развёрнутость и
-полноэкранный режим окна, режим без сети. `<userData>/logs/main.log` — запуск, загрузка,
-ошибки и предупреждения страницы, отменённые запросы; ключ `--verbose` пишет всё. `<userData>`:
+**Settings and log.** `<userData>/settings.json` — window size, position, maximised and fullscreen state, offline mode. `<userData>/logs/main.log` — startup, loading, page errors and warnings, cancelled requests; the `--verbose` flag logs everything. `<userData>` is:
 
-- macOS — `~/Library/Application Support/<название>`;
-- Windows — `%APPDATA%\<название>`;
-- Linux — `~/.config/<название>`.
+- macOS — `~/Library/Application Support/<app name>`;
+- Windows — `%APPDATA%\<app name>`;
+- Linux — `~/.config/<app name>`.
 
-Для проверки подойдёт `--remote-debugging-port=9222`: DevTools-протокол на `localhost`.
+For testing, `--remote-debugging-port=9222` exposes the DevTools protocol on `localhost`.
 
-## Windows и Linux
+## Windows and Linux
 
-На Mac (electron-builder 26, Apple Silicon) `npm run desktop:build:demo -- --mac --linux --win`
-собирает все установщики сам — NSIS, AppImage и deb, без Wine и Docker: нужные инструменты
-electron-builder скачивает в свой кэш. Запустить Windows- и Linux-версии на Mac нельзя — их
-проверяют на своих ОС.
+On a Mac (electron-builder 26, Apple Silicon) `npm run desktop:build:demo -- --mac --linux --win` builds all installers by itself — NSIS, AppImage and deb, without Wine or Docker: electron-builder downloads the tools it needs into its cache. The Windows and Linux builds cannot be run on a Mac; test them on their own systems.
 
-Запасной путь — workflow `.github/workflows/desktop.yml` в публичном репозитории: запуск только
-вручную (Actions → «Настольное приложение» → Run workflow), матрица macOS / Windows / Ubuntu,
-демо-профиль, установщики — артефакты запуска на 14 дней. Релизы не публикуются, секретов нет.
+The fallback is the `.github/workflows/desktop.yml` workflow in the public repository: manual runs only (Actions → "Desktop app" → Run workflow), a macOS / Windows / Ubuntu matrix, the demo profile, installers kept as run artifacts for 14 days. No releases are published and no secrets are used.
 
-Linux: AppImage перед запуском нужно сделать исполняемым (`chmod +x`); на Ubuntu 22.04 и новее
-ему нужен пакет `libfuse2`. Если AppImage не запускается из-за песочницы Chromium (Ubuntu 24.04),
-ставьте deb.
+Linux: make the AppImage executable before running it (`chmod +x`); on Ubuntu 22.04 and newer it needs the `libfuse2` package. If the AppImage does not start because of the Chromium sandbox (Ubuntu 24.04), install the deb.
 
-## Подпись
+## Code signing
 
-Без сертификатов установщики **не подписаны**. На macOS приложение подписывается ad-hoc (иначе на
-Apple Silicon оно не запустится вовсе), но это не подпись разработчика.
+Without certificates the installers are **unsigned**. On macOS the app is signed ad-hoc (otherwise it does not start on Apple Silicon at all), but that is not a developer signature.
 
-### Что увидит пользователь
+### What users will see
 
-**macOS (Gatekeeper).** При первом запуске скачанного приложения — «Не удаётся проверить
-разработчика» / «Apple не может проверить приложение на наличие вредоносного ПО».
+**macOS (Gatekeeper).** On the first launch of a downloaded app: "cannot verify the developer" / "Apple could not verify the app is free of malware".
 
-- macOS 14 и старше: правой кнопкой (или Control-щелчок) по приложению в «Программах» →
-  «Открыть» → «Открыть».
-- macOS 15 и новее этот путь убрали: попробовать открыть, затем «Системные настройки →
-  Конфиденциальность и безопасность» → внизу «Всё равно открыть» → ввести пароль.
-- Для опытных: `xattr -dr com.apple.quarantine "/Applications/<название>.app"`.
+- macOS 14 and older: right-click (or Control-click) the app in Applications → Open → Open.
+- macOS 15 and newer removed that path: try to open the app, then System Settings → Privacy & Security → "Open Anyway" at the bottom → enter your password.
+- Advanced: `xattr -dr com.apple.quarantine "/Applications/<app name>.app"`.
 
-**Windows (SmartScreen).** «Windows защитила ваш компьютер», издатель неизвестен. Нажать
-«Подробнее» → «Выполнить в любом случае». Антивирус может дополнительно проверить установщик.
+**Windows (SmartScreen).** "Windows protected your PC", unknown publisher. Click "More info" → "Run anyway". An antivirus may also scan the installer.
 
-**Linux.** Подписи не спрашивает.
+**Linux.** No signature prompts.
 
-### Что нужно для подписи
+### What signing requires
 
 **macOS:**
 
-1. Членство в Apple Developer Program (99 $ в год).
-2. Сертификат **Developer ID Application**, выгруженный в `.p12` с паролем.
-3. Для нотаризации — ключ App Store Connect API (`.p8`, Key ID, Issuer ID) или Apple ID с паролем
-   приложения и Team ID.
+1. Apple Developer Program membership ($99 a year).
+2. A **Developer ID Application** certificate exported to a password-protected `.p12`.
+3. For notarisation — an App Store Connect API key (`.p8`, Key ID, Issuer ID) or an Apple ID with an app-specific password and Team ID.
 
-С подписью `build.mjs` включает hardened runtime, а electron-builder сам отправляет приложение на
-нотаризацию и прикрепляет к нему «печать» (staple) — тогда Gatekeeper молчит.
+With signing enabled, `build.mjs` turns on the hardened runtime, and electron-builder submits the app for notarisation and staples the ticket — then Gatekeeper stays silent.
 
-**Windows:** сертификат подписи кода (OV или EV) от удостоверяющего центра. С 2023 года ключ
-выдают только на токене или в облачном HSM, поэтому варианта два:
+**Windows:** a code signing certificate (OV or EV) from a certificate authority. Since 2023 the key is issued only on a hardware token or in a cloud HSM, so there are two options:
 
-- `.pfx` (если УЦ его выдаёт) или токен на машине сборки;
-- облачная подпись Azure Trusted Signing — тогда в `build.mjs` добавляется `win.azureSignOptions`
-  (имя издателя, endpoint, профиль сертификата, учётная запись подписи — это не секреты), а
-  секреты передаются переменными `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`.
+- a `.pfx` (if the CA issues one) or a token on the build machine;
+- Azure Trusted Signing — then `win.azureSignOptions` is added to `build.mjs` (publisher name, endpoint, certificate profile, signing account — none of these are secrets), and the secrets are passed as `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`.
 
-Подпись убирает «неизвестного издателя», но SmartScreen может предупреждать и дальше, пока у
-сертификата не накопится репутация.
+Signing removes "unknown publisher", but SmartScreen may keep warning until the certificate builds up reputation.
 
-### Куда вписать ключи
+### Where the keys go
 
-**Только в переменные окружения** electron-builder на машине сборки или в секреты CI. В
-репозиторий — ни сертификатов, ни паролей, ни `.env` с ними.
+**Only into electron-builder environment variables** on the build machine or into CI secrets. Never commit certificates, passwords or `.env` files with them.
 
-| Переменная | Для чего |
+| Variable | Purpose |
 | --- | --- |
-| `CSC_LINK` | путь к `.p12` (или base64 его содержимого) — macOS |
-| `CSC_KEY_PASSWORD` | пароль к `.p12` |
-| `CSC_NAME` | вместо `CSC_LINK`: имя сертификата, уже лежащего в связке ключей |
-| `APPLE_API_KEY`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` | нотаризация по ключу API (путь к `.p8`, Key ID, Issuer ID) |
-| `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID` | или нотаризация по Apple ID |
-| `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` | `.pfx` и пароль для Windows (при сборке не на Windows) |
+| `CSC_LINK` | path to the `.p12` (or its base64 content) — macOS |
+| `CSC_KEY_PASSWORD` | password of the `.p12` |
+| `CSC_NAME` | instead of `CSC_LINK`: name of a certificate already in the keychain |
+| `APPLE_API_KEY`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` | notarisation with an API key (path to the `.p8`, Key ID, Issuer ID) |
+| `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID` | or notarisation with an Apple ID |
+| `WIN_CSC_LINK`, `WIN_CSC_KEY_PASSWORD` | `.pfx` and password for Windows (when building on another OS) |
 | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | Azure Trusted Signing |
 
-Пример для macOS:
+Example for macOS:
 
 ```sh
 export CSC_LINK=~/keys/developer-id.p12 CSC_KEY_PASSWORD=…
@@ -157,6 +112,4 @@ export APPLE_API_KEY=~/keys/AuthKey_XXXX.p8 APPLE_API_KEY_ID=XXXX APPLE_API_ISSU
 npm run desktop:build:demo
 ```
 
-В GitHub Actions — через «Settings → Secrets and variables → Actions» и блок `env:` у шага сборки
-в `desktop.yml` (`CSC_LINK: ${{ secrets.MAC_CERT_P12_BASE64 }}` и т. д.; строку
-`CSC_IDENTITY_AUTO_DISCOVERY: 'false'` тогда убрать). Сейчас workflow секретов не использует.
+In GitHub Actions, use Settings → Secrets and variables → Actions and an `env:` block on the build step in `desktop.yml` (`CSC_LINK: ${{ secrets.MAC_CERT_P12_BASE64 }}` and so on; then remove the `CSC_IDENTITY_AUTO_DISCOVERY: 'false'` line). The workflow currently uses no secrets.

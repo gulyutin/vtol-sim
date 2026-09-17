@@ -1,58 +1,74 @@
-# VTOL-симулятор миссии
+# VTOL Mission Simulator
 
-Симулятор полёта VTOL-самолёта схемы «4 + 1»: четыре подъёмных ротора и маршевый винт. Взлёт и посадка — вертикально, маршрут — по-самолётному. Интерфейс в стиле наземной станции управления: карта со спутниковыми снимками и 3D-вид аппарата.
+A browser-based simulator and operator trainer for a "4+1" VTOL aircraft: four lift rotors plus a pusher propeller. It takes off and lands vertically and flies its route like an airplane. The interface follows a ground control station (GCS): a map with satellite imagery, a 3D view of the aircraft, telemetry and instruments.
 
-**Играть:** https://gulyutin.github.io/vtol-sim/
+**Play:** https://gulyutin.github.io/vtol-sim/
 
-## Задания
+The in-app interface is in Russian.
 
-- **Перелёт А → Б** (по умолчанию) — взлёт на аэродроме, свои промежуточные точки, посадка в пункте Б; точку Б можно перетащить.
-- **Аэрофотосъёмка склона** — галсы по GSD и перекрытиям, кадры, покрытие участка, выдержка и освещённость.
-- **Доставка** — туда с грузом, посадка и разгрузка, обратно.
-- **Облёт по маршруту** — свои точки и высоты; маршрут можно менять в полёте.
+## Missions
 
-Районы с разным рельефом — выбор в верхней панели: Подмосковье (долина Оки), Приэльбрусье (высокогорная долина Баксана, площадка на 1900 м), Хибины (горы до 1200 м и Имандра), Байкал (Малое Море и Ольхон). У каждого — свои дома, дороги и вода из OpenStreetMap и ретрансляторы связи на гребнях.
+- **Transfer A → B** (default) — take off at the airfield, fly your own waypoints, land at point B; point B can be dragged on the map.
+- **Aerial survey** — survey lines from the required GSD and overlaps, photo frames, area coverage, shutter speed and lighting.
+- **Delivery** — fly out with cargo, land and unload, fly back.
+- **Route flight** — your own waypoints and heights above terrain; the route can be edited in flight.
+- **Search and rescue** — search lines over an area with a thermal camera; missing people are among bears, wolves, moose and deer that are warm too. Click a hot spot in the thermal window to mark a find.
+- **Forest fire patrol** — patrol a zone, spot smoke columns that are visible for kilometres and report them from the 3D view, then confirm the fire with the thermal camera and mark hot spots: smouldering spots inside the burn, spot fires beyond the edge and lone smouldering trees with almost no smoke. Sun-heated rock fields and a cabin with a burning stove are decoys.
 
-Порядок как на настоящем аппарате: по желанию — предполётная подготовка (питание — после него загораются БАНО; связь; проверки сервоприводов — элероны и рули V-оперения ходят на модели; воздушных сигналов — продув ПВД виден в телеметрии; регуляторов роторов, огней и маршевого двигателя), затем АРМ, взлёт; после касания — ДИЗАРМ. ДИЗАРМ в полёте тоже можно — моторы останавливаются, и аппарат планирует или падает: так отрабатывается отказ.
+Regions with different terrain are selected in the top bar: Moscow region (Oka valley), Elbrus area (the high Baksan valley, airfield at 1,900 m), Khibiny (mountains up to 1,200 m and Lake Imandra), Lake Baikal (Maloye More and Olkhon Island) and Kuturchin Belogorye (Eastern Sayan taiga and bald peaks up to 1,640 m). Each region has its own buildings, roads and water from OpenStreetMap and radio relays on the ridges.
 
-Взлёт и посадка — против ветра: взлётный маршрут с разгоном, посадочная прямая из трёх точек, торможение с выключенным маршевым винтом, снижение в режиме коптера. Перед взлётом — предполётные проверки: ветер, температура, облачность, масса, прямая видимость с НСУ.
+The flight procedure follows a real aircraft: optional pre-flight checks (power — the navigation lights come on after it; the data link; servo checks — the ailerons and V-tail surfaces move on the model; air data — blowing into the pitot tube shows in telemetry; lift rotor controllers, lights and the pusher motor), then ARM and takeoff; after touchdown — DISARM. DISARM in flight is possible too: the motors stop and the aircraft glides or falls, which is how a failure is practised.
 
-## Тренажёр
+Takeoff and landing are into the wind: a departure leg with acceleration, a three-point final approach, braking with the pusher off and a descent in copter mode. Pre-flight checks cover wind, temperature, cloud base, mass and line of sight to the GCS.
 
-- **Особые случаи** — окно «Инструктор»: отказы связи, ГНСС, ПВД, рулей, маршевого и подъёмных двигателей, питания и другие; панель тревог с порядком действий, «Фэйлсейф» — ручное управление с геймпада или клавиатуры.
-- **Погода** — по заданию, фактическая сейчас (Open-Meteo) или пресеты: порывы, дождь, снег, туман, низкая облачность; турбулентность, в том числе за холмами.
-- **Режимы** — от тренировки до зачёта со случайными отказами; после посадки — вывод о полёте одним абзацем, оценка и разбор: графики, события, повтор в 3D. Записи сохраняются в файл. Запись с местом полёта (например, бортовой журнал, если профиль умеет его читать) открывается там, где летали: район строится по записи — рельеф, снимки, ветер и маршрут, чтобы повторить тот же полёт на модели; рули в повторе — по командам из записи.
-- **Зоны и РЭБ** — окно «Зоны»: запретные зоны, подавление и подмена ГНСС, подавление связи; рисуются на карте или загружаются из GeoJSON/KML. Предполётная проверка предупреждает о пересечении, оценка штрафует за вход в запретную зону. Реальных зон в репозитории нет — только то, что нарисует или загрузит инструктор.
-- **Связь по рельефу** — за хребтом связь с НСУ пропадает, телеметрия приходит с пропусками или замирает; индикатор сигнала в верхней панели, радиотень на карте, ретрансляторы (мачта или аппарат-ретранслятор).
-- **Звук и голос** — роторы, маршевый, обтекание, сигналы НСУ; речевые сообщения («Потеря связи», «Заряд тридцать процентов»). Настройки — ⚙.
+## Trainer
 
-## Физика
+- **Emergencies** — the Instructor window: failures of the data link, GNSS, airspeed sensor, control surfaces, pusher and lift motors, power and more; an alert panel with the checklist; "Failsafe" — manual control from a gamepad or keyboard.
+- **Link-loss reaction** — set per mission: return home, continue the mission or land in place, after 5–120 s without the link.
+- **Weather** — from the mission, the actual weather now (Open-Meteo) or presets: gusts, rain, snow, fog, low cloud; turbulence, including in the lee of hills.
+- **Modes** — from training to an exam with random failures. After landing: a one-paragraph flight summary, a score and a debrief with charts, events and a 3D replay. Flights are saved to a file. A recording with a flight location opens where it was flown: the region is built from the recording — terrain, imagery, wind and route — so the same flight can be replayed on the model.
+- **Zones and electronic warfare** — the Zones window: no-fly zones, GNSS jamming and spoofing, data-link jamming; drawn on the map or loaded from GeoJSON/KML. The pre-flight check warns about crossings, and the score penalises entering a no-fly zone. The repository has no real zones — only what the instructor draws or loads.
+- **Terrain and the data link** — behind a ridge the GCS link drops and telemetry arrives with gaps or freezes; signal indicator in the top bar, radio shadow on the map, relays (a mast or a relay aircraft).
+- **Sound and voice** — rotors, pusher, airflow, GCS signals; voice callouts ("Link lost", "Battery thirty percent"). Settings are under ⚙.
 
-Поляра крыла с индуктивным сопротивлением в развороте, висение по импульсной теории, набор и снижение с ограничением вертикальной скорости, ветер со сдвигом по высоте и треугольник скоростей, огибание рельефа, ёмкость батареи по температуре. Планировщик и живой полёт считают по одной физике — расход в полёте сходится с планом.
+## Autopilot and physics
 
-Ветер у рельефа: восходящие потоки на наветренных склонах, нисходящие и роторная болтанка за хребтами, усиление над гребнями и в седловинах, ветер вдоль долин, днём — термики над освещёнными склонами. Плотность воздуха — по высоте и температуре: в горах висение дороже, развороты шире. Если рельеф у площадки круче предельного набора, переход в самолётный режим выше; ВОЗВРАТ набирает безопасную высоту над рельефом на пути домой.
+Wing polar with induced drag in turns, hover from momentum theory, climb and descent limited by vertical speed, wind with height shear and the wind triangle, terrain following, battery capacity by temperature. The planner and the live flight share the same physics, so in-flight consumption matches the plan.
 
-## Графика
+The route planner follows the terrain along the route. If the slope beyond the takeoff site is steeper than the aircraft can climb along the way, the plan adds climb orbits over the site (and descent orbits before landing) instead of cutting through the slope; the orbits show on the map and count in the energy budget. In flight, if a downdraft still leaves the aircraft short of height before a slope, it climbs in an orbit and then continues the route.
 
-Рельеф со спутниковыми снимками, дома и леса из OpenStreetMap, небо и облака с тенями на земле, пыль от роторов у земли. Качество — в верхней панели («Графика: низкое / среднее / высокое»): на слабых ноутбуках и телефонах выбирайте низкое.
+Wind near terrain: updrafts on windward slopes, downdrafts and rotor turbulence behind ridges, speed-up over crests and saddles, valley winds and daytime thermals over sunlit slopes. Air density follows height and temperature: hover costs more in the mountains and turns are wider. If the terrain at the site is steeper than the maximum climb, the transition to airplane mode happens higher; RETURN climbs to a safe height above terrain on the way home.
 
-Камера «за хвостом» поворачивается мышью, колёсико — ближе или дальше, двойной щелчок — обратно за хвост. «Камера на хвосте» закреплена на оперении и смотрит вперёд — горизонт кренится вместе с аппаратом. Ещё есть облёт мышью, вид с площадки и «кино» — смена ракурсов.
+## Graphics
 
-## Запуск
+- Terrain with satellite imagery; buildings, roads, water and forests from OpenStreetMap.
+- Sky and haze from one scattering model (Rayleigh and Mie): a blue zenith, a bright horizon, a halo around the sun, and distant ridges fading into aerial perspective by distance and height. Haze density follows the visibility in the weather.
+- Time of day: the sun reddens near the horizon, skylight turns blue at twilight, exposure adapts.
+- Volumetric clouds with self-shadowing and a silver lining against the sun; cloud shadows on the ground match the clouds.
+- Taiga spruces and birches; broadleaf trees turn yellow in autumn according to the region's date.
+- Rotor dust near the ground, smoke columns and flames of forest fires.
+
+Quality is set in the top bar (low / medium / high); choose low on weak laptops and phones.
+
+The chase camera turns with the mouse, the wheel moves it closer or farther, a double click puts it back behind the tail. The tail camera is mounted on the tail and looks forward, so the horizon banks with the aircraft. There are also a free orbit camera, a view from the pad and a "cinema" mode that switches angles.
+
+## Running locally
 
 ```bash
 npm ci
 npm run dev
 ```
 
-Тесты — `npm test`, проверка типов — `npm run typecheck`.
+Tests: `npm test`; type check: `npm run typecheck`.
 
-## Профиль аппарата
+A desktop app with installers for macOS, Windows and Linux is described in [desktop/README.md](desktop/README.md).
 
-Параметры аппарата, штатная камера и район заданий собраны в профиль (`src/sim/profile.ts`). В репозитории — демо-профиль `src/profile-demo`: условный аппарат, числа правдоподобные, но не относятся к конкретной модели. Свой профиль кладётся в `private/profile/index.ts` (папка в репозиторий не входит) и подхватывается автоматически; `PROFILE=demo` принудительно включает демо.
+## Aircraft profile
 
-## Данные
+Aircraft parameters, the standard camera and the mission regions live in a profile (`src/sim/profile.ts`). The repository contains the demo profile `src/profile-demo`: a generic aircraft whose numbers are plausible but do not describe any specific model. A custom profile goes into `private/profile/index.ts` (the folder is not in the repository) and is picked up automatically; `PROFILE=demo` forces the demo profile.
 
-Спутниковые снимки — Esri World Imagery. Рельеф — Terrain Tiles (Terrarium) из AWS Open Data. Дома, дороги, вода, леса и полосы — © участники OpenStreetMap, лицензия ODbL. Фактическая погода — Open-Meteo.com. 3D-модель аппарата условная.
+## Data and licences
 
-Озвучка НСУ — голос Silero TTS v5.5 (диктор xenia), лицензия CC BY-NC-SA 4.0: файлы в `public/voice` (там же `LICENSE.txt`), пересборка — `scripts/voice-pack.ts`. Фраз, которых нет в записи, говорит синтез речи браузера.
+Satellite imagery — Esri World Imagery. Terrain — Terrain Tiles (Terrarium) from AWS Open Data. Buildings, roads, water, forests and runways — © OpenStreetMap contributors, ODbL. Actual weather — Open-Meteo.com. The 3D aircraft model is generic.
+
+GCS voice — Silero TTS v5.5 (speaker xenia), licensed CC BY-NC-SA 4.0: the files are in `public/voice` (with `LICENSE.txt`); rebuild with `scripts/voice-pack.ts`. Phrases that are not recorded are spoken by the browser's speech synthesis.

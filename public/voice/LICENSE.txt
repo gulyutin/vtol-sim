@@ -1,13 +1,12 @@
-Озвучка НСУ — public/voice/xenia/*.mp3
+GCS voice callouts — public/voice/xenia/*.mp3
 
-Голос: Silero TTS, модель v5_5_ru, диктор xenia. Авторы — Silero Team,
+Voice: Silero TTS, model v5_5_ru, speaker xenia. Authors — Silero Team,
 https://github.com/snakers4/silero-models
-Лицензия моделей Silero и этих записей: Creative Commons «Атрибуция — Некоммерческое использование —
-На тех же условиях» 4.0 Международная (CC BY-NC-SA 4.0),
-https://creativecommons.org/licenses/by-nc-sa/4.0/
+Licence of the Silero models and of these recordings: Creative Commons Attribution-NonCommercial-ShareAlike
+4.0 International (CC BY-NC-SA 4.0), https://creativecommons.org/licenses/by-nc-sa/4.0/
 
-Что изменено: фразы синтезированы из текстов тренажёра (src/game/callouts.ts) с расставленными
-ударениями и сокращениями, записанными словами; тишина в начале и в конце обрезана, громкость
-выровнена, записи сжаты в MP3 (моно, 64 кбит/с). Пересобрать — scripts/voice-pack.ts.
+Changes made: the phrases were synthesised from the trainer's texts (src/game/callouts.ts) with stress marks
+added and abbreviations spelled out as words; leading and trailing silence trimmed, loudness normalised,
+recordings compressed to MP3 (mono, 64 kbit/s). Rebuild with scripts/voice-pack.ts.
 
-Записи можно использовать только некоммерчески, с указанием авторства; производные — на тех же условиях.
+The recordings may be used only non-commercially, with attribution; derivatives under the same terms.

@@ -1,8 +1,8 @@
-# Установщики настольного приложения (демо-профиль) для macOS, Windows и Linux.
-# Запускается только вручную (Actions → «Настольное приложение» → Run workflow).
-# Ничего не публикует: установщики остаются артефактами запуска на 14 дней. Без секретов —
-# установщики не подписаны (см. desktop/README.md).
-name: Настольное приложение
+# Desktop app installers (demo profile) for macOS, Windows and Linux.
+# Manual runs only (Actions → "Desktop app" → Run workflow).
+# Publishes nothing: installers stay as run artifacts for 14 days. No secrets —
+# the installers are unsigned (see desktop/README.md).
+name: Desktop app
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
           - { name: Windows, os: windows-latest, flag: --win }
           - { name: Linux, os: ubuntu-latest, flag: --linux }
     env:
-      # Не искать сертификаты в связке ключей раннера: сборка без подписи.
+      # Do not look for certificates in the runner's keychain: unsigned build.
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +34,7 @@ jobs:
 
       - run: npm ci
 
-      - name: Сборка установщиков
+      - name: Build installers
         run: npm run desktop:build:demo -- ${{ matrix.flag }}
 
       - uses: actions/upload-artifact@v4
