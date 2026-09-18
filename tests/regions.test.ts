@@ -16,7 +16,7 @@ import type { GeoPoint } from '../src/sim/types';
  */
 
 /** Высота площадки над морем, м; у домашнего района — условная. */
-const SITE_ELEVATION_M: Record<string, number> = { home: 250, elbrus: 1876, khibiny: 231, baikal: 488 };
+const SITE_ELEVATION_M: Record<string, number> = { home: 250, elbrus: 1876, khibiny: 231, baikal: 488, shotozero: 100 };
 /** Дополнительные районы профиля (PROFILE.regions) — условная высота. */
 const siteElevationM = (id: string) => SITE_ELEVATION_M[id] ?? 200;
 
@@ -32,7 +32,7 @@ describe('районы', () => {
     expect(REGIONS.length).toBeGreaterThanOrEqual(4);
     for (const r of REGIONS) expect(r.title && r.hint).toBeTruthy();
     // Кутурчин без готового файла: дома и лес собираются в браузере (src/ui/placeOsm.ts).
-    for (const r of REGION_PRESETS.slice(1)) if (r.id !== 'kuturchin') expect(r.osmUrl).toMatch(/\.bin/);
+    for (const r of REGION_PRESETS.slice(1)) if (!['kuturchin', 'shotozero'].includes(r.id)) expect(r.osmUrl).toMatch(/\.bin/);
   });
 
   it('без адреса и хранилища (тесты) — домашний район; задания и область — из него', () => {
