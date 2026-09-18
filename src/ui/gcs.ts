@@ -1,5 +1,7 @@
 import type { Check } from '../game/preflight';
 import type { AltitudeRef, RoutePoint, Scenario, ScenarioKind, Settings } from '../game/scenarios';
+import { SEASONS, type SeasonId } from '../game/season';
+import { WEATHER_EVENTS, type WeatherEventKind } from '../sim/weatherEvent';
 import { EMERGENCY_COMMANDS, MODE_NAMES, type Command, type Controls, type LiveState } from '../sim/flight';
 import { CAMERAS } from '../sim/payload';
 import { loadQuality, QUALITY, type Quality } from './quality';
@@ -247,7 +249,7 @@ const button = (a: string, label: string, ic: string, extra = '') => `<button cl
 /** Группа кнопок с подписью. low — прижата к низу колонки. */
 const group = (cls: string, title: string, ...buttons: string[]) => `<div class="grp ${cls}"><i>${title}</i>${buttons.join('')}</div>`;
 /** Кнопки, открывающие одноимённые окна. */
-const WINDOWS = ['task', 'profile', 'prep', 'instructor', 'zones', 'telemetry', 'horizon', 'control', 'console'];
+const WINDOWS = ['task', 'profile', 'prep', 'instructor', 'zones', 'telemetry', 'horizon', 'control', 'console', 'rc'];
 const ZONE_HINT = 'Выберите вид и нарисуйте на карте. Зона РЭБ — круг: щелчок — центр, второй щелчок — граница. Запретная зона — многоугольник: щелчки по вершинам, двойной щелчок — завершить. Правый щелчок по зоне — удалить.';
 
 /** Высота точек в таблице маршрута: показ и правка в системе высот задания. */
@@ -268,7 +270,7 @@ export const ALTITUDE_REFS: readonly { id: AltitudeRef; title: string }[] = [
   { id: 'takeoff', title: 'от точки взлёта' },
 ];
 
-type NumKey = Exclude<keyof Settings, 'cameraId' | 'shutter' | 'linkLossAction' | 'altitudeRef'>;
+type NumKey = Exclude<keyof Settings, 'cameraId' | 'shutter' | 'linkLossAction' | 'altitudeRef' | 'season' | 'weatherEvent'>;
 const FORMAT: Record<NumKey, (v: number) => string> = {
   linkLossTimeoutS: (v) => `${v} с`,
   gsdCm: (v) => `${fmt(v, 2)} см`,
@@ -384,6 +386,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       .map((k) => `<option value="${k}" ${k === loadQuality() ? 'selected' : ''}>${QUALITY[k].label}</option>`)
       .join('')}</select></label>
     <button data-a="sound">🔊 Звук включён</button>
+    <button data-a="rc" title="Пульт по USB или геймпад: оси, инверсия, калибровка">🎮 Пульт ДУ…</button>
     <button data-a="voice" ${h.onVoice ? '' : 'hidden'}>🗣 Голос: выкл</button>
     <label class="select voice-pick" hidden><span>Голос</span><select data-voice-pick title="Русские голоса браузера: нейросетевые звучат естественнее"></select></label>
     <button data-a="voice-preview" hidden>▶ Прослушать</button>
@@ -496,6 +499,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   ${win('telemetry', 'Телеметрия', '<dl class="tm"></dl>', 'width:220px')}
   ${win('horizon', 'Авиагоризонт', '<canvas class="adi" width="150" height="150"></canvas><dl class="tm adi-tm"></dl>', 'width:170px')}
   ${win('console', 'Консоль', '<ul class="log"></ul>', 'width:320px')}
+  ${win('rc', 'Пульт ДУ', '<div class="rc-setup"></div>', 'width:340px')}
   ${win('profile', 'Рельеф вдоль маршрута', '<canvas class="prof" width="440" height="130"></canvas>', 'width:460px')}
   <div class="toast" hidden></div>`;
   root.appendChild(el);
@@ -885,6 +889,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       if (k === 'cameraId') s.cameraId = i.value;
       else if (k === 'linkLossAction') s.linkLossAction = i.value as LinkLossAction;
       else if (k === 'altitudeRef') s.altitudeRef = i.value as AltitudeRef;
+      else if (k === 'season') s.season = i.value as SeasonId;
+      else if (k === 'weatherEvent') s.weatherEvent = i.value as WeatherEventKind;
       else if (k === 'approachDeg') s.approachDeg = approachIntoWind() ? null : +i.value;
       else (s as Record<string, number | string>)[k] = +i.value;
     });
@@ -994,7 +1000,10 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         }
         <details open><summary>Полёт</summary>
           ${range('iasMs', 'Скорость (приборная)', 15, 28, 0.5, s.iasMs)}
-          ${range('localHour', 'Время вылета (местное)', 5, 21, 0.25, s.localHour)}
+          ${range('localHour', 'Время вылета (местное)', 0, 23.75, 0.25, s.localHour)}
+          <label class="select"><span>Время года</span><select data-k="season">
+            ${SEASONS.map((x) => `<option value="${x.id}" ${x.id === (s.season ?? 'region') ? 'selected' : ''}>${x.title}</option>`).join('')}
+          </select></label>
         </details>
         <details ${s.approachDeg == null ? '' : 'open'}><summary>Заход на посадку</summary>
           <label class="check"><input type="checkbox" data-a="approach-wind" ${s.approachDeg == null ? 'checked' : ''}> Против ветра</label>
@@ -1016,6 +1025,10 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           ${range('windSpeedMs', 'Ветер на 10 м', 0, 12, 0.5, s.windSpeedMs)}
           ${range('windFromDeg', 'Откуда дует', 0, 355, 5, s.windFromDeg)}
           ${range('temperatureC', 'Температура', -35, 35, 1, s.temperatureC)}
+          <label class="select"><span>В полёте погода</span><select data-k="weatherEvent">
+            ${WEATHER_EVENTS.map((x) => `<option value="${x.id}" ${x.id === (s.weatherEvent ?? 'none') ? 'selected' : ''}>${x.title}</option>`).join('')}
+          </select></label>
+          <p class="hint">Фронт или гроза в прогнозе, по которому строится план, не учтены: где они, видно на карте, сводки метеослужбы — в консоли. Продолжать задание или возвращаться — решать вам.</p>
           <div class="row">
             <label class="check"><input type="checkbox" data-a="error" ${forecastError ? 'checked' : ''}> Факт отличается от прогноза</label>
             <button class="small" data-a="day">Другой день</button>

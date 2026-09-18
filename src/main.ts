@@ -5,12 +5,13 @@ import { PROFILE } from '@profile';
 import { parseOsm } from './sim/osm';
 import { loadQuality, QUALITY, saveQuality } from './ui/quality';
 import { Preparation, PREP_STEPS, type GroundTest, type PrepStepId } from './game/preparation';
-import { ACTIVE_REGION, buildMission, departure, forecastWeather, REGION, SCENARIOS, type Mission, type RoutePoint, type Scenario, type Settings } from './game/scenarios';
+import { ACTIVE_REGION, buildMission, departure, forecastWeather, missionDate, REGION, SCENARIOS, type Mission, type RoutePoint, type Scenario, type Settings } from './game/scenarios';
+import { groundSeason, seasonTemperatureC } from './game/season';
 import { LOG_REGION_ID, osmRegionFor, REGIONS, saveLogRegion, setRegion } from './game/regions';
 import { inBounds, placeRecording, regionFromRecording, settleOnTerrain } from './game/logRegion';
 import { SurfaceMotion } from './game/surfaces';
 import { FireMode } from './ui/fireMode';
-import { Gimbal, GimbalWindow } from './ui/gimbal';
+import { Gimbal, GimbalWindow, type Point3 } from './ui/gimbal';
 import { RcSticks } from './ui/rcSticks';
 import { SearchMode } from './ui/searchMode';
 import { loadLastLog, saveLastLog } from './ui/logStore';
@@ -32,6 +33,12 @@ import { failureInfo, linkLossText, type FailureId } from './sim/failures';
 import type { Alert } from './ui/gcs';
 import { AIRCRAFT } from './sim/aircraft';
 import { LiveFlight, MODE_NAMES, type Controls } from './sim/flight';
+import { marchToGround } from './ui/heat';
+import { WeatherEvent } from './sim/weatherEvent';
+import { VideoLink, VideoOsd, type OsdData, type VideoLinkState } from './ui/videoLink';
+import { buildOrthophoto } from './ui/orthophoto';
+import { RcSetup } from './ui/rcSetup';
+import { flightRemarks } from './game/remarks';
 import { backTransitionAltitudeM, combineResults, distanceM, fromLocal, simulateMission, toLocal, transitionAltitudeM } from './sim/mission';
 import { sunPosition } from './sim/sun';
 import { TerrainRelief, TerrainWind } from './sim/terrainWind';
@@ -52,6 +59,9 @@ import { EW_EFFECT_THRESHOLD, isZone, makeZoneId, zoneLabel, type Zone } from '.
 import { coverageSteps, linkProfile, type Relay } from './sim/radio';
 import { parseZonesFile, zonesToGeoJSON } from './game/zonesGeoJson';
 import { environmentAlerts } from './sim/failures';
+
+/** Стороны света по 45° — для сводок. */
+const COMPASS8 = ['С', 'СВ', 'В', 'ЮВ', 'Ю', 'ЮЗ', 'З', 'СЗ'];
 import { eventKindOf } from './game/recorder';
 
 const app = document.getElementById('app')!;
@@ -128,6 +138,11 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   let daySeed = 1;
   let forecast!: Weather;
   let actual!: Weather;
+  // Погода, которая меняется в полёте (weatherEvent.ts): что уже сообщено и когда обновляли вид.
+  let wxEvent: WeatherEvent | null = null;
+  const wxNotes = new Set<string>();
+  let wxKey = '';
+  let wxAt = 0;
   // Ветер у рельефа: по прогнозу — для проверок и карты, фактический — для полёта.
   let windForecast: TerrainWind | null = null;
   let windActual: TerrainWind | null = null;
@@ -338,7 +353,12 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
           ),
         };
       }
+      // Другое время года — и температура типичная для него; ползунки в окне задания — заново.
+      const season = s.season ?? 'region';
+      const seasonChanged = season !== (settings.season ?? 'region');
+      if (seasonChanged && season !== 'region') s = { ...s, temperatureC: seasonTemperatureC(season, siteA.lat) };
       settings = s;
+      if (seasonChanged) gcs.loadScenario(scenario, settings, forecastError);
       replan();
     },
     onForecastError(on) {
@@ -414,7 +434,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       replan();
     },
     onDebrief() {
-      openDebrief(lastAssessment?.rec ?? currentRecording(), lastAssessment?.a, lastAssessment?.ctx);
+      openDebrief(lastAssessment?.rec ?? currentRecording(), lastAssessment?.a, lastAssessment?.ctx, true);
     },
     onWeatherSource(src) {
       weatherSource = src;
@@ -532,8 +552,9 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
 
   document.title = PROFILE.title;
   const quality = QUALITY[loadQuality()];
-  // Экранный пульт — поверх 3D-вида, виден в ФЭЙЛСЕЙФе.
+  // Экранный пульт — поверх 3D-вида, виден в ФЭЙЛСЕЙФе; настоящий пульт — окно «Пульт ДУ» в настройках.
   const rc = new RcSticks(gcs.viewEl.parentElement!);
+  new RcSetup(document.querySelector<HTMLElement>('.rc-setup')!, pilot);
   // Камера на подвесе: в поиске и патруле — тепловизор, в перелёте, облёте и доставке — дневная по кнопке.
   const pipEl = gcs.viewEl.parentElement!.querySelector<HTMLElement>('.pip')!;
   const gimbal = new Gimbal();
@@ -544,6 +565,9 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   const world = new World(gcs.viewEl, { terrain, site: siteA, bounds, area: [], maxImageryZoom: quality.maxImageryZoom, cloudBaseM: 1500, cloudCover: 0.3, quality });
   // По умолчанию камера за хвостом: аппарат на экране смотрит туда же, куда летит.
   world.setCameraMode('chase');
+  // Видео с подвеса идёт по радиолинии: задержка, сжатие, замирание без связи; поверх — служебная информация.
+  const vlink = new VideoLink(world.renderer);
+  const osd = new VideoOsd(pipEl);
 
   // Видео полёта из разбора: на время записи основной цикл стоит, кадры рисует запись.
   let videoBusy = false;
@@ -742,7 +766,9 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     started = false;
     prep.reset();
     scenario = cloneScenario(sc);
-    settings = { ...scenario.defaults };
+    // Выбранное время года остаётся и в другом задании.
+    const season = settings.season && settings.season !== 'region' ? { season: settings.season, temperatureC: settings.temperatureC } : {};
+    settings = { ...scenario.defaults, ...season };
     if (weatherSource === 'forecast' && applied) ({ scenario, settings } = applyForecastHour(scenario, settings, applied.hour));
     relays = [...scenario.relays];
     gcs.loadScenario(scenario, settings, forecastError);
@@ -766,6 +792,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     windForecast = new TerrainWind(relief, forecast, { sun: sunAt });
     windActual = new TerrainWind(relief, actual, { sun: sunAt, seed: daySeed });
     world.setWeather(actual);
+    world.setSeason(groundSeason(missionDate(scenario, settings), siteA.lat, actual.groundTemperatureC, siteA.elevationM));
     gcs.setWeatherSummary(
       weatherSource === 'scenario'
         ? ''
@@ -941,6 +968,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       weather: actual,
       origin: siteA,
       home: siteA,
+      ...(wxEvent ? { weatherEvent: wxEvent } : {}),
       // Заданный курс захода — и для ВОЗВРАТА, если задание и так садится дома.
       ...(settings.approachDeg != null && distanceM(mission.stages[mission.stages.length - 1]!.landing, siteA) < 50 ? { homeApproachDeg: settings.approachDeg } : {}),
       startT: t0,
@@ -1065,6 +1093,15 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     lastTrailT = -Infinity;
     callouts.reset();
     voice.clear();
+    // Погода, которая меняется в полёте: нацелена на середину маршрута, приходит через 15–30 мин.
+    const wxKind = settings.weatherEvent ?? 'none';
+    const pts = mission.stages.flatMap((p) => p.waypoints).map((p) => toLocal(siteA, p));
+    const target = pts.length ? { east: pts.reduce((a, p) => a + p.east, 0) / pts.length, north: pts.reduce((a, p) => a + p.north, 0) / pts.length } : { east: 0, north: 0 };
+    wxEvent = wxKind === 'none' ? null : new WeatherEvent(wxKind, actual, { seed: daySeed * 131 + Math.floor(Math.random() * 1000), target });
+    wxNotes.clear();
+    wxKey = '';
+    wxAt = 0;
+    map.setWeatherHazard(null);
     startStage(0, 0, 0);
     controls = {
       iasMs: settings.iasMs,
@@ -1294,12 +1331,50 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       durationS: s.t,
     });
     gcs.log(s.t, `Оценка: ${a.total} из 100 — ${a.grade}`, a.total >= 60 ? 'info' : 'warn');
-    openDebrief(r, a, ctx);
+    openDebrief(r, a, ctx, true);
   }
 
-  function openDebrief(r: Recording, a?: Assessment, ctx?: ConclusionContext) {
+  /** live — разбор этого полёта: у съёмки по его кадрам собирается ортофотоплан. */
+  function openDebrief(r: Recording, a?: Assessment, ctx?: ConclusionContext, live = false) {
     if (!debrief.visible) pausedBeforeDebrief = paused;
     paused = true;
+    const cam = mission.camera;
+    const area = scenario.kind === 'survey' ? scenario.area.map((p) => toLocal(siteA, p)) : null;
+    debrief.setOrthoHost(
+      live && cam && area && frames.length
+        ? {
+            build: async (onProgress) => {
+              if (videoBusy) throw new Error('идёт запись видео');
+              videoBusy = true;
+              try {
+                const shot = [...frames];
+                const o = await buildOrthophoto(world, shot, area, cam, { onProgress });
+                const blur = shot.filter((f) => f.reason?.includes('смаз')).length;
+                const dark = shot.filter((f) => f.reason?.includes('недодерж')).length;
+                const gap = Math.round(o.gapShare * 100);
+                const text =
+                  `Кадров ${shot.length}, годных ${shot.filter((f) => f.ok).length}${blur ? `, смаз ${blur}` : ''}${dark ? `, недодержка ${dark}` : ''}. ` +
+                  `Пиксель ортофото ${fmt(o.pixelM * 100, 0)} см. ${gap ? `Без покрытия ${gap} % участка — тёмные пятна внутри жёлтой границы.` : 'Участок покрыт целиком.'}`;
+                return { url: o.canvas.toDataURL('image/png'), text, fileName: `orthophoto-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.png` };
+              } finally {
+                videoBusy = false;
+              }
+            },
+          }
+        : null,
+    );
+    // Замечания: у разбора этого полёта — с участками плана, у открытой записи — без них.
+    const plans = live
+      ? mission.stages.map((st) => ({
+          path: [
+            { ...toLocal(siteA, st.takeoff), up: transitionAltitudeM(st) - siteA.elevationM },
+            ...st.waypoints.map((w) => ({ ...toLocal(siteA, w), up: w.altitudeM - siteA.elevationM, ...(w.routeLeg !== undefined ? { leg: w.routeLeg } : {}) })),
+            { ...toLocal(siteA, st.landing), up: backTransitionAltitudeM(st) - siteA.elevationM },
+          ],
+          ...(st.legLabels ? { legLabels: st.legLabels } : {}),
+        }))
+      : [];
+    debrief.setRemarks(flightRemarks({ rec: r, plans }));
     debrief.show(r, a, ctx);
   }
 
@@ -1326,7 +1401,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
         live = lw;
         const local = new Date(Date.now() + scenario.utcOffsetH * 3_600_000);
         scenario = { ...scenario, date: local.toISOString().slice(0, 10) };
-        settings = { ...settings, localHour: Math.round((local.getUTCHours() + local.getUTCMinutes() / 60) * 4) / 4 };
+        settings = { ...settings, localHour: Math.round((local.getUTCHours() + local.getUTCMinutes() / 60) * 4) / 4, season: 'region' };
         gcs.log(0, `Погода сейчас: ${lw.summary}`);
         replan();
       })
@@ -1582,6 +1657,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
         reachAt = performance.now();
         drawReachFlight();
       }
+      weatherTick(s);
       // Вектор путевой скорости на 30 с вперёд: нос по курсу, линия — куда реально летит.
       // НСУ видит телеметрию: при отказе ГНСС — оценку места, без связи — последний принятый кадр.
       const tele = flight.telemetry;
@@ -1672,14 +1748,23 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     gwin.setActive(!!thermalMode || !!day);
     // Углы подвеса меняются и сами — при сопровождении: подписи — раз в несколько кадров.
     if ((thermalMode || day) && ++gimbalLabelFrame % 6 === 0) gwin.sync();
+    const video = thermalMode ? thermalMode.frame : day;
     if (thermalMode) {
       gwin.lastFovDeg = thermalMode.fovDeg;
-      thermalMode.render(gwin.rect(thermalMode.aspect), gwin.ir);
+      const r = gwin.rect(thermalMode.aspect);
+      thermalMode.render(r, gwin.ir);
+      vlink.present(r, videoLinkState(), performance.now() / 1000);
     } else if (day) {
       const r = gwin.rect(4 / 3);
       Object.assign(pipEl.style, { width: `${r.width}px`, height: `${r.height}px` });
       gwin.lastFovDeg = day.fovDeg;
       world.renderPip(r, day.eye, day.look, day.fovDeg, day.up);
+      vlink.present(r, videoLinkState(), performance.now() / 1000);
+    } else vlink.reset();
+    if (!video) osd.update(null);
+    else if (gimbalLabelFrame % 6 === 0) osd.update(osdData(video, thermalMode ? (gwin.ir ? 'ИК' : 'ТВ') : 'ТВ'));
+    if (thermalMode || day) {
+      // Окно камеры уже нарисовано.
     } else if (pip && mission.camera) {
       const w = Math.round(Math.min(260, gcs.viewEl.clientWidth * 0.4));
       const r = { right: 12, bottom: 12, width: w, height: Math.round((w * 2) / 3) };
@@ -1688,6 +1773,100 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       const fov = (2 * Math.atan((cam.heightPx * cam.pixelPitchUm * 1e-3) / (2 * cam.focalLengthMm)) * 180) / Math.PI;
       world.renderPip(r, pip.eye, pip.look, fov, pip.up);
     }
+  }
+
+  /**
+   * Меняющаяся погода раз в секунду: фронт или гроза на карте, дождь и облака в 3D там, где борт,
+   * сводки метеослужбы в консоли — за 20 и 5 км и когда борт уже в ней.
+   */
+  function weatherTick(s: { t: number; east: number; north: number }) {
+    const ev = wxEvent;
+    if (!ev || performance.now() - wxAt < 1000) return;
+    wxAt = performance.now();
+    const h = ev.hazard(s.t, 25000);
+    const geo = (p: { east: number; north: number }) => fromLocal(siteA, p.east, p.north);
+    map.setWeatherHazard(!h ? null : h.kind === 'front' ? { ...h, a: geo(h.a), b: geo(h.b) } : { ...h, center: geo(h.center) });
+    const w = ev.weatherAt(s.east, s.north, s.t);
+    const cold = actual.groundTemperatureC < 1;
+    const precipitation = w.precipitation ? { kind: cold ? ('snow' as const) : w.precipitation.kind, mmPerH: w.precipitation.mmPerH } : (actual.precipitation ?? null);
+    const key = `${Math.round((precipitation?.mmPerH ?? 0) * 2)}|${Math.round((w.cloudBaseM ?? 0) / 50)}|${Math.round((w.cloudCover ?? 0) * 20)}|${Math.round((w.visibilityM ?? 0) / 500)}`;
+    if (key !== wxKey) {
+      wxKey = key;
+      world.setWeather({
+        ...actual,
+        precipitation,
+        ...(w.cloudBaseM !== null ? { cloudBaseM: w.cloudBaseM } : {}),
+        ...(w.cloudCover !== null ? { cloudCover: w.cloudCover } : {}),
+        ...(w.visibilityM !== null ? { visibilityM: Math.min(actual.visibilityM ?? Infinity, w.visibilityM) } : {}),
+      });
+    }
+    const a = ev.approach(s.east, s.north, s.t);
+    const km = (m: number) => (m / 1000).toFixed(m < 10_000 ? 1 : 0).replace('.', ',');
+    const min = (sec: number) => Math.max(1, Math.round(sec / 60));
+    const kmh = Math.round(ev.speedMs * 3.6);
+    // Первая сводка — подробная (что за погода и что будет), следующие — коротко, по одной за раз.
+    let said = false;
+    const note = (id: string, text: string, kind?: 'warn' | 'bad') => {
+      if (said || wxNotes.has(id) || (id !== '20' && !wxNotes.has('20'))) return;
+      wxNotes.add(id);
+      said = true;
+      gcs.log(s.t, text, kind);
+    };
+    if (ev.kind === 'front') {
+      const from = COMPASS8[Math.round(((ev.moveDeg + 180) % 360) / 45) % 8];
+      if (a.distanceM <= 25000)
+        note(
+          '20',
+          a.distanceM === 0
+            ? `Метео: холодный фронт идёт ${kmh} км/ч с ${from}. За ним ветер почти вдвое сильнее и правее, ливневый дождь, облачность до 400–500 м; на линии — шквал`
+            : `Метео: холодный фронт в ${km(a.distanceM)} км с ${from}, идёт ${kmh} км/ч — здесь через ~${min(a.etaS ?? 0)} мин. За ним ветер почти вдвое сильнее и правее, ливневый дождь, облачность до 400–500 м; на линии — шквал`,
+        );
+      if (a.distanceM > 0 && a.distanceM <= 5000) note('5', `Метео: холодный фронт в ${km(a.distanceM)} км — здесь через ~${min(a.etaS ?? 0)} мин`, 'warn');
+      if (a.distanceM === 0) note('in', 'Метео: фронт над бортом — шквал, ветер усиливается и поворачивает вправо, ливень, облака опускаются', 'bad');
+    } else {
+      const hz = ev.hazard(s.t, 0);
+      const bearing = hz && hz.kind === 'storm' ? (Math.atan2(hz.center.east - s.east, hz.center.north - s.north) * 180) / Math.PI : 0;
+      const where = COMPASS8[Math.round((((bearing % 360) + 360) % 360) / 45) % 8];
+      const goes = COMPASS8[Math.round(ev.moveDeg / 45) % 8];
+      if (!hz) return;
+      if (a.distanceM <= 25000)
+        note(
+          '20',
+          `Метео: грозовая ячейка в ${km(a.distanceM)} км на ${where}, смещается на ${goes} ${kmh} км/ч${a.etaS !== null ? `, выйдет на борт через ~${min(a.etaS)} мин` : ''}. Под ней ливень и нисходящие потоки до 6 м/с, вокруг на 6 км — порывы до 15 м/с и болтанка`,
+        );
+      if (a.distanceM > 0 && a.distanceM <= 5000) note('5', `Метео: гроза в ${km(a.distanceM)} км на ${where}${a.etaS !== null ? `, выйдет на борт через ~${min(a.etaS)} мин` : ''}`, 'warn');
+      if (a.distanceM === 0) note('in', 'Метео: борт в зоне грозы — сильная болтанка, порывы от ячейки, под ядром ливень и нисходящий поток до 6 м/с', 'bad');
+    }
+  }
+
+  /** Видеоканал — по радиолинии борта: в разборе и на земле до взлёта связь всегда хорошая. */
+  function videoLinkState(): VideoLinkState {
+    const s = flight.state;
+    return { lost: s.linkLost, quality: s.linkLost ? 0 : s.link.quality, loss: s.link.loss };
+  }
+
+  /** Служебная информация видео: полётные данные, подвес, точка рельефа в центре кадра, связь. */
+  function osdData(f: { eye: Point3; look: Point3 }, channel: string): OsdData {
+    const s = flight.state;
+    const dir = { east: f.look.east - f.eye.east, north: f.look.north - f.eye.north, up: f.look.up - f.eye.up };
+    const hit = marchToGround(f.eye, dir, (e, n) => world.groundAt(e, n), 30000);
+    const g = hit ? fromLocal(siteA, hit.east, hit.north) : null;
+    return {
+      channel,
+      mode: MODE_NAMES[s.mode],
+      flightS: Math.max(0, s.t - takeoffT),
+      aglM: s.aglM,
+      altM: siteA.elevationM + s.up,
+      speedMs: s.groundSpeedMs,
+      headingDeg: s.headingDeg,
+      panDeg: gimbal.panDeg,
+      tiltDeg: gimbal.tiltDeg,
+      zoom: gimbal.zoom,
+      center: g ? { lat: g.lat, lon: g.lon } : null,
+      linkQuality: s.linkLost ? 0 : s.link.quality,
+      latencyS: vlink.latencyS,
+      frozen: vlink.frozen,
+    };
   }
 
   /** Подпись окна поиска и патруля — по каналу подвеса: тепловизор или дневная камера. */

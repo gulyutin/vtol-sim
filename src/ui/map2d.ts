@@ -338,6 +338,11 @@ const pinIcon = (label: string, alt: string | number | null, cls = '') =>
  * борт, след, кадры, покрытие. Пока editing включён, участок, точки и пункт доставки
  * можно двигать.
  */
+/** Опасная погода для карты (weatherEvent.ts WeatherHazard в широтах и долготах). */
+export type MapWeatherHazard =
+  | { kind: 'front'; a: GeoPoint; b: GeoPoint; moveDeg: number; speedMs: number }
+  | { kind: 'storm'; center: GeoPoint; coreM: number; outflowM: number; moveDeg: number; speedMs: number; strength: number };
+
 export class Map2D {
   readonly map: L.Map;
   follow = false;
@@ -649,6 +654,44 @@ export class Map2D {
       icon: L.divIcon({ className: 'target-pin', html: '<div></div>', iconSize: [26, 26], iconAnchor: [13, 13] }),
       interactive: false,
     }).addTo(this.map);
+  }
+
+  private weatherLayer: L.LayerGroup | null = null;
+
+  /**
+   * Опасная погода по сводке метеослужбы: холодный фронт — синяя линия с зубцами в сторону движения,
+   * грозовая ячейка — красное ядро с ливнем и оранжевый круг порывистого ветра от неё; стрелка —
+   * куда смещается. null — убрать.
+   */
+  setWeatherHazard(h: MapWeatherHazard | null) {
+    this.weatherLayer?.remove();
+    this.weatherLayer = null;
+    if (!h) return;
+    const g = L.layerGroup().addTo(this.map);
+    const kmh = Math.round(h.speedMs * 3.6);
+    if (h.kind === 'front') {
+      L.polyline([ll(h.a), ll(h.b)], { color: '#1c7ed6', weight: 5, opacity: 0.85, interactive: false }).addTo(g);
+      // Зубцы холодного фронта — треугольники по линии в сторону движения.
+      const n = 14;
+      for (let i = 1; i < n; i++) {
+        const f = i / n;
+        const p = { lat: h.a.lat + (h.b.lat - h.a.lat) * f, lon: h.a.lon + (h.b.lon - h.a.lon) * f };
+        L.marker(ll(p), {
+          icon: L.divIcon({ className: 'front-tooth', html: `<div style="transform: rotate(${h.moveDeg}deg)"></div>`, iconSize: [14, 14], iconAnchor: [7, 7] }),
+          interactive: false,
+        }).addTo(g);
+      }
+      L.marker(ll(h.a), { icon: L.divIcon({ className: 'wx-label', html: `Холодный фронт · ${kmh} км/ч`, iconSize: [150, 18], iconAnchor: [0, 22] }), interactive: false }).addTo(g);
+    } else {
+      L.circle(ll(h.center), { radius: h.outflowM, color: '#f08c00', weight: 2, dashArray: '8 6', fill: true, fillOpacity: 0.06 * h.strength, interactive: false }).addTo(g);
+      L.circle(ll(h.center), { radius: h.coreM, color: '#e03131', weight: 2, fillColor: '#e03131', fillOpacity: 0.35 * h.strength, interactive: false }).addTo(g);
+      L.marker(ll(h.center), {
+        icon: L.divIcon({ className: 'wx-arrow', html: `<div style="transform: rotate(${h.moveDeg - 90}deg)">➜</div>`, iconSize: [26, 26], iconAnchor: [13, 13] }),
+        interactive: false,
+      }).addTo(g);
+      L.marker(ll(h.center), { icon: L.divIcon({ className: 'wx-label', html: `Гроза · ${kmh} км/ч`, iconSize: [120, 18], iconAnchor: [-16, 24] }), interactive: false }).addTo(g);
+    }
+    this.weatherLayer = g;
   }
 
   private searchLayer: L.LayerGroup | null = null;

@@ -86,6 +86,7 @@ export interface TerrainShading {
 
 const SHADER_HEAD = /* glsl */ `
 uniform vec3 tCamera; uniform vec2 tCloudOffset; uniform float tCloudCover; uniform float tCloudBase; uniform vec3 tSunDir;
+uniform float tSnow; uniform float tSnowLine;
 varying vec3 vTerrainWorld;
 float tHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float tNoise(vec2 p) { vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
@@ -115,6 +116,22 @@ const SHADER_FRAGMENT = /* glsl */ `
   }
 }
 #endif
+if (tSnow > 0.001 || tSnowLine < 9000.0) {
+  // Снег: по покрову у площадки и выше границы снега в горах (граница — неровная). Пятнами, когда
+  // покров неполный; крутые склоны его не держат; в лесу (тёмный снимок) снег виден между деревьями.
+  vec3 p = vTerrainWorld;
+  vec3 nrm = normalize(cross(dFdx(p), dFdy(p)));
+  float flatness = mix(0.35, 1.0, smoothstep(0.62, 0.86, abs(nrm.y)));
+  float line = smoothstep(tSnowLine - 140.0, tSnowLine + 140.0, p.y + 120.0 * (tFbm4(p.xz / 420.0) - 0.5));
+  float cover = max(tSnow, line);
+  float patchN = tFbm4(p.xz / 70.0 + 3.0);
+  float c = smoothstep(1.0 - cover - 0.07, 1.0 - cover + 0.07, patchN) * flatness;
+  float lum = dot(diffuseColor.rgb, vec3(0.299, 0.587, 0.114));
+  float forest = 1.0 - smoothstep(0.07, 0.19, lum);
+  vec3 snowCol = vec3(0.86, 0.89, 0.94) * (0.93 + 0.07 * tNoise(p.xz * 0.4));
+  vec3 under = mix(diffuseColor.rgb, snowCol * 0.5, 0.5);
+  diffuseColor.rgb = mix(diffuseColor.rgb, mix(snowCol, under, forest), c);
+}
 #ifdef TERRAIN_CLOUD_SHADOWS
 if (tSunDir.y > 0.05) {
   // Тень облака: точка облачного слоя на луче к Солнцу, та же функция, что у облаков.
@@ -186,7 +203,15 @@ export class TerrainLod {
     tCloudCover: { value: 0 },
     tCloudBase: { value: 1500 },
     tSunDir: { value: new THREE.Vector3(0, 1, 0) },
+    tSnow: { value: 0 },
+    tSnowLine: { value: 1e5 },
   };
+
+  /** Снег на земле: покров у площадки 0…1 и граница снега в горах, м по высоте сцены. */
+  setSnow(cover: number, lineY: number) {
+    this.uniforms.tSnow.value = cover;
+    this.uniforms.tSnowLine.value = lineY;
+  }
 
   constructor(
     private readonly terrain: Terrain,

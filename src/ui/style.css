@@ -1781,3 +1781,174 @@ i.zk.rk {
   border-color: #ffd43b;
   color: #ffd43b;
 }
+
+/* Служебная информация поверх видео с подвеса (videoLink.ts). */
+.osd {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  font: 600 10px/1.35 ui-monospace, Menlo, monospace;
+  color: #f4fff4;
+  text-shadow: 0 0 2px #000, 0 0 3px #000;
+  white-space: pre;
+}
+
+.osd > div {
+  position: absolute;
+}
+
+.osd-tl {
+  left: 6px;
+  top: 26px;
+}
+
+.osd-tr {
+  right: 6px;
+  top: 26px;
+  text-align: right;
+}
+
+.osd-bl {
+  left: 6px;
+  bottom: 22px;
+}
+
+.osd-br {
+  right: 6px;
+  bottom: 22px;
+  text-align: right;
+}
+
+.osd-lost {
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  padding: 3px 10px;
+  border: 1px solid #ff6b6b;
+  background: rgba(0, 0, 0, 0.55);
+  color: #ff8787;
+  font-size: 14px;
+  letter-spacing: 0.1em;
+}
+
+.pip.full .osd {
+  font-size: 13px;
+}
+
+/* Опасная погода на карте (map2d.setWeatherHazard). */
+.front-tooth div {
+  width: 0;
+  height: 0;
+  margin: 1px auto 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-bottom: 10px solid #1c7ed6;
+}
+
+.wx-arrow div {
+  font: 700 20px/26px system-ui, sans-serif;
+  color: #e03131;
+  text-align: center;
+  text-shadow: 0 0 3px #fff;
+  transform-origin: 50% 50%;
+}
+
+.wx-arrow div::before {
+  content: '';
+}
+
+.wx-label {
+  font: 600 12px/18px system-ui, sans-serif;
+  color: #fff;
+  text-shadow: 0 0 3px #000, 0 0 2px #000;
+  white-space: nowrap;
+}
+
+/* Ортофотоплан в разборе (orthophoto.ts). */
+.db-ortho {
+  margin-top: 8px;
+}
+
+.db-ortho .do-img {
+  display: block;
+  width: 100%;
+  border-radius: 4px;
+  background: #20252b;
+}
+
+.db-ortho .do-img:not([src]) {
+  display: none;
+}
+
+.db-ortho .do-text {
+  margin: 4px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.db-ortho a.db-btn {
+  text-decoration: none;
+}
+
+/* Окно «Пульт ДУ» (rcSetup.ts). */
+.rcs-dev {
+  margin: 0 0 6px;
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.rcs-axes {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.rcs-bar {
+  position: relative;
+  display: block;
+  height: 8px;
+  min-width: 70px;
+  border-radius: 4px;
+  background: #d9dde2;
+}
+
+.rcs-bar i {
+  position: absolute;
+  top: -1px;
+  width: 4px;
+  height: 10px;
+  margin-left: -2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.rcs-map {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.rcs-map td {
+  padding: 2px 3px;
+}
+
+.rcs-map select {
+  font-size: 12px;
+}
+
+/* Замечания инструктора в разборе (remarks.ts): щелчок — к моменту полёта. */
+.db-remarks li[data-t] {
+  cursor: pointer;
+}
+
+.db-remarks li[data-t]:hover {
+  text-decoration: underline;
+}
+
+ul.log li.good {
+  color: var(--good);
+}

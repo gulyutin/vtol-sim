@@ -12,6 +12,8 @@ import type { AltitudeRef, LocationSpec, RoutePoint } from '../sim/profile';
 import type { Relay } from '../sim/radio';
 import type { GeoPoint, MissionPlan, PayloadLoad, Site, Terrain, Weather } from '../sim/types';
 import { sunPosition } from '../sim/sun';
+import { seasonDate, type SeasonId } from './season';
+import type { WeatherEventKind } from '../sim/weatherEvent';
 import { stabilityShear, windAt, windTriangle } from '../sim/wind';
 import { activeRegion } from './regions';
 import { searchPattern, THERMAL_CAMERA, type AnimalWeights, type ThermalCamera } from './search';
@@ -43,6 +45,10 @@ export interface Settings {
   altitudeRef: AltitudeRef;
   /** Курс захода на посадку, градусы; нет (null) — против ветра. */
   approachDeg?: number | null;
+  /** Время года: нет или 'region' — по дате района (seasonDate). */
+  season?: SeasonId;
+  /** Погода, которая меняется в полёте (weatherEvent.ts): нет или 'none' — не меняется. */
+  weatherEvent?: WeatherEventKind;
 }
 
 export type ScenarioKind = 'transfer' | 'survey' | 'delivery' | 'route' | 'search' | 'fire';
@@ -299,10 +305,15 @@ export function forecastWeather(sc: Scenario, s: Settings): Weather {
   };
 }
 
+/** Дата вылета (местная, ГГГГ-ММ-ДД): дата района или день выбранного времени года. */
+export function missionDate(sc: Scenario, s: Settings): string {
+  return seasonDate(sc.date, s.season);
+}
+
 /** Время вылета в UTC. */
 export function departure(sc: Scenario, s: Settings): Date {
   const minutes = Math.round((s.localHour - sc.utcOffsetH) * 60);
-  return new Date(Date.parse(`${sc.date}T00:00:00Z`) + minutes * 60_000);
+  return new Date(Date.parse(`${missionDate(sc, s)}T00:00:00Z`) + minutes * 60_000);
 }
 
 /**
@@ -313,7 +324,8 @@ export function atDeparture<S extends Scenario>(sc: S, s: Settings, utc: Date): 
   const local = new Date(utc.getTime() + sc.utcOffsetH * 3_600_000);
   return {
     scenario: { ...sc, date: local.toISOString().slice(0, 10) },
-    settings: { ...s, localHour: local.getUTCHours() + local.getUTCMinutes() / 60 },
+    // Вылет в конкретный день — время года по этой дате.
+    settings: { ...s, localHour: local.getUTCHours() + local.getUTCMinutes() / 60, season: 'region' },
   };
 }
 

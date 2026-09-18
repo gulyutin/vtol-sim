@@ -18,7 +18,7 @@ import { createAircraft, type AircraftModel } from './aircraftModel';
 import { HEAT_THERMAL_M, HEAT_VIEW_M, HeatBodies, marchToGround, type HeatBody } from './heat';
 import { Landmarks } from './landmarks';
 import { OsmLayer } from './osmLayer';
-import { createGroundStation, createLandingPad, createLandingZone, createVehicle, createWaypointMarker, RotorDust } from './props';
+import { createGroundStation, createLandingPad, createLandingZone, createVehicle, createWaypointMarker, PadLights, RotorDust } from './props';
 import { QUALITY, type QualitySettings } from './quality';
 import { SkyDome } from './skyDome';
 import { fogFor, overcastFactor, Precipitation } from './precipitation';
@@ -62,6 +62,7 @@ import type { Bounds } from './terrainData';
 import { TerrainLod } from './terrainLod';
 import { ThermalView, type ThermalKind } from './thermal';
 import { ZoneWalls } from './zones3d';
+import type { GroundSeason } from '../game/season';
 
 export type { HeatBody, HeatKind, HeatPose } from './heat';
 
@@ -140,6 +141,10 @@ export class World {
   aircraft: AircraftModel = createAircraft();
   /** 0 — день, 1 — ночь (по высоте Солнца). */
   nightFactor = 0;
+  /** Огни площадок: ночью — ориентир для посадки. */
+  private padLights: PadLights[] = [];
+  /** Время года на земле — до первого setSeason по дате района. */
+  private season: GroundSeason = { snow: 0, snowLineM: 1e5, ice: 0, bare: 0, autumn: autumnOf(ACTIVE_REGION.location.date) };
   private cameraMode: CameraMode = 'follow';
   private q: QualitySettings;
   private readonly composer: EffectComposer;
@@ -385,7 +390,8 @@ export class World {
     }
     // Дом под моделью ориентира не рисуется — не будет двойного объёма.
     if (this.landmarks) data = this.landmarks.withoutReplaced(data);
-    this.osm = new OsmLayer(data, (e, n) => this.groundAt(e, n), this.q, { autumn: autumnOf(ACTIVE_REGION.location.date) });
+    this.osm = new OsmLayer(data, (e, n) => this.groundAt(e, n), this.q, { autumn: this.season.autumn });
+    this.osm.setSeason(this.season);
     this.scene.add(this.osm.group);
   }
 
@@ -425,6 +431,17 @@ export class World {
     this.sockPivot.rotation.set(0, Math.PI / 2 - to, -droop, 'YZX');
     this.groundWind.set(Math.sin(to) * groundMs, -Math.cos(to) * groundMs);
     this.cloudWind.set(Math.sin(to) * cloudsMs, -Math.cos(to) * cloudsMs);
+  }
+
+  /**
+   * Время года на земле (src/game/season.ts): снег на рельефе выше границы и по покрову, на кронах и
+   * крышах, лёд на воде, голые лиственные, осенняя листва, снежная пыль из-под винтов.
+   */
+  setSeason(s: GroundSeason) {
+    this.season = s;
+    this.lod.setSnow(s.snow, s.snowLineM - this.site.elevationM);
+    this.osm?.setSeason(s);
+    this.dust.setSnow(s.snow);
   }
 
   /** Положение Солнца: небо, прямой свет, рассеянный свет, дымка и отражения. */
@@ -745,10 +762,30 @@ export class World {
     // Мир из OpenStreetMap: деревья качает ветер, ночью горят окна и фонари.
     this.osm?.update(this.camera.position, { time: this.clock, nightFactor: this.nightFactor, wind: this.groundWind });
     this.landmarks?.update(this.nightFactor);
+    for (const l of this.padLights) l.setNight(this.nightFactor, this.clock);
     this.precip.update(dt, this.camera);
     this.heat.cull(this.camera.position, HEAT_VIEW_M);
     if (post) this.composer.render(dt);
     else this.renderer.render(this.scene, this.camera);
+  }
+
+  /**
+   * Спрятать то, чего нет на настоящих снимках с воздуха: маршрут, след, отметки, стены зон, облака,
+   * осадки, пыль и сам аппарат (для ортофотоплана). Вернуть — restoreOverlays с тем, что вернулось.
+   */
+  hideOverlays(): [THREE.Object3D, boolean][] {
+    const list: (THREE.Object3D | null | undefined)[] = [this.routeGroup, this.markerGroup, this.trail, this.frameLines, this.zoneWalls.group, this.precip.object, this.clouds, this.dust.object, this.blob, this.aircraft.group, this.areaLine, this.coverage];
+    const out: [THREE.Object3D, boolean][] = [];
+    for (const o of list) {
+      if (!o) continue;
+      out.push([o, o.visible]);
+      o.visible = false;
+    }
+    return out;
+  }
+
+  restoreOverlays(saved: [THREE.Object3D, boolean][]) {
+    for (const [o, v] of saved) o.visible = v;
   }
 
   /**
@@ -1062,7 +1099,10 @@ export class World {
 
   /** Дополнительные площадки посадки (пункт доставки), локальные метры. */
   setPads(points: { east: number; north: number }[]) {
-    for (const p of this.pads) this.scene.remove(p);
+    for (const p of this.pads) {
+      this.scene.remove(p);
+      this.padLights = this.padLights.filter((l) => l !== p.userData['lights']);
+    }
     this.pads = points.map((p) => this.createPad(p.east, p.north));
     for (const p of this.pads) this.scene.add(p);
   }
@@ -1071,7 +1111,10 @@ export class World {
   private createPad(east: number, north: number): THREE.Group {
     const g = new THREE.Group();
     g.position.set(east, this.groundAt(east, north), -north);
-    g.add(createLandingPad(), createLandingZone(AIRCRAFT.limits.landingZoneRadiusM));
+    const lights = new PadLights(AIRCRAFT.limits.landingZoneRadiusM);
+    this.padLights.push(lights);
+    g.add(createLandingPad(), createLandingZone(AIRCRAFT.limits.landingZoneRadiusM), lights.group);
+    g.userData['lights'] = lights;
     return g;
   }
 

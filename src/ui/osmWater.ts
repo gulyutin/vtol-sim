@@ -79,6 +79,7 @@ const WATER_HEAD = /* glsl */ `
 uniform sampler2D osmWaterNormals;
 uniform float osmTime;
 uniform vec2 osmWind;
+uniform float osmIce;
 varying vec3 vWaterWorld;
 `;
 
@@ -92,7 +93,7 @@ const WATER_NORMAL = /* glsl */ `
   vec3 n2 = texture2D(osmWaterNormals, (mat2(0.8, 0.6, -0.6, 0.8) * p - drift * 1.6) / 7.3).xyz * 2.0 - 1.0;
   vec3 n3 = texture2D(osmWaterNormals, (mat2(0.6, -0.8, 0.8, 0.6) * p - drift * 0.5) / 61.0).xyz * 2.0 - 1.0;
   // Сильнее при ветре; вдали — спокойнее (иначе блики рябят в пикселях).
-  float strength = (0.12 + 0.035 * min(ws, 14.0)) / (1.0 + distance(vWaterWorld, cameraPosition) / 1800.0);
+  float strength = (0.12 + 0.035 * min(ws, 14.0)) / (1.0 + distance(vWaterWorld, cameraPosition) / 1800.0) * (1.0 - osmIce);
   vec2 slope = (n1.xy + 0.55 * n2.xy + 0.9 * n3.xy) * strength;
   vec3 nWorld = normalize(vec3(slope.x, 1.0, slope.y));
   normal = normalize((viewMatrix * vec4(nWorld, 0.0)).xyz);
@@ -122,11 +123,22 @@ export class OsmWaterLayer {
     this.material.onBeforeCompile = (shader) => {
       shader.uniforms.osmTime = uniforms.osmTime;
       shader.uniforms.osmWind = uniforms.osmWind;
+      shader.uniforms.osmIce = uniforms.osmIce;
       shader.uniforms.osmWaterNormals = { value: this.normals };
       shader.vertexShader =
         'varying vec3 vWaterWorld;\n' +
         shader.vertexShader.replace('#include <project_vertex>', '#include <project_vertex>\n  vWaterWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;');
-      shader.fragmentShader = WATER_HEAD + shader.fragmentShader.replace('#include <normal_fragment_maps>', WATER_NORMAL);
+      shader.fragmentShader =
+        WATER_HEAD +
+        shader.fragmentShader
+          .replace('#include <normal_fragment_maps>', WATER_NORMAL)
+          // Лёд под снегом: белёсый, матовый, без ряби; у кромки и промоин — темнее.
+          .replace(
+            '#include <color_fragment>',
+            // Переметённый ветром снег на льду — плавные полосы по крупной текстуре ряби.
+            '#include <color_fragment>\n  float drift = texture2D(osmWaterNormals, vWaterWorld.xz / vec2(260.0, 90.0)).x;\n  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.82, 0.86, 0.92) * (0.9 + 0.12 * drift), osmIce);',
+          )
+          .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n  roughnessFactor = mix(roughnessFactor, 0.8, osmIce);');
     };
     this.material.customProgramCacheKey = () => 'osm-water';
 

@@ -965,6 +965,15 @@ export class RotorDust {
     this.alloc(Math.max(0, Math.floor(maxParticles)));
   }
 
+  /** Снег на земле: из-под винтов поднимается снежная пыль вместо песка и травы. */
+  setSnow(snow: number) {
+    const u = this.material.uniforms;
+    const k = Math.min(1, Math.max(0, snow));
+    (u['uDust']!.value as THREE.Color).set(0xc9ba9b).lerp(new THREE.Color(0xe8edf4), k);
+    (u['uGrass']!.value as THREE.Color).set(0xa3aa84).lerp(new THREE.Color(0xdfe5ee), k);
+    (u['uBlade']!.value as THREE.Color).set(0x5b7a34).lerp(new THREE.Color(0xd4dbe6), k);
+  }
+
   setMax(maxParticles: number) {
     const n = Math.max(0, Math.floor(maxParticles));
     if (n !== this.max) this.alloc(n);
@@ -1268,6 +1277,67 @@ const zoneMaterial = lazy(() => {
     polygonOffsetUnits: -4,
   });
 });
+
+/** Круглое мягкое пятно для огней: точка с ореолом, края прозрачные. */
+const lightSprite = lazy(() => {
+  const S = 64;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const g = c.getContext('2d')!;
+  const grad = g.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.25, 'rgba(255,255,255,0.9)');
+  grad.addColorStop(0.6, 'rgba(255,255,255,0.18)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, S, S);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+});
+
+/**
+ * Огни площадки для ночной посадки: зелёные по кругу зоны посадки и белый проблесковый маяк у
+ * края. Размер на экране постоянный — огонь виден издалека точкой; днём гаснут (setNight).
+ */
+export class PadLights {
+  readonly group = new THREE.Group();
+  private readonly ring: THREE.PointsMaterial;
+  private readonly beacon: THREE.PointsMaterial;
+
+  constructor(radiusM: number) {
+    this.group.name = 'pad-lights';
+    const n = 12;
+    const pos: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * TAU;
+      pos.push(Math.cos(a) * radiusM, 0.35, Math.sin(a) * radiusM);
+    }
+    const mat = (size: number) =>
+      new THREE.PointsMaterial({ size, sizeAttenuation: false, map: lightSprite(), transparent: true, depthWrite: false, toneMapped: false, blending: THREE.AdditiveBlending });
+    this.ring = mat(7);
+    this.ring.color.setRGB(0.25, 2.2, 0.6);
+    const ringGeo = new THREE.BufferGeometry();
+    ringGeo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    const ring = new THREE.Points(ringGeo, this.ring);
+    ring.frustumCulled = false;
+    this.beacon = mat(11);
+    this.beacon.color.setRGB(3, 3, 3);
+    const beaconGeo = new THREE.BufferGeometry();
+    beaconGeo.setAttribute('position', new THREE.Float32BufferAttribute([0, 2.2, -(radiusM + 3)], 3));
+    const beacon = new THREE.Points(beaconGeo, this.beacon);
+    beacon.frustumCulled = false;
+    this.group.add(ring, beacon);
+  }
+
+  /** night 0…1 — насколько темно; t — время, с: маяк вспыхивает раз в секунду на 0,12 с. */
+  setNight(night: number, t: number) {
+    const k = Math.min(1, Math.max(0, (night - 0.25) / 0.5));
+    this.group.visible = k > 0;
+    this.ring.opacity = k;
+    this.beacon.opacity = k * (t % 1 < 0.12 ? 1 : 0);
+  }
+}
 
 /** Круг зоны посадки (пунктир) заданного радиуса на земле; начало — центр. */
 export function createLandingZone(radiusM: number): THREE.Mesh {

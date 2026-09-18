@@ -25,10 +25,22 @@ export interface OsmUniforms {
   osmNight: { value: number };
   osmWind: { value: THREE.Vector2 };
   osmCam: { value: THREE.Vector3 };
+  /** Время года (src/game/season.ts): снег на кронах и крышах, лёд на воде, голые лиственные — 0…1. */
+  osmSnow: { value: number };
+  osmIce: { value: number };
+  osmBare: { value: number };
 }
 
 export function createOsmUniforms(): OsmUniforms {
-  return { osmTime: { value: 0 }, osmNight: { value: 0 }, osmWind: { value: new THREE.Vector2() }, osmCam: { value: new THREE.Vector3() } };
+  return {
+    osmTime: { value: 0 },
+    osmNight: { value: 0 },
+    osmWind: { value: new THREE.Vector2() },
+    osmCam: { value: new THREE.Vector3() },
+    osmSnow: { value: 0 },
+    osmIce: { value: 0 },
+    osmBare: { value: 0 },
+  };
 }
 
 /** Дальности слоя, м. Полей для дорог и воды в QualitySettings может не быть — тогда от радиуса домов. */

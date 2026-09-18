@@ -1,4 +1,5 @@
 import { AIRCRAFT, ASPECT_RATIO } from './aircraft';
+import { plainLocalWind, type WeatherEvent } from './weatherEvent';
 import { brakeDecel, climbPowerW, HOVER_TRANSLATE_MS, hoverPowerW, polar, takeoffMassKg } from './aero';
 import { airDensity, batteryCapacityWh, G, RHO0, tasFromIas, temperatureAt } from './atmosphere';
 import { failureInfo, FIRE_TO_POWER_S, LINK_TIMEOUT_S, RC_RANGE_M, type FailureId, type LinkLossAction } from './failures';
@@ -503,6 +504,8 @@ export interface FlightSetup {
   home?: Site;
   /** Курс захода на посадку дома по ВОЗВРАТУ, градусы; нет — против фактического ветра. */
   homeApproachDeg?: number;
+  /** Погода, которая меняется в полёте (weatherEvent.ts): фронт или гроза; время — от начала этого отсчёта (t). */
+  weatherEvent?: WeatherEvent;
   /** Время и израсходованная энергия к началу полёта — для второго полёта на той же батарее. */
   startT?: number;
   initialEnergyWh?: number;
@@ -543,6 +546,7 @@ export class LiveFlight {
   private readonly site: Site;
   private readonly homeSite: Site;
   private readonly homeApproachDeg: number | null;
+  private readonly event: WeatherEvent | null;
   private readonly mass: number;
   private readonly payloadW: number;
   private readonly terrain: Terrain;
@@ -688,6 +692,7 @@ export class LiveFlight {
     if (setup.linkLoss) this.linkLoss = { ...setup.linkLoss };
     this.homeSite = setup.home ?? plan.landing;
     this.homeApproachDeg = setup.homeApproachDeg ?? null;
+    this.event = setup.weatherEvent ?? null;
     this.terrain = setup.terrain;
     this.weather = setup.weather;
     this.mass = takeoffMassKg(plan.payload?.massKg ?? 0);
@@ -1970,6 +1975,7 @@ export class LiveFlight {
     const ground = this.groundUp(s.east, s.north);
     s.aglM = s.up - ground;
     if (this.tw) this.lw = this.tw.localWind(s.east, s.north, s.aglM, s.t);
+    if (this.event) this.lw = this.event.apply(this.lw ?? plainLocalWind(this.weather, s.aglM), s.east, s.north, s.aglM, s.t);
     this.sampleGust(h);
     if (this.failed.size > 0) this.failureTick(h);
     if (s.linkLost) this.linkTimeout();

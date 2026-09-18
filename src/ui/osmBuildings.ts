@@ -501,6 +501,7 @@ function facadeAtlas(): THREE.DataTexture {
 const FACADE_HEAD = /* glsl */ `
 uniform sampler2D osmFacade;
 uniform float osmNight;
+uniform float osmSnow;
 varying vec2 vFacadeUv;
 varying vec4 vFacadeInfo;
 float osmHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
@@ -537,6 +538,7 @@ export function createBuildingMaterial(u: OsmUniforms): { material: THREE.MeshSt
   const material = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, metalness: 0 });
   material.onBeforeCompile = (shader) => {
     shader.uniforms.osmNight = u.osmNight;
+    shader.uniforms.osmSnow = u.osmSnow;
     shader.uniforms.osmFacade = { value: atlas };
     shader.vertexShader =
       'attribute vec2 facadeUv;\nattribute vec4 facadeInfo;\nvarying vec2 vFacadeUv;\nvarying vec4 vFacadeInfo;\n' +
@@ -555,7 +557,12 @@ export function createBuildingMaterial(u: OsmUniforms): { material: THREE.MeshSt
           '#include <roughnessmap_fragment>\nif (vFacadeInfo.x > 3.5) roughnessFactor = vFacadeInfo.z / 255.0;\nroughnessFactor = mix(roughnessFactor, 0.15, fGlass);',
         )
         .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor = vFacadeInfo.w / 255.0 * (1.0 - fGlass);')
-        .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += fGlass * fLight * osmNight * 2.4;');
+        .replace(
+          '#include <emissivemap_fragment>',
+          // Снег на крышах: на обращённых вверх гранях (normal здесь — в координатах камеры).
+          '#include <emissivemap_fragment>\ntotalEmissiveRadiance += fGlass * fLight * osmNight * 2.4;\n' +
+            'diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.88, 0.9, 0.94), osmSnow * smoothstep(0.35, 0.75, dot(normal, normalize((viewMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz))) * (1.0 - fGlass));',
+        );
   };
   material.customProgramCacheKey = () => 'osm-facade';
   return { material, atlas };

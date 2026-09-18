@@ -104,6 +104,11 @@ export class SearchMode {
     else this.host.world.renderPip(rect, c.eye, c.look, c.fovDeg, c.up);
   }
 
+  /** Кадр подвеса: откуда и куда смотрит камера; null — аппарат на земле или подвес не включён. */
+  get frame(): { eye: Point3; look: Point3 } | null {
+    return this.camera;
+  }
+
   /** Поле зрения кадра подвеса, °. */
   get fovDeg(): number {
     return this.camera?.fovDeg ?? fovOf(this.sc.camera);

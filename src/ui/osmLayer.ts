@@ -181,7 +181,30 @@ function broadleafGeometry(): THREE.BufferGeometry {
 const TREE_FADE = /* glsl */ `#include <begin_vertex>
 #ifdef USE_INSTANCING
   transformed *= 1.0 - smoothstep(osmFade.x, osmFade.y, length(instanceMatrix[3].xz - osmCam.xz));
+#endif
+  // Крона (зелёные вершины): у голых лиственных — вдвое меньше и серо-бурая сетка ветвей.
+  vCrown = color.g > color.r * 1.12 ? 1.0 : 0.0;
+  vTreeUp = normal.y;
+  vTreeP = position;
+#ifdef OSM_BROADLEAF
+  if (vCrown > 0.5) transformed = mix(transformed, vec3(0.0, 12.0, 0.0) + (transformed - vec3(0.0, 12.0, 0.0)) * 0.72, osmBare);
 #endif`;
+
+/** Фрагменты деревьев: снег на кронах сверху, голые ветви лиственных — дырявые серо-бурые. */
+const TREE_COLOR = /* glsl */ `#include <color_fragment>
+#ifdef OSM_BROADLEAF
+  if (vCrown > 0.5 && osmBare > 0.01) {
+    float h = fract(sin(dot(floor(vTreeP * 2.6), vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+    if (h < 0.62 * osmBare) discard;
+    diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.3, 0.26, 0.23), osmBare);
+  }
+#endif
+#ifdef OSM_BROADLEAF
+  float snowOn = osmSnow * (1.0 - 0.85 * osmBare);
+#else
+  float snowOn = osmSnow;
+#endif
+  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.86, 0.89, 0.94), snowOn * vCrown * smoothstep(0.1, 0.7, vTreeUp) * 0.8);`;
 
 const TREE_PROJECT = /* glsl */ `vec4 mvPosition = vec4(transformed, 1.0);
 #ifdef USE_INSTANCING
@@ -471,7 +494,7 @@ export class OsmLayer {
   private readonly runwayParts: { mesh: THREE.Mesh; tex?: THREE.Texture }[] = [];
 
   /** Осень 0…1: доля пожелтевших лиственных и насколько они жёлтые. */
-  private readonly autumn: number;
+  private autumn: number;
 
   constructor(data: OsmData, groundAt: (east: number, north: number) => number, quality: QualitySettings, season: { autumn?: number } = {}) {
     this.autumn = Math.min(1, Math.max(0, season.autumn ?? 0));
@@ -514,11 +537,17 @@ export class OsmLayer {
         shader.uniforms.osmFade = this.osmFade;
         shader.uniforms.osmTime = this.uniforms.osmTime;
         shader.uniforms.osmWind = this.uniforms.osmWind;
+        shader.uniforms.osmSnow = this.uniforms.osmSnow;
+        shader.uniforms.osmBare = this.uniforms.osmBare;
+        const vary = 'varying float vCrown;\nvarying float vTreeUp;\nvarying vec3 vTreeP;\nuniform float osmSnow;\nuniform float osmBare;\n';
         shader.vertexShader =
+          vary +
           'uniform vec3 osmCam;\nuniform vec2 osmFade;\nuniform float osmTime;\nuniform vec2 osmWind;\n' +
           shader.vertexShader.replace('#include <begin_vertex>', TREE_FADE).replace('#include <project_vertex>', TREE_PROJECT);
+        shader.fragmentShader = vary + shader.fragmentShader.replace('#include <color_fragment>', TREE_COLOR);
       };
-      mat.customProgramCacheKey = () => 'osm-tree';
+      if (name === 'osm-broadleaves') mat.defines = { OSM_BROADLEAF: '' };
+      mat.customProgramCacheKey = () => `osm-tree-${name}`;
       this.treeMats.push(mat);
       const mesh = new THREE.InstancedMesh(geo, mat, TREE_CAP);
       mesh.name = name;
@@ -570,6 +599,18 @@ export class OsmLayer {
     this.roads.update(ce, cn, r.roadsM, u.osmNight.value, r.streetLights, performance.now() + ROAD_BUDGET_MS);
     this.updateTrees(ce, cn);
     this.lastUpdateMs = performance.now() - t0;
+  }
+
+  /** Время года: снег на кронах и крышах, лёд, голые лиственные; осенняя листва — перекраска деревьев. */
+  setSeason(s: { snow: number; ice: number; bare: number; autumn: number }): void {
+    this.uniforms.osmSnow.value = s.snow;
+    this.uniforms.osmIce.value = s.ice;
+    this.uniforms.osmBare.value = s.bare;
+    const autumn = Math.min(1, Math.max(0, s.autumn));
+    if (Math.abs(autumn - this.autumn) > 0.01) {
+      this.autumn = autumn;
+      this.treesDirty = true;
+    }
   }
 
   dispose(): void {

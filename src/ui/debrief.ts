@@ -17,6 +17,7 @@ import {
   type VideoCamera,
   type VideoSizeId,
 } from './videoPlan';
+import type { Remark } from '../game/remarks';
 import './debrief.css';
 
 /*
@@ -168,6 +169,11 @@ interface Geometry {
   h: number;
 }
 
+/** Сборка ортофотоплана: onProgress 0…1; итог — картинка, подпись и имя файла. */
+export interface OrthoHost {
+  build(onProgress: (share: number) => void): Promise<{ url: string; text: string; fileName: string }>;
+}
+
 export class Debrief {
   /** Время сменилось изнутри окна: прокрутка, клик по событию, воспроизведение. Не вызывается из setTime. */
   onSeek?: (t: number) => void;
@@ -241,10 +247,12 @@ export class Debrief {
         <dl class="db-now"></dl>
         <details class="db-sec" open><summary>Итоги</summary><dl class="db-sum"></dl></details>
         <details class="db-sec db-assess-sec" open><summary>Оценка</summary><div class="db-assess"></div></details>
+        <details class="db-sec db-remarks-sec" open hidden><summary>Замечания инструктора</summary><ul class="log db-remarks" title="Щелчок — перейти к этому моменту"></ul></details>
         <details class="db-sec"><summary>События <span class="db-evn"></span></summary><ul class="log db-events"></ul></details>
         <div class="db-actions">
           <button class="db-btn" data-db="export">Сохранить запись</button>
           <button class="db-btn" data-db="video" hidden>Сохранить видео…</button>
+          <button class="db-btn" data-db="ortho" hidden title="Склеить кадры съёмки в ортофото: где не хватило перекрытия, где смаз и недодержка">Ортофотоплан…</button>
           <button class="db-btn" data-db="import">${importTitle}</button>
           <input type="file" class="db-file" multiple hidden>
         </div>
@@ -265,9 +273,19 @@ export class Debrief {
           </div>
           <div class="dv-status" hidden></div>
         </div>
+        <div class="db-ortho" hidden>
+          <div class="dv-progress" hidden><div class="dv-bar"><i></i></div><span class="dv-pct"></span></div>
+          <p class="do-text"></p>
+          <a class="do-link" target="_blank" rel="noopener"><img class="do-img" alt="Ортофотоплан"></a>
+          <div class="dv-buttons"><a class="db-btn do-save" download="orthophoto.png">Сохранить PNG</a></div>
+        </div>
         <div class="db-error" hidden></div>
       </div>`;
     root.appendChild(el);
+    this.q<HTMLUListElement>('.db-remarks').addEventListener('click', (e) => {
+      const li = (e.target as HTMLElement).closest<HTMLElement>('li[data-t]');
+      if (li) this.seek(+li.dataset.t!);
+    });
     this.canvas = this.q<HTMLCanvasElement>('.db-chart');
     this.slider = this.q<HTMLInputElement>('.db-slider');
     this.fileInput = this.q<HTMLInputElement>('.db-file');
@@ -302,6 +320,9 @@ export class Debrief {
         }
         case 'video-go':
           void this.saveVideo();
+          break;
+        case 'ortho':
+          void this.buildOrtho();
           break;
         case 'video-cancel':
           this.videoAbort?.abort();
@@ -430,6 +451,57 @@ export class Debrief {
     if (!host) {
       this.videoAbort?.abort();
       this.q<HTMLElement>('.db-video').hidden = true;
+    }
+  }
+
+  /** Замечания инструктора (src/game/remarks.ts) к следующему show; null — раздела нет. */
+  setRemarks(list: readonly Remark[] | null): void {
+    const sec = this.q<HTMLElement>('.db-remarks-sec');
+    sec.hidden = !list?.length;
+    const ul = this.q<HTMLUListElement>('.db-remarks');
+    ul.innerHTML = (list ?? [])
+      .map((r) => `<li class="${r.level === 'good' ? 'good' : r.level}" ${r.t !== null ? `data-t="${r.t}"` : ''}>${r.text.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!)}</li>`)
+      .join('');
+  }
+
+  /** Сборка ортофотоплана по кадрам съёмки (main.ts); null — кнопки нет. */
+  setOrthoHost(host: OrthoHost | null): void {
+    this.orthoHost = host;
+    this.q<HTMLElement>('[data-db="ortho"]').hidden = !host;
+    if (!host) this.q<HTMLElement>('.db-ortho').hidden = true;
+  }
+
+  private orthoHost: OrthoHost | null = null;
+  private orthoBusy = false;
+
+  private async buildOrtho() {
+    const host = this.orthoHost;
+    if (!host || this.orthoBusy) return;
+    this.orthoBusy = true;
+    const box = this.q<HTMLElement>('.db-ortho');
+    box.hidden = false;
+    const prog = box.querySelector<HTMLElement>('.dv-progress')!;
+    const bar = prog.querySelector<HTMLElement>('i')!;
+    const pct = prog.querySelector<HTMLElement>('.dv-pct')!;
+    const text = box.querySelector<HTMLElement>('.do-text')!;
+    prog.hidden = false;
+    text.textContent = 'Кадры проецируются на рельеф…';
+    try {
+      const r = await host.build((share) => {
+        bar.style.width = `${Math.round(share * 100)}%`;
+        pct.textContent = `${Math.round(share * 100)} %`;
+      });
+      box.querySelector<HTMLImageElement>('.do-img')!.src = r.url;
+      box.querySelector<HTMLAnchorElement>('.do-link')!.href = r.url;
+      const save = box.querySelector<HTMLAnchorElement>('.do-save')!;
+      save.href = r.url;
+      save.download = r.fileName;
+      text.textContent = r.text;
+    } catch (e) {
+      text.textContent = `Не собрался: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      prog.hidden = true;
+      this.orthoBusy = false;
     }
   }
 

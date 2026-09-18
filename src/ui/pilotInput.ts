@@ -1,13 +1,21 @@
+import { axisValue, defaultMapping, type AxisMap, type RcMapping } from '../game/rcMapping';
 import type { Stick } from '../sim/flight';
+
+export { axisValue, defaultMapping, type AxisMap, type RcMapping };
 
 export type { Stick };
 
 /*
- * Ручки ПДУ для «Фэйлсейфа»: геймпад (стандартная раскладка, режим 2 — левый стик газ и
- * рыскание, правый — тангаж и крен) или, если геймпада нет, клавиатура: W/S — газ, A/D —
- * рыскание, стрелки — тангаж и крен. Самоцентрирующийся стик газа — это «держать высоту»:
- * в симуляторе газ 0 значит держать, а не выключить (Controls.stick в flight.ts).
+ * Ручки ПДУ для «Фэйлсейфа»: геймпад или настоящий пульт по USB (EdgeTX/OpenTX в режиме
+ * джойстика), если его нет — клавиатура: W/S — газ, A/D — рыскание, стрелки — тангаж и крен.
+ * Какая ось пульта — какая ручка, инверсия и калибровка хода — раскладка (RcMapping), своя у
+ * каждого пульта, хранится в браузере. По умолчанию: у геймпада стандартной раскладки — режим 2
+ * (левый стик газ и рыскание, правый — тангаж и крен), у пульта — AETR (крен, тангаж, газ,
+ * рыскание — оси 0…3). Середина хода газа — это «держать высоту»: в симуляторе газ 0 значит
+ * держать, а не выключить (Controls.stick в flight.ts).
  */
+
+const STORE = 'vtol-rc-mapping:';
 
 export interface PilotInputOptions {
   /** Мёртвая зона стиков, доля хода. */
@@ -47,6 +55,7 @@ export class PilotInput {
   private kbOn = false;
   private kb: Stick = { ...ZERO };
   private lastT: number | null = null;
+  private map: { id: string; m: RcMapping } | null = null;
 
   private readonly onKeyDown = (e: KeyboardEvent) => {
     if (!this.kbOn || !(e.code in KEYS) || typing(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -95,9 +104,9 @@ export class PilotInput {
     this.lastT = now;
     const pad = this.pad();
     if (pad) {
-      const ax = (i: number) => this.shape(pad.axes[i] ?? 0);
-      // Режим 2; вверх по оси геймпада — минус.
-      return { yaw: ax(0), throttle: -ax(1), roll: ax(2), pitch: -ax(3) };
+      const m = this.mappingFor(pad);
+      const ax = (a: AxisMap) => this.shape(axisValue(pad.axes[a.index] ?? 0, a), m);
+      return { roll: ax(m.roll), pitch: ax(m.pitch), yaw: ax(m.yaw), throttle: ax(m.throttle) };
     }
     if (!this.kbOn) return null;
     for (const axis of Object.keys(ZERO) as Axis[]) {
@@ -133,11 +142,51 @@ export class PilotInput {
     return any;
   }
 
+  /** Пульт сейчас: имя, сырые оси, стандартная ли раскладка; null — не подключён. */
+  device(): { id: string; axes: readonly number[]; standard: boolean } | null {
+    const p = this.pad();
+    return p ? { id: p.id, axes: p.axes, standard: p.mapping === 'standard' } : null;
+  }
+
+  /** Раскладка подключённого пульта (сохранённая или по умолчанию); null — пульта нет. */
+  mapping(): RcMapping | null {
+    const p = this.pad();
+    return p ? this.mappingFor(p) : null;
+  }
+
+  /** Сохранить раскладку подключённого пульта; null — вернуть раскладку по умолчанию. */
+  setMapping(m: RcMapping | null): void {
+    const p = this.pad();
+    if (!p) return;
+    try {
+      if (m) localStorage.setItem(STORE + p.id, JSON.stringify(m));
+      else localStorage.removeItem(STORE + p.id);
+    } catch {
+      // Хранилище недоступно — раскладка живёт до перезагрузки.
+    }
+    this.map = { id: p.id, m: m ?? defaultMapping(p.mapping === 'standard') };
+  }
+
+  private mappingFor(p: Gamepad): RcMapping {
+    if (this.map?.id === p.id) return this.map.m;
+    let m = defaultMapping(p.mapping === 'standard');
+    try {
+      const s = localStorage.getItem(STORE + p.id);
+      if (s) m = { ...m, ...(JSON.parse(s) as Partial<RcMapping>) };
+    } catch {
+      // Нет хранилища или испорчено — по умолчанию.
+    }
+    this.map = { id: p.id, m };
+    return m;
+  }
+
   /** Мёртвая зона с перенормировкой хода и экспонента. */
-  private shape(x: number): number {
+  private shape(x: number, m?: { deadzone: number; expo: number }): number {
+    const dz = m?.deadzone ?? this.deadzone;
+    const ex = m?.expo ?? this.expo;
     const a = Math.abs(x);
-    if (a <= this.deadzone) return 0;
-    const v = Math.min(1, (a - this.deadzone) / (1 - this.deadzone));
-    return Math.sign(x) * ((1 - this.expo) * v + this.expo * v * v * v);
+    if (a <= dz) return 0;
+    const v = Math.min(1, (a - dz) / (1 - dz));
+    return Math.sign(x) * ((1 - ex) * v + ex * v * v * v);
   }
 }
