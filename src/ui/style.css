@@ -2047,3 +2047,232 @@ ul.log li.good {
   display: block;
   margin: 0 0 3px auto;
 }
+
+/* Тёмная тема для ночных полётов: ⚙ → «Тема» (авто — по Солнцу). Карта приглушена. */
+:root[data-theme='dark'] {
+  --bar: #1c2127;
+  --btn: rgba(40, 46, 54, 0.94);
+  --btn-line: #46505c;
+  --text: #d7dde4;
+  --muted: #8b97a3;
+  --win: rgba(28, 33, 39, 0.97);
+  --good: #3ec27a;
+  --warn: #e0a84a;
+  --bad: #ef6a6a;
+  color-scheme: dark;
+}
+
+:root[data-theme='dark'] .topbar {
+  border-bottom-color: #0e1114;
+}
+
+:root[data-theme='dark'] .tb,
+:root[data-theme='dark'] button.small,
+:root[data-theme='dark'] select,
+:root[data-theme='dark'] input[type='number'],
+:root[data-theme='dark'] input[type='text'],
+:root[data-theme='dark'] textarea {
+  background: #262c33;
+  color: var(--text);
+  border-color: #46505c;
+}
+
+:root[data-theme='dark'] button.small:hover,
+:root[data-theme='dark'] .gbtn:hover {
+  background: #313943;
+}
+
+:root[data-theme='dark'] .gbtn.on,
+:root[data-theme='dark'] .gbtn.open,
+:root[data-theme='dark'] button.small.on {
+  background: #4a3620;
+}
+
+:root[data-theme='dark'] .gbtn[data-a='emergency'] {
+  color: #ff8a80;
+}
+
+:root[data-theme='dark'] .grp.trainer .gbtn {
+  background: rgba(36, 48, 66, 0.94);
+}
+
+:root[data-theme='dark'] .status {
+  background: #232a31;
+  border-color: #46505c;
+  color: var(--text);
+}
+
+:root[data-theme='dark'] .status[data-mode='auto'],
+:root[data-theme='dark'] .status[data-mode='guided'] {
+  background: #173a26;
+  border-color: #2f8f58;
+}
+
+:root[data-theme='dark'] .status[data-mode='rtl'],
+:root[data-theme='dark'] .status[data-mode='backtransition'] {
+  background: #3d3016;
+  border-color: #a8802c;
+}
+
+:root[data-theme='dark'] .status[data-mode='crashed'] {
+  background: #4a1d1d;
+}
+
+:root[data-theme='dark'] .menu,
+:root[data-theme='dark'] .toast {
+  background: #1f252c;
+  color: var(--text);
+  border-color: #46505c;
+}
+
+:root[data-theme='dark'] .menu button {
+  color: var(--text);
+  border-bottom-color: #2c333b;
+}
+
+:root[data-theme='dark'] .menu button:hover {
+  background: #2d2418;
+}
+
+:root[data-theme='dark'] .menu.settings label.select,
+:root[data-theme='dark'] details,
+:root[data-theme='dark'] ul.log li,
+:root[data-theme='dark'] ul.zones li,
+:root[data-theme='dark'] table.route td,
+:root[data-theme='dark'] .bat-table td,
+:root[data-theme='dark'] table.kv tr.total td,
+:root[data-theme='dark'] .fc-detail {
+  border-color: #2c333b;
+}
+
+:root[data-theme='dark'] .win {
+  border-color: #3a434d;
+}
+
+:root[data-theme='dark'] .win-title {
+  background: #242b33;
+  border-bottom-color: #3a434d;
+  color: var(--text);
+}
+
+:root[data-theme='dark'] .win-title .x {
+  color: var(--text);
+}
+
+:root[data-theme='dark'] .brief {
+  background: #2c2419;
+}
+
+:root[data-theme='dark'] .verdict.good,
+:root[data-theme='dark'] .fc-h[data-v='go'] {
+  background: #173a26;
+  color: #8fe0b0;
+}
+
+:root[data-theme='dark'] .verdict.warn,
+:root[data-theme='dark'] .fc-h[data-v='caution'] {
+  background: #3d3016;
+}
+
+:root[data-theme='dark'] .verdict.bad,
+:root[data-theme='dark'] .fc-h[data-v='nogo'] {
+  background: #4a1d1d;
+  color: #ffb3b3;
+}
+
+:root[data-theme='dark'] .rcs-bar,
+:root[data-theme='dark'] .bat-bar {
+  background: #343c46;
+}
+
+:root[data-theme='dark'] .splitter {
+  background: #2c333b;
+  border-color: #1c2127;
+}
+
+:root[data-theme='dark'] .leaflet-tile-pane {
+  filter: brightness(0.55) contrast(1.08) saturate(0.8);
+}
+
+:root[data-theme='dark'] .leaflet-control-attribution,
+:root[data-theme='dark'] .leaflet-control-scale-line {
+  background: rgba(28, 33, 39, 0.8) !important;
+  color: var(--muted) !important;
+}
+
+:root[data-theme='dark'] .leaflet-control-attribution a {
+  color: #9fb6d0;
+}
+
+/* Видео подвеса ушло на второй экран: в рамке — только надпись и кнопки. */
+.pip[data-ext] {
+  background: rgba(10, 12, 15, 0.82);
+}
+
+.pip[data-ext]::after {
+  content: 'Видео — на втором экране';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  text-align: center;
+  color: #8b97a3;
+  font: 12px system-ui, sans-serif;
+}
+
+/* Камера подвеса включена: вверху 3D-вид, внизу — кадр камеры (main.ts setDock). */
+.view-pane.docked .view {
+  bottom: 50%;
+}
+
+.cam-dock {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  bottom: 0;
+  background: #000;
+  border-top: 2px solid #2c333b;
+}
+
+.cam-dock canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.view-pane.docked .pip {
+  border-width: 0;
+  border-radius: 0;
+}
+
+.view-pane.docked .rc-sticks,
+.view-pane.docked .smoke-btn {
+  bottom: calc(50% + 12px);
+}
+
+/* Наземные группы на карте (map2d.setTeams). */
+.team-pin div {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #1c7ed6;
+  border: 2px solid #fff;
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.team-pin.arrived div {
+  background: #2f9e44;
+}
+
+.team-pin span {
+  position: absolute;
+  left: 26px;
+  top: 2px;
+  white-space: nowrap;
+  font: 600 11px system-ui, sans-serif;
+  color: #fff;
+  text-shadow: 0 0 3px #000, 0 0 2px #000;
+}

@@ -70,6 +70,10 @@ export interface GcsHandlers {
   /** Речевые сообщения НСУ: вкл/выкл. */
   onVoice?(on: boolean): void;
   /** Выбран голос из списка; «Прослушать» — пробная фраза. */
+  /** Тема: авто (по Солнцу), тёмная, светлая. */
+  onTheme?(mode: 'auto' | 'dark' | 'light'): void;
+  /** Второй монитор: видео подвеса или 3D-вид в отдельном окне. */
+  onSecondScreen?(): void;
   /** Кнопка «Пульт»: показать или спрятать пульт; вернуть — показан ли. */
   onSticks?(): boolean;
   onVoicePick?(uri: string): void;
@@ -177,6 +181,8 @@ export interface Gcs {
   /** Строка под выбором погоды: откуда погода и что в ней. */
   setWeatherSummary(text: string): void;
   setSoundMuted(muted: boolean): void;
+  /** Подпись кнопки темы (сохранённый выбор). */
+  setTheme(mode: 'auto' | 'dark' | 'light'): void;
   /** Выбрать источник погоды в списке (режим задаёт свою погоду). */
   setWeatherSource(src: string): void;
   /** Список районов; при одном районе и меньше выбор скрыт. */
@@ -391,6 +397,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       .join('')}</select></label>
     <button data-a="sound">🔊 Звук включён</button>
     <button data-a="rc" title="Пульт по USB или геймпад: оси, инверсия, калибровка">🎮 Пульт ДУ…</button>
+    <button data-a="theme" title="Тёмная тема для ночных полётов; авто — тёмная, когда Солнце село">🌓 Тема: авто</button>
+    <button data-a="screen2" title="Второй монитор: видео с подвеса или 3D-вид — в отдельном окне браузера">🖥 Второй экран…</button>
     <button data-a="voice" ${h.onVoice ? '' : 'hidden'}>🗣 Голос: выкл</button>
     <label class="select voice-pick" hidden><span>Голос</span><select data-voice-pick title="Русские голоса браузера: нейросетевые звучат естественнее"></select></label>
     <button data-a="voice-preview" hidden>▶ Прослушать</button>
@@ -399,7 +407,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   <main class="split">
     <section class="map-pane">
       <div class="map"></div>
-      <!-- Слева — по порядку работы: план, подготовка и полёт; внизу — тренажёр. Справа — карта и приборы. -->
+      <!-- Слева — по порядку работы: план, подготовка и полёт. Справа — карта, тренажёр и приборы. -->
       <div class="col left">
         ${group(
           'plan',
@@ -420,13 +428,6 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           button('sticks', 'Пульт', icon('sticks'), 'title="Пульт ДУ: показать ручки (экранные, пульт по USB, клавиатура); управление с пульта — в ФЭЙЛСЕЙФе"'),
           button('unload', 'Разгрузка', icon('unload'), 'hidden'),
         )}
-        ${group(
-          'trainer low',
-          'Тренажёр',
-          button('instructor', 'Инструктор', icon('instructor'), 'title="Ввести особый случай"'),
-          button('zones', 'Зоны', icon('zones'), `title="Запретные зоны и РЭБ" ${h.onZoneTool ? '' : 'hidden'}`),
-          button('debrief', 'Разбор', icon('debrief'), 'title="Разбор полёта"'),
-        )}
       </div>
       <div class="col right">
         ${group(
@@ -436,6 +437,13 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           button('target', 'Облёт точки', icon('target'), 'title="ОПЕР. ТОЧКА: щёлкните по карте — аппарат уйдёт к точке и будет кружить над ней. Esc — отмена"'),
           button('reach', 'Досягаемость', icon('reach'), `title="Куда долетит и вернётся: запас 25 %, 10 %, впритык, в один конец" ${h.onReach ? '' : 'hidden'}`),
           button('clear', 'Очистить', icon('clear'), 'title="Очистить траекторию на карте и в 3D"'),
+        )}
+        ${group(
+          'trainer',
+          'Тренажёр',
+          button('instructor', 'Инструктор', icon('instructor'), 'title="Ввести особый случай"'),
+          button('zones', 'Зоны', icon('zones'), `title="Запретные зоны и РЭБ" ${h.onZoneTool ? '' : 'hidden'}`),
+          button('debrief', 'Разбор', icon('debrief'), 'title="Разбор полёта"'),
         )}
         ${group(
           'instruments low',
@@ -460,6 +468,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     <div class="splitter" title="Потяните, чтобы изменить доли"></div>
     <section class="view-pane">
       <div class="view"></div>
+      <div class="cam-dock" hidden><canvas></canvas></div>
       <div class="alerts" hidden></div>
       <select class="camera">
         <option value="chase" title="Мышь — повернуть, колёсико — ближе/дальше, двойной щелчок — сброс">3D: за хвостом</option>
@@ -694,6 +703,13 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       else if (a === 'packs') h.onPacks?.();
       else if (a === 'forecast') h.onForecast?.();
       else if (a === 'sticks') b.classList.toggle('open', h.onSticks?.() ?? false);
+      else if (a === 'theme') {
+        const order = ['auto', 'dark', 'light'] as const;
+        const next = order[(order.indexOf((b.dataset.mode as (typeof order)[number]) ?? 'auto') + 1) % order.length]!;
+        b.dataset.mode = next;
+        b.textContent = `🌓 Тема: ${{ auto: 'авто', dark: 'тёмная', light: 'светлая' }[next]}`;
+        h.onTheme?.(next);
+      } else if (a === 'screen2') h.onSecondScreen?.();
       else if (a === 'reach') {
         reach = !reach;
         b.classList.toggle('on', reach);
@@ -1189,6 +1205,12 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       weatherSource = src;
       const sel = taskBody.querySelector<HTMLSelectElement>('[data-a="wsrc"]');
       if (sel) sel.value = src;
+    },
+
+    setTheme(mode) {
+      const b = q<HTMLButtonElement>('[data-a="theme"]');
+      b.dataset.mode = mode;
+      b.textContent = `🌓 Тема: ${{ auto: 'авто', dark: 'тёмная', light: 'светлая' }[mode]}`;
     },
 
     setSoundMuted(muted) {

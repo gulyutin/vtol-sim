@@ -259,6 +259,18 @@ export interface OsdData {
 const pad2 = (n: number) => String(Math.floor(n)).padStart(2, '0');
 const fmtT = (s: number) => `${pad2(s / 3600)}:${pad2((s % 3600) / 60)}:${pad2(s % 60)}`;
 
+/** Текст служебной информации по углам кадра (строки через \n) — для окна и для второго экрана. */
+export function osdText(d: OsdData): { tl: string; tr: string; bl: string; br: string } {
+  const bars = '▂▄▆█'.slice(0, Math.max(0, Math.min(4, Math.ceil(d.linkQuality * 4))));
+  const c = d.center ? `${d.center.lat.toFixed(5)}° ${d.center.lon.toFixed(5)}°` : '—';
+  return {
+    tl: `● ЗАП ${fmtT(d.flightS)}\n${d.channel} · ${d.mode}`,
+    tr: `СВЯЗЬ ${Math.round(d.linkQuality * 100)}% ${bars}\nЗАДЕРЖКА ${Math.round(d.latencyS * 1000)} мс`,
+    bl: `H ${Math.round(d.aglM)} м (${Math.round(d.altM)} абс)\nV ${d.speedMs.toFixed(1)} м/с  К ${String(Math.round(d.headingDeg) % 360).padStart(3, '0')}°`,
+    br: `АЗ ${d.panDeg >= 0 ? '+' : ''}${Math.round(d.panDeg)}°  УМ ${Math.round(d.tiltDeg)}°  ×${d.zoom.toFixed(1)}\nЦЕНТР ${c}`,
+  };
+}
+
 /**
  * Служебная информация поверх видео с подвеса, как её вшивает борт: по углам — время записи и
  * режим, связь и задержка, высота, скорость и курс, углы подвеса, зум и координаты центра кадра.
@@ -294,12 +306,11 @@ export class VideoOsd {
   update(d: OsdData | null) {
     this.el.hidden = !d;
     if (!d) return;
-    const bars = '▂▄▆█'.slice(0, Math.max(0, Math.min(4, Math.ceil(d.linkQuality * 4))));
-    this.tl.textContent = `● ЗАП ${fmtT(d.flightS)}\n${d.channel} · ${d.mode}`;
-    this.tr.textContent = `СВЯЗЬ ${Math.round(d.linkQuality * 100)}% ${bars}\nЗАДЕРЖКА ${Math.round(d.latencyS * 1000)} мс`;
-    this.bl.textContent = `H ${Math.round(d.aglM)} м (${Math.round(d.altM)} абс)\nV ${d.speedMs.toFixed(1)} м/с  К ${String(Math.round(d.headingDeg) % 360).padStart(3, '0')}°`;
-    const c = d.center ? `${d.center.lat.toFixed(5)}° ${d.center.lon.toFixed(5)}°` : '—';
-    this.br.textContent = `АЗ ${d.panDeg >= 0 ? '+' : ''}${Math.round(d.panDeg)}°  УМ ${Math.round(d.tiltDeg)}°  ×${d.zoom.toFixed(1)}\nЦЕНТР ${c}`;
+    const o = osdText(d);
+    this.tl.textContent = o.tl;
+    this.tr.textContent = o.tr;
+    this.bl.textContent = o.bl;
+    this.br.textContent = o.br;
     this.lost.hidden = !d.frozen;
   }
 }

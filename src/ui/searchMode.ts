@@ -106,7 +106,7 @@ export class SearchMode {
   }
 
   /** Кадр подвеса: откуда и куда смотрит камера; null — аппарат на земле или подвес не включён. */
-  get frame(): { eye: Point3; look: Point3 } | null {
+  get frame(): { eye: Point3; look: Point3; up: THREE.Vector3; fovDeg: number } | null {
     return this.camera;
   }
 

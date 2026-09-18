@@ -18,6 +18,7 @@ import {
   type VideoSizeId,
 } from './videoPlan';
 import type { Remark } from '../game/remarks';
+import { openProtocol } from './examProtocol';
 import './debrief.css';
 
 /*
@@ -252,6 +253,7 @@ export class Debrief {
         <div class="db-actions">
           <button class="db-btn" data-db="export">Сохранить запись</button>
           <button class="db-btn" data-db="video" hidden>Сохранить видео…</button>
+          <button class="db-btn" data-db="protocol" title="Протокол проверки оператора: баллы, замечания, график, траектория, допуск, подписи — сохранить в PDF">Протокол (PDF)…</button>
           <button class="db-btn" data-db="ortho" hidden title="Склеить кадры съёмки в ортофото: где не хватило перекрытия, где смаз и недодержка">Ортофотоплан…</button>
           <button class="db-btn" data-db="import">${importTitle}</button>
           <input type="file" class="db-file" multiple hidden>
@@ -323,6 +325,10 @@ export class Debrief {
           break;
         case 'ortho':
           void this.buildOrtho();
+          break;
+        case 'protocol':
+          if (this.rec && !openProtocol({ rec: this.rec, ...(this.assessment ? { assessment: this.assessment } : {}), remarks: this.remarks, chartUrl: this.canvas.toDataURL('image/png'), region: this.regionName }))
+            this.showError('Браузер не дал открыть окно протокола — разрешите всплывающие окна для этого сайта.');
           break;
         case 'video-cancel':
           this.videoAbort?.abort();
@@ -455,7 +461,12 @@ export class Debrief {
   }
 
   /** Замечания инструктора (src/game/remarks.ts) к следующему show; null — раздела нет. */
+  /** Район для протокола. */
+  regionName = '';
+  private remarks: readonly Remark[] = [];
+
   setRemarks(list: readonly Remark[] | null): void {
+    this.remarks = list ?? [];
     const sec = this.q<HTMLElement>('.db-remarks-sec');
     sec.hidden = !list?.length;
     const ul = this.q<HTMLUListElement>('.db-remarks');

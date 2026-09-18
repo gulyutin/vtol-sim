@@ -656,6 +656,23 @@ export class Map2D {
     }).addTo(this.map);
   }
 
+  private teamLayer: L.LayerGroup | null = null;
+
+  /** Наземные группы: значок и подпись; прибывшая — зелёная. Пусто — убрать. */
+  setTeams(list: readonly { name: string; at: GeoPoint; arrived: boolean }[]) {
+    this.teamLayer?.remove();
+    this.teamLayer = null;
+    if (!list.length) return;
+    const g = L.layerGroup().addTo(this.map);
+    for (const t of list) {
+      L.marker(ll(t.at), {
+        icon: L.divIcon({ className: `team-pin${t.arrived ? ' arrived' : ''}`, html: `<div>👥</div><span>${t.name}</span>`, iconSize: [22, 22], iconAnchor: [11, 11] }),
+        interactive: false,
+      }).addTo(g);
+    }
+    this.teamLayer = g;
+  }
+
   private weatherLayer: L.LayerGroup | null = null;
 
   /**

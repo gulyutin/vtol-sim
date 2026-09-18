@@ -29,6 +29,11 @@ export interface OsmUniforms {
   osmSnow: { value: number };
   osmIce: { value: number };
   osmBare: { value: number };
+  /** Зеркало воды (World.renderReflection): текстура, матрица проекции, уровень, включено ли. */
+  osmRefl: { value: THREE.Texture | null };
+  osmReflMatrix: { value: THREE.Matrix4 };
+  osmReflY: { value: number };
+  osmReflOn: { value: number };
 }
 
 export function createOsmUniforms(): OsmUniforms {
@@ -40,6 +45,10 @@ export function createOsmUniforms(): OsmUniforms {
     osmSnow: { value: 0 },
     osmIce: { value: 0 },
     osmBare: { value: 0 },
+    osmRefl: { value: null },
+    osmReflMatrix: { value: new THREE.Matrix4() },
+    osmReflY: { value: 0 },
+    osmReflOn: { value: 0 },
   };
 }
 

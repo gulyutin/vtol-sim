@@ -86,7 +86,7 @@ export interface TerrainShading {
 
 const SHADER_HEAD = /* glsl */ `
 uniform vec3 tCamera; uniform vec2 tCloudOffset; uniform float tCloudCover; uniform float tCloudBase; uniform vec3 tSunDir;
-uniform float tSnow; uniform float tSnowLine;
+uniform float tSnow; uniform float tSnowLine; uniform float tValleyFog; uniform float tValleyTop;
 varying vec3 vTerrainWorld;
 float tHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float tNoise(vec2 p) { vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
@@ -131,6 +131,12 @@ if (tSnow > 0.001 || tSnowLine < 9000.0) {
   vec3 snowCol = vec3(0.86, 0.89, 0.94) * (0.93 + 0.07 * tNoise(p.xz * 0.4));
   vec3 under = mix(diffuseColor.rgb, snowCol * 0.5, 0.5);
   diffuseColor.rgb = mix(diffuseColor.rgb, mix(snowCol, under, forest), c);
+}
+if (tValleyFog > 0.001) {
+  // Утренний туман в низинах: сверху — белая пелена там, где рельеф ниже её верхней границы.
+  float depth = tValleyTop - vTerrainWorld.y + 30.0 * (tFbm4(vTerrainWorld.xz / 650.0) - 0.5);
+  float f = smoothstep(-10.0, 30.0, depth) * tValleyFog;
+  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.9, 0.92, 0.94), 0.9 * f);
 }
 #ifdef TERRAIN_CLOUD_SHADOWS
 if (tSunDir.y > 0.05) {
@@ -205,7 +211,15 @@ export class TerrainLod {
     tSunDir: { value: new THREE.Vector3(0, 1, 0) },
     tSnow: { value: 0 },
     tSnowLine: { value: 1e5 },
+    tValleyFog: { value: 0 },
+    tValleyTop: { value: -1e5 },
   };
+
+  /** Туман в низинах: 0…1 и верхняя граница, м по высоте сцены. */
+  setValleyFog(amount: number, topY: number) {
+    this.uniforms.tValleyFog.value = amount;
+    this.uniforms.tValleyTop.value = topY;
+  }
 
   /** Снег на земле: покров у площадки 0…1 и граница снега в горах, м по высоте сцены. */
   setSnow(cover: number, lineY: number) {

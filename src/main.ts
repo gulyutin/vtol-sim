@@ -41,6 +41,8 @@ import { RcSetup } from './ui/rcSetup';
 import { flightRemarks } from './game/remarks';
 import { afterFlight, capacityWh as batteryCapacityOf, install as installBattery, installed, loadPark, savePark, tickPark, toggleCharger } from './game/batteries';
 import { BatteryPanel } from './ui/batteryPanel';
+import { SecondScreen } from './ui/secondScreen';
+import { GroundTeams } from './game/groundTeams';
 import { backTransitionAltitudeM, combineResults, distanceM, fromLocal, simulateMission, toLocal, transitionAltitudeM } from './sim/mission';
 import { sunPosition } from './sim/sun';
 import { TerrainRelief, TerrainWind } from './sim/terrainWind';
@@ -140,6 +142,20 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   let daySeed = 1;
   let forecast!: Weather;
   let actual!: Weather;
+  // Наземные группы: расчёт у НСУ, спасатели и пожарные к отметкам (groundTeams.ts).
+  const teams = new GroundTeams();
+  let teamsAt = 0;
+  let skyAt = 0;
+  let valleyTop: number | null = null;
+  // Тема НСУ: авто — тёмная, когда Солнце село; выбор хранится в браузере.
+  let themeMode: 'auto' | 'dark' | 'light' = 'auto';
+  try {
+    const saved = localStorage.getItem('vtol-theme');
+    if (saved === 'dark' || saved === 'light') themeMode = saved;
+  } catch {
+    // Без хранилища — авто.
+  }
+  let themeAt = 0;
   // Аккумуляторы расчёта (batteries.ts): на аппарате, на зарядке, в машине; хранятся в браузере.
   const park = loadPark(settings.temperatureC);
   /** Батарея для плана (сейчас на аппарате) и для этого полёта (на взлёте): ёмкость и израсходованное до взлёта. */
@@ -381,6 +397,16 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     },
     onCommand: command,
     onSticks: () => rc.toggleShown(),
+    onTheme(mode) {
+      themeMode = mode;
+      try {
+        localStorage.setItem('vtol-theme', mode);
+      } catch {
+        // Без хранилища — до перезагрузки.
+      }
+      applyTheme();
+    },
+    onSecondScreen: () => screen2.toggle(),
     onControls(c) {
       controls = { ...controls, ...c };
     },
@@ -569,6 +595,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     onSetup: () => document.querySelector<HTMLButtonElement>('[data-a="rc"]')?.click(),
   });
   new RcSetup(document.querySelector<HTMLElement>('.rc-setup')!, pilot);
+  gcs.setTheme(themeMode);
   // Аккумуляторы: поставить на аппарат, на зарядку, ждать — только на земле без АРМ.
   const batPanel = new BatteryPanel(document.querySelector<HTMLElement>('.bat-panel')!, {
     onInstall(id) {
@@ -620,6 +647,14 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   // Видео с подвеса идёт по радиолинии: задержка, сжатие, замирание без связи; поверх — служебная информация.
   const vlink = new VideoLink(world.renderer);
   const osd = new VideoOsd(pipEl);
+  // Второй монитор: видео подвеса или 3D-вид в отдельном окне браузера (⚙ → «Второй экран»).
+  const screen2 = new SecondScreen();
+  // Нижняя половина правой части — кадр камеры подвеса (setDock, presentDock).
+  const viewPane = gcs.viewEl.parentElement!;
+  const dockEl = viewPane.querySelector<HTMLElement>('.cam-dock')!;
+  const dockCanvas = dockEl.querySelector('canvas')!;
+  const dockCtx = dockCanvas.getContext('2d')!;
+  let dockOn = false;
 
   // Видео полёта из разбора: на время записи основной цикл стоит, кадры рисует запись.
   let videoBusy = false;
@@ -1108,6 +1143,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
                 rec.event(t, `Отметка: ${m.text}`, m.result === 'found' ? 'info' : 'warn');
                 gcs.log(t, reveal ? m.text : 'Отметка поставлена — что под ней, покажет разбор', reveal && m.result !== 'found' ? 'warn' : 'info');
                 sound.alarm(reveal && m.result === 'found' ? 'prepStep' : 'shutter');
+                sendTeam(m, 'rescue', t);
               },
             },
             { difficulty: difficultyId, seed: Math.floor(Math.random() * 2 ** 31) },
@@ -1136,6 +1172,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
               },
               onReport: (r, reveal) => {
                 const t = flight.state.t;
+                sendTeam(r, 'fire', t);
                 const good = r.result === 'reported';
                 rec.event(t, `Донесение: ${r.text}`, good ? 'info' : 'warn');
                 gcs.log(t, reveal ? r.text : 'Донесение отправлено — разбор покажет, был ли там дым', reveal && !good ? 'warn' : 'info');
@@ -1150,6 +1187,8 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     lastTrailT = -Infinity;
     callouts.reset();
     voice.clear();
+    teams.clear();
+    map.setTeams([]);
     // Погода, которая меняется в полёте: нацелена на середину маршрута, приходит через 15–30 мин.
     const wxKind = settings.weatherEvent ?? 'none';
     const pts = mission.stages.flatMap((p) => p.waypoints).map((p) => toLocal(siteA, p));
@@ -1436,6 +1475,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
         }))
       : [];
     debrief.setRemarks(flightRemarks({ rec: r, plans }));
+    debrief.regionName = ACTIVE_REGION.title;
     debrief.show(r, a, ctx);
   }
 
@@ -1723,6 +1763,8 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
         drawReachFlight();
       }
       weatherTick(s);
+      skyTick(s);
+      teamsTick(s.t);
       // Вектор путевой скорости на 30 с вперёд: нос по курсу, линия — куда реально летит.
       // НСУ видит телеметрию: при отказе ГНСС — оценку места, без связи — последний принятый кадр.
       const tele = flight.telemetry;
@@ -1806,33 +1848,58 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   }
 
   function draw(dt: number) {
-    world.render(dt);
     // Поиск и патруль: окно подвеса с тепловизором вместо окна фотокамеры.
     const thermalMode = searchMode?.active ? searchMode : fireMode?.active ? fireMode : null;
     const day = dayGimbal();
-    gwin.setActive(!!thermalMode || !!day);
+    const frame = thermalMode?.frame ?? day;
+    const aspect = thermalMode ? thermalMode.aspect : 4 / 3;
+    const canvas = world.renderer.domElement;
+    const ext = screen2.open && screen2.mode === 'gimbal';
+    // Камера подвеса включена — правая часть пополам: вверху 3D-вид, внизу кадр камеры; ⤢ — кадр во весь вид.
+    const docked = !!frame && !gwin.full;
+    setDock(docked);
+    gwin.setActive(!!frame);
+    pipEl.classList.toggle('thermal', !!thermalMode && gwin.ir);
     // Углы подвеса меняются и сами — при сопровождении: подписи — раз в несколько кадров.
-    if ((thermalMode || day) && ++gimbalLabelFrame % 6 === 0) gwin.sync();
-    const video = thermalMode ? thermalMode.frame : day;
-    if (thermalMode) {
-      gwin.lastFovDeg = thermalMode.fovDeg;
-      const r = gwin.rect(thermalMode.aspect);
-      thermalMode.render(r, gwin.ir, gwin.palette);
+    if (frame && ++gimbalLabelFrame % 6 === 0) gwin.sync();
+    if (frame) gwin.lastFovDeg = frame.fovDeg;
+    const renderGimbal = (r: { right: number; bottom: number; width: number; height: number }, f: NonNullable<typeof frame>) => {
+      // Подвес с двумя каналами: дневная камера (RGB) или тепловизор; видео — через радиолинию.
+      if (gwin.ir) world.renderThermal(r, f.eye, f.look, f.fovDeg, f.up, { palette: gwin.palette });
+      else world.renderPip(r, f.eye, f.look, f.fovDeg, f.up);
       vlink.present(r, videoLinkState(), performance.now() / 1000);
-    } else if (day) {
-      const r = gwin.rect(4 / 3);
+    };
+    if (frame && docked) {
+      // Кадр — в угол холста до 3D-вида (он его потом закроет), оттуда — в нижнюю половину и на второй экран.
+      const bw = dockEl.clientWidth;
+      const bh = dockEl.clientHeight;
+      const w = Math.max(16, Math.round(Math.min(bw, bh * aspect, canvas.clientWidth, canvas.clientHeight * aspect)));
+      const h = Math.round(w / aspect);
+      renderGimbal({ right: canvas.clientWidth - w, bottom: canvas.clientHeight - h, width: w, height: h }, frame);
+      presentDock(canvas, w, h);
+      // Рамка с кнопками, щелчками и служебной информацией — ровно над кадром.
+      Object.assign(pipEl.style, { width: `${w}px`, height: `${h}px`, right: `${Math.round((bw - w) / 2)}px`, bottom: `${Math.round((bh - h) / 2)}px` });
+      if (ext) screen2.present(canvas, { x: 0, y: 0, width: w, height: h }, osdData(frame, gwin.ir ? 'ИК' : 'RGB'));
+    }
+    world.render(dt);
+    if (frame && !docked) {
+      // Во весь вид (⤢): поверх 3D-вида.
+      const r = gwin.rect(aspect);
+      pipEl.style.removeProperty('right');
+      pipEl.style.removeProperty('bottom');
       Object.assign(pipEl.style, { width: `${r.width}px`, height: `${r.height}px` });
-      gwin.lastFovDeg = day.fovDeg;
-      // Подвес с двумя каналами: дневная камера (RGB) или тепловизор.
-      if (gwin.ir) world.renderThermal(r, day.eye, day.look, day.fovDeg, day.up, { palette: gwin.palette });
-      else world.renderPip(r, day.eye, day.look, day.fovDeg, day.up);
-      vlink.present(r, videoLinkState(), performance.now() / 1000);
-    } else vlink.reset();
-    if (!video) osd.update(null);
-    else if (gimbalLabelFrame % 6 === 0) osd.update(osdData(video, gwin.ir ? 'ИК' : 'RGB'));
-    if (thermalMode || day) {
-      // Окно камеры уже нарисовано.
-    } else if (pip && mission.camera) {
+      renderGimbal(r, frame);
+      if (ext) screen2.present(canvas, { x: canvas.clientWidth - r.right - r.width, y: canvas.clientHeight - r.bottom - r.height, width: r.width, height: r.height }, osdData(frame, gwin.ir ? 'ИК' : 'RGB'));
+    }
+    if (!frame) {
+      vlink.reset();
+      if (ext) screen2.idle('Видео подвеса появится, когда аппарат в воздухе и окно камеры включено (кнопка «Подвес»)');
+    }
+    if (!frame) osd.update(null);
+    else if (gimbalLabelFrame % 6 === 0) osd.update(osdData(frame, gwin.ir ? 'ИК' : 'RGB'));
+    if (!frame && pip && mission.camera) {
+      pipEl.style.removeProperty('right');
+      pipEl.style.removeProperty('bottom');
       const w = Math.round(Math.min(260, gcs.viewEl.clientWidth * 0.4));
       const r = { right: 12, bottom: 12, width: w, height: Math.round((w * 2) / 3) };
       Object.assign(pipEl.style, { width: `${r.width}px`, height: `${r.height}px` });
@@ -1840,6 +1907,36 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       const fov = (2 * Math.atan((cam.heightPx * cam.pixelPitchUm * 1e-3) / (2 * cam.focalLengthMm)) * 180) / Math.PI;
       world.renderPip(r, pip.eye, pip.look, fov, pip.up);
     }
+    // Второй монитор с 3D-видом — весь холст вида вместе с окнами камеры.
+    if (screen2.open && screen2.mode === 'view') screen2.present(canvas, { x: 0, y: 0, width: canvas.clientWidth, height: canvas.clientHeight }, null);
+  }
+
+  /** Нижняя половина правой части — кадр камеры подвеса (видна, пока камера включена и не во весь вид). */
+  function setDock(on: boolean) {
+    if (dockOn === on) return;
+    dockOn = on;
+    viewPane.classList.toggle('docked', on);
+    dockEl.hidden = !on;
+    if (!on) {
+      pipEl.style.removeProperty('right');
+      pipEl.style.removeProperty('bottom');
+    }
+    world.resize();
+  }
+
+  /** Кадр подвеса с угла холста — в нижнюю половину, по центру, с чёрными полями. */
+  function presentDock(src: HTMLCanvasElement, w: number, h: number) {
+    const dpr = window.devicePixelRatio || 1;
+    const W = Math.round(dockEl.clientWidth * dpr);
+    const H = Math.round(dockEl.clientHeight * dpr);
+    if (dockCanvas.width !== W || dockCanvas.height !== H) {
+      dockCanvas.width = W;
+      dockCanvas.height = H;
+    }
+    const k = src.width / Math.max(1, src.clientWidth);
+    dockCtx.fillStyle = '#000';
+    dockCtx.fillRect(0, 0, W, H);
+    dockCtx.drawImage(src, 0, 0, w * k, h * k, (W - w * dpr) / 2, (H - h * dpr) / 2, w * dpr, h * dpr);
   }
 
   /**
@@ -1956,7 +2053,17 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   }
 
   /** Время на земле: зарядка, температура; план — заново, если АКБ на аппарате заметно изменилась. */
+  /** Тема по выбору; авто — тёмная, когда Солнце село (ночь в 3D-виде). Раз в секунду. */
+  function applyTheme(force = true) {
+    if (!force && performance.now() - themeAt < 1000) return;
+    themeAt = performance.now();
+    const dark = themeMode === 'dark' || (themeMode === 'auto' && world.nightFactor > 0.5);
+    const want = dark ? 'dark' : 'light';
+    if (document.documentElement.dataset.theme !== want) document.documentElement.dataset.theme = want;
+  }
+
   function batteryTick(dtS: number) {
+    applyTheme(false);
     const s = flight.state;
     tickPark(park, dtS, actual.groundTemperatureC, s.mode === 'ground' || s.mode === 'landed');
     renderBatteries();
@@ -1970,6 +2077,68 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
         replan();
         resetFlight();
       }
+    }
+  }
+
+  /**
+   * Небо раз в секунду: гроза и фронт — видны в 3D; радуга — когда у борта дождя уже нет, а против
+   * Солнца в 4–10 км ещё идёт; утренний туман в низинах — в тихое ясное утро, тает с высотой Солнца.
+   */
+  function skyTick(s: { t: number; east: number; north: number }) {
+    if (performance.now() - skyAt < 1000) return;
+    skyAt = performance.now();
+    const sun = sunPosition(new Date(departure(scenario, settings).getTime() + s.t * 1000), siteA);
+    const ev = wxEvent;
+    let rainbow = 0;
+    if (ev) {
+      const h = ev.hazard(s.t, 25000);
+      const here = ev.weatherAt(s.east, s.north, s.t).precipitation?.mmPerH ?? 0;
+      if (here < 0.3 && sun.elevationDeg > 3 && sun.elevationDeg < 40) {
+        const az = ((sun.azimuthDeg + 180) * Math.PI) / 180;
+        for (const d of [4000, 7000, 10000]) {
+          const r = ev.weatherAt(s.east + Math.sin(az) * d, s.north + Math.cos(az) * d, s.t).precipitation?.mmPerH ?? 0;
+          if (r > 1) rainbow = Math.max(rainbow, Math.min(1, r / 6));
+        }
+      }
+      world.setWeatherFx(h ? (h.kind === 'front' ? { kind: 'front', a: h.a, b: h.b, moveDeg: h.moveDeg } : { kind: 'storm', center: h.center, coreM: h.coreM, strength: h.strength }) : null, rainbow);
+    } else world.setWeatherFx(null, 0);
+    // Туман: тихо (ветер у земли до 3 м/с), ясно, утро; тает, когда Солнце поднимается выше ~12°.
+    const w10 = windAt(actual, 10).speedMs;
+    const calm = Math.min(1, Math.max(0, (3 - w10) / 2));
+    const clear = Math.min(1, Math.max(0, (0.6 - (actual.cloudCover ?? 0.3)) / 0.3));
+    const morning = settings.localHour < 11 && sun.elevationDeg < 12 ? Math.min(1, Math.max(0, (12 - sun.elevationDeg) / 8)) : 0;
+    const fog = calm * clear * morning * (actual.groundTemperatureC > -8 ? 1 : 0);
+    world.setValleyFog(fog, valleyTopM());
+  }
+
+  /** Верх тумана в низинах, м над морем: нижняя пятая часть рельефа района плюс 25 м (раз на район). */
+  function valleyTopM(): number {
+    if (valleyTop !== null) return valleyTop;
+    const b = ACTIVE_REGION.location.region;
+    const hs: number[] = [];
+    for (let i = 0; i <= 30; i++) for (let j = 0; j <= 30; j++) hs.push(terrain.elevationM({ lat: b.south + ((b.north - b.south) * i) / 30, lon: b.west + ((b.east - b.west) * j) / 30 }));
+    hs.sort((a, c) => a - c);
+    valleyTop = hs[Math.floor(hs.length * 0.2)]! + 25;
+    return valleyTop;
+  }
+
+  /** Отметка или донесение — к ней выезжает наземная группа (машина до леса, дальше пешком). */
+  function sendTeam(p: { east: number; north: number }, kind: 'rescue' | 'fire', t: number) {
+    const team = teams.dispatch({ east: p.east, north: p.north }, t, kind);
+    const eta = GroundTeams.etaS(team.from, team.to);
+    gcs.log(t, `${team.name} ${kind === 'rescue' ? 'выехала' : 'выехал'} к ${kind === 'rescue' ? 'отметке' : 'дыму'}: ${(Math.hypot(team.to.east - team.from.east, team.to.north - team.from.north) / 1000).toFixed(1).replace('.', ',')} км, будет через ~${Math.max(1, Math.round(eta / 60))} мин`);
+  }
+
+  /** Люди и машины на земле; раз в секунду — карта и доклады о прибытии. */
+  function teamsTick(t: number) {
+    world.setCrew(teams.bodies(t));
+    world.setVehicles(teams.vehicles(t));
+    if (performance.now() - teamsAt < 1000) return;
+    teamsAt = performance.now();
+    map.setTeams(teams.positions(t).map((x) => ({ name: x.name, at: fromLocal(siteA, x.at.east, x.at.north), arrived: x.arrived })));
+    for (const team of teams.arrivals(t)) {
+      gcs.log(t, `${team.name} на месте отметки — осматривает`);
+      rec.event(t, `${team.name} на месте`, 'info');
     }
   }
 

@@ -80,6 +80,10 @@ uniform sampler2D osmWaterNormals;
 uniform float osmTime;
 uniform vec2 osmWind;
 uniform float osmIce;
+uniform sampler2D osmRefl;
+uniform mat4 osmReflMatrix;
+uniform float osmReflY;
+uniform float osmReflOn;
 varying vec3 vWaterWorld;
 `;
 
@@ -99,6 +103,25 @@ const WATER_NORMAL = /* glsl */ `
   normal = normalize((viewMatrix * vec4(nWorld, 0.0)).xyz);
 }
 `;
+
+/**
+ * Зеркало: отражение берегов, леса и облаков (World.renderReflection) — по Френелю, сильнее при
+ * скользящем взгляде; рябь сдвигает картинку; только у воды на уровне зеркала и не на льду.
+ */
+const WATER_REFLECTION = /* glsl */ `
+if (osmReflOn > 0.5) {
+  vec4 rp = osmReflMatrix * vec4(vWaterWorld, 1.0);
+  vec3 nW = normalize((vec4(normal, 0.0) * viewMatrix).xyz);
+  rp.xy += nW.xz * 0.9 * rp.w * 0.06;
+  vec3 refl = texture2DProj(osmRefl, rp).rgb;
+  vec3 vDir = normalize(cameraPosition - vWaterWorld);
+  float cosT = clamp(dot(nW, vDir), 0.0, 1.0);
+  float fres = 0.02 + 0.98 * pow(1.0 - cosT, 5.0);
+  // Уровни воды по клеткам разнятся на метры (рельеф): отражение плавно гаснет к чужому уровню.
+  float onPlane = 1.0 - smoothstep(4.0, 20.0, abs(vWaterWorld.y - osmReflY));
+  float k = clamp(0.03 + 0.95 * fres, 0.0, 0.9) * onPlane * (1.0 - osmIce);
+  outgoingLight = mix(outgoingLight, refl, k);
+}`;
 
 export class OsmWaterLayer {
   private readonly chunks: LazyChunks<Item>;
@@ -124,6 +147,10 @@ export class OsmWaterLayer {
       shader.uniforms.osmTime = uniforms.osmTime;
       shader.uniforms.osmWind = uniforms.osmWind;
       shader.uniforms.osmIce = uniforms.osmIce;
+      shader.uniforms.osmRefl = uniforms.osmRefl;
+      shader.uniforms.osmReflMatrix = uniforms.osmReflMatrix;
+      shader.uniforms.osmReflY = uniforms.osmReflY;
+      shader.uniforms.osmReflOn = uniforms.osmReflOn;
       shader.uniforms.osmWaterNormals = { value: this.normals };
       shader.vertexShader =
         'varying vec3 vWaterWorld;\n' +
@@ -138,7 +165,8 @@ export class OsmWaterLayer {
             // Переметённый ветром снег на льду — плавные полосы по крупной текстуре ряби.
             '#include <color_fragment>\n  float drift = texture2D(osmWaterNormals, vWaterWorld.xz / vec2(260.0, 90.0)).x;\n  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.82, 0.86, 0.92) * (0.9 + 0.12 * drift), osmIce);',
           )
-          .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n  roughnessFactor = mix(roughnessFactor, 0.8, osmIce);');
+          .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n  roughnessFactor = mix(roughnessFactor, 0.8, osmIce);')
+          .replace('#include <opaque_fragment>', WATER_REFLECTION + '\n#include <opaque_fragment>');
     };
     this.material.customProgramCacheKey = () => 'osm-water';
 
@@ -164,6 +192,19 @@ export class OsmWaterLayer {
 
   get group(): THREE.Group {
     return this.chunks.group;
+  }
+
+  /** Уровни воды построенных клеток: центр клетки и высота, м сцены. */
+  private readonly levels = new Map<number, { e: number; n: number; y: number }>();
+
+  /** Уровень ближайшей к точке воды в пределах radius, м сцены; null — воды рядом нет. */
+  levelNear(e: number, n: number, radius: number): { y: number; d: number } | null {
+    let best: { y: number; d: number } | null = null;
+    for (const l of this.levels.values()) {
+      const d = Math.hypot(l.e - e, l.n - n);
+      if (d <= radius && (!best || d < best.d)) best = { y: l.y, d };
+    }
+    return best;
   }
 
   update(ce: number, cn: number, radius: number, deadline: number): void {
@@ -300,6 +341,11 @@ export class OsmWaterLayer {
     }
     if (!pos.length) return [];
     const nv = pos.length / 3;
+    // Уровень воды клетки — для зеркала (planar reflection): медиана высот вершин.
+    const ys: number[] = [];
+    for (let i = 1; i < pos.length; i += 3 * Math.max(1, Math.floor(nv / 400))) ys.push(pos[i]!);
+    ys.sort((a, b) => a - b);
+    this.levels.set(ix * 100_003 + iy, { e: (ix + 0.5) * CHUNK_M, n: (iy + 0.5) * CHUNK_M, y: ys[ys.length >> 1]! - LIFT_M });
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     const nor = new Int8Array(nv * 3);

@@ -29,6 +29,13 @@ export interface QualitySettings {
   precipParticles: number;
   /** Объёмные облака: шагов по лучу и шагов самозатенения к Солнцу. */
   cloudSteps: [number, number];
+  /** Дальний лес простыми конусами — до этого радиуса, м (0 — нет), и шаг между ними, м. */
+  farTreeRadiusM?: number;
+  farTreeSpacingM?: number;
+  /** Трава и кусты у камеры, когда она низко. */
+  groundCover?: boolean;
+  /** Отражения в воде: доля разрешения экрана для зеркала (0 или нет — только небо). */
+  waterReflections?: number;
 }
 
 export const QUALITY: Record<Quality, QualitySettings> = {
@@ -61,6 +68,10 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     buildingsRadiusM: 8000,
     treeRadiusM: 700,
     treeSpacingM: 11,
+    farTreeRadiusM: 3500,
+    farTreeSpacingM: 34,
+    groundCover: true,
+    waterReflections: 0.35,
     dustParticles: 400,
     precipParticles: 12000, cloudSteps: [32, 2],
   },
@@ -77,6 +88,10 @@ export const QUALITY: Record<Quality, QualitySettings> = {
     buildingsRadiusM: 14000,
     treeRadiusM: 1400,
     treeSpacingM: 8,
+    farTreeRadiusM: 6500,
+    farTreeSpacingM: 26,
+    groundCover: true,
+    waterReflections: 0.5,
     dustParticles: 900,
     precipParticles: 20000, cloudSteps: [48, 3],
   },

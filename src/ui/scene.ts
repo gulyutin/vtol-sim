@@ -63,6 +63,7 @@ import { TerrainLod } from './terrainLod';
 import { ThermalView, type ThermalKind, type ThermalPalette } from './thermal';
 import { ZoneWalls } from './zones3d';
 import type { GroundSeason } from '../game/season';
+import { WeatherFx, type FxHazard } from './weatherFx';
 
 export type { HeatBody, HeatKind, HeatPose } from './heat';
 
@@ -143,6 +144,10 @@ export class World {
   nightFactor = 0;
   /** Огни площадок: ночью — ориентир для посадки. */
   private padLights: PadLights[] = [];
+  /** Видимая погода (weatherFx.ts): гроза, фронт, радуга. */
+  private fx!: WeatherFx;
+  private fxHazard: FxHazard | null = null;
+  private rainbowAmount = 0;
   /** Время года на земле — до первого setSeason по дате района. */
   private season: GroundSeason = { snow: 0, snowLineM: 1e5, ice: 0, bare: 0, autumn: autumnOf(ACTIVE_REGION.location.date) };
   private cameraMode: CameraMode = 'follow';
@@ -293,6 +298,7 @@ export class World {
     this.precip = new Precipitation(this.q.precipParticles);
     this.scene.add(this.precip.object);
     this.scene.add(this.clouds);
+    this.fx = new WeatherFx(this.scene);
 
     this.dust = new RotorDust(this.q.dustParticles);
     // Мягкая тень под аппаратом: видна на любой высоте, в отличие от карты теней вокруг него.
@@ -431,6 +437,88 @@ export class World {
     this.sockPivot.rotation.set(0, Math.PI / 2 - to, -droop, 'YZX');
     this.groundWind.set(Math.sin(to) * groundMs, -Math.cos(to) * groundMs);
     this.cloudWind.set(Math.sin(to) * cloudsMs, -Math.cos(to) * cloudsMs);
+  }
+
+  private refl: { target: THREE.WebGLRenderTarget; cam: THREE.PerspectiveCamera; tm: THREE.Matrix4 } | null = null;
+
+  /**
+   * Зеркало воды: сцена с камеры, отражённой в уровне ближайшей воды, в текстуру пониженного
+   * разрешения; всё, что ниже уровня, отсекается наклонной ближней плоскостью (как в three Reflector).
+   * Вода, осадки и радуга в отражении не рисуются. Нет воды рядом или камера у самой воды — выключено.
+   */
+  private renderReflection() {
+    const osm = this.osm;
+    const scale = (this.q as QualitySettings & { waterReflections?: number }).waterReflections ?? 0;
+    const cam = this.camera;
+    const lv = osm && scale > 0 ? osm.waterLevelNear(cam.position.x, -cam.position.z, 5000) : null;
+    if (!osm || !lv || cam.position.y < lv.y + 0.8) {
+      osm?.setReflection(null, null, 0);
+      return;
+    }
+    const r = this.renderer;
+    const size = r.getDrawingBufferSize(new THREE.Vector2());
+    const w = Math.max(64, Math.round(size.x * scale));
+    const h = Math.max(64, Math.round(size.y * scale));
+    if (!this.refl) this.refl = { target: new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType }), cam: new THREE.PerspectiveCamera(), tm: new THREE.Matrix4() };
+    const { target, cam: rc, tm } = this.refl;
+    if (target.width !== w || target.height !== h) target.setSize(w, h);
+    const y0 = lv.y;
+    // Зеркальная камера: положение и точка взгляда отражены в плоскости y = y0, «верх» — тоже.
+    const dir = cam.getWorldDirection(new THREE.Vector3());
+    const look = cam.position.clone().add(dir);
+    rc.fov = cam.fov;
+    rc.aspect = cam.aspect;
+    rc.near = cam.near;
+    rc.far = cam.far;
+    rc.position.set(cam.position.x, 2 * y0 - cam.position.y, cam.position.z);
+    rc.up.set(0, -1, 0);
+    rc.lookAt(look.x, 2 * y0 - look.y, look.z);
+    rc.updateMatrixWorld();
+    rc.updateProjectionMatrix();
+    tm.set(0.5, 0, 0, 0.5, 0, 0.5, 0, 0.5, 0, 0, 0.5, 0.5, 0, 0, 0, 1).multiply(rc.projectionMatrix).multiply(rc.matrixWorldInverse);
+    // Наклонная ближняя плоскость: отсекаем всё ниже воды (+30 см — берег у самой воды тоже).
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, y0 + 0.3, 0)).applyMatrix4(rc.matrixWorldInverse);
+    const clip = new THREE.Vector4(plane.normal.x, plane.normal.y, plane.normal.z, plane.constant);
+    const e = rc.projectionMatrix.elements;
+    const qv = new THREE.Vector4((Math.sign(clip.x) + e[8]!) / e[0]!, (Math.sign(clip.y) + e[9]!) / e[5]!, -1, (1 + e[10]!) / e[14]!);
+    clip.multiplyScalar(2 / clip.dot(qv));
+    e[2] = clip.x;
+    e[6] = clip.y;
+    e[10] = clip.z + 1;
+    e[14] = clip.w;
+    rc.projectionMatrixInverse.copy(rc.projectionMatrix).invert();
+    const hide = [osm.waterGroup, this.precip.object, this.fx.group];
+    const vis = hide.map((o) => o.visible);
+    hide.forEach((o) => (o.visible = false));
+    const prevTarget = r.getRenderTarget();
+    const prevShadow = r.shadowMap.autoUpdate;
+    const prevClear = r.getClearColor(new THREE.Color());
+    const prevAlpha = r.getClearAlpha();
+    r.shadowMap.autoUpdate = false;
+    try {
+      // Что отсечено (берег ниже уровня зеркала) — цветом дымки у горизонта, не чёрным.
+      r.setClearColor((this.scene.fog as THREE.Fog).color, 1);
+      r.setRenderTarget(target);
+      r.clear();
+      r.render(this.scene, rc);
+    } finally {
+      r.setRenderTarget(prevTarget);
+      r.setClearColor(prevClear, prevAlpha);
+      r.shadowMap.autoUpdate = prevShadow;
+      hide.forEach((o, k) => (o.visible = vis[k]!));
+    }
+    osm.setReflection(target.texture, tm, y0);
+  }
+
+  /** Опасная погода для вида (гроза, фронт; локальные метры) и радуга 0…1. */
+  setWeatherFx(hazard: FxHazard | null, rainbow: number) {
+    this.fxHazard = hazard;
+    this.rainbowAmount = rainbow;
+  }
+
+  /** Утренний туман в низинах: 0…1 и верхняя граница, м над морем. */
+  setValleyFog(amount: number, topM: number) {
+    this.lod.setValleyFog(amount, topM - this.site.elevationM);
   }
 
   /**
@@ -765,8 +853,14 @@ export class World {
     for (const l of this.padLights) l.setNight(this.nightFactor, this.clock);
     this.precip.update(dt, this.camera);
     this.heat.cull(this.camera.position, HEAT_VIEW_M);
+    this.fx.update(dt, this.camera, this.fxHazard, this.clouds.position.y, (e, n) => this.groundAt(e, n), this.sunDir, this.rainbowAmount);
+    this.renderReflection();
+    // Молния: сцена на долю секунды ярче.
+    const exposure = this.renderer.toneMappingExposure;
+    if (this.fx.flash > 0) this.renderer.toneMappingExposure = exposure * (1 + 2.5 * this.fx.flash);
     if (post) this.composer.render(dt);
     else this.renderer.render(this.scene, this.camera);
+    this.renderer.toneMappingExposure = exposure;
   }
 
   /**
@@ -774,7 +868,8 @@ export class World {
    * осадки, пыль и сам аппарат (для ортофотоплана). Вернуть — restoreOverlays с тем, что вернулось.
    */
   hideOverlays(): [THREE.Object3D, boolean][] {
-    const list: (THREE.Object3D | null | undefined)[] = [this.routeGroup, this.markerGroup, this.trail, this.frameLines, this.zoneWalls.group, this.precip.object, this.clouds, this.dust.object, this.blob, this.aircraft.group, this.areaLine, this.coverage];
+    this.osm?.setReflection(null, null, 0);
+    const list: (THREE.Object3D | null | undefined)[] = [this.routeGroup, this.markerGroup, this.trail, this.frameLines, this.zoneWalls.group, this.precip.object, this.clouds, this.dust.object, this.blob, this.aircraft.group, this.areaLine, this.coverage, this.fx.group];
     const out: [THREE.Object3D, boolean][] = [];
     for (const o of list) {
       if (!o) continue;
@@ -806,7 +901,11 @@ export class World {
     this.renderer.setScissorTest(true);
     this.renderer.setViewport(x, rect.bottom, rect.width, rect.height);
     this.renderer.setScissor(x, rect.bottom, rect.width, rect.height);
+    // Зеркало воды снято для основной камеры — с этой оно бы не совпало: здесь вода отражает небо.
+    const refl = this.osm?.reflectionOn ?? false;
+    if (refl) this.osm!.suspendReflection(true);
     this.renderer.render(this.scene, cam);
+    if (refl) this.osm!.suspendReflection(false);
     this.renderer.setScissorTest(false);
     this.renderer.setViewport(0, 0, size.x, size.y);
   }
@@ -832,7 +931,40 @@ export class World {
    * рельеф. Звать при каждом изменении — для ходьбы каждый кадр (фаза шага).
    */
   setHeatBodies(bodies: readonly HeatBody[]) {
-    this.heat.set(bodies);
+    this.missionBodies = bodies;
+    this.heat.set([...this.crewBodies, ...bodies]);
+  }
+
+  private missionBodies: readonly HeatBody[] = [];
+  private crewBodies: HeatBody[] = [];
+  private readonly crewVehicles = new Map<number, THREE.Group>();
+
+  /** Люди на земле — расчёт у НСУ и наземные группы (groundTeams.ts): тёплые и в тепловизоре. */
+  setCrew(people: readonly { id: number; east: number; north: number; headingDeg: number; pose: 'standing' | 'sitting' | 'walking'; phase: number }[]) {
+    this.crewBodies = people.map((p) => ({ id: p.id, kind: 'person', east: p.east, north: p.north, headingDeg: p.headingDeg, pose: p.pose, phase: p.phase }));
+    this.heat.set([...this.crewBodies, ...this.missionBodies]);
+  }
+
+  /** Машины наземных групп: едут по прямой по рельефу, стоят у места высадки. */
+  setVehicles(list: readonly { id: number; east: number; north: number; headingDeg: number }[]) {
+    const seen = new Set<number>();
+    for (const v of list) {
+      seen.add(v.id);
+      let m = this.crewVehicles.get(v.id);
+      if (!m) {
+        m = createVehicle();
+        this.crewVehicles.set(v.id, m);
+        this.scene.add(m);
+      }
+      m.position.set(v.east, this.groundAt(v.east, v.north), -v.north);
+      // Нос машины — к −Z, как у аппарата: поворот на −курс.
+      m.rotation.y = -v.headingDeg * DEG;
+    }
+    for (const [id, m] of this.crewVehicles) {
+      if (seen.has(id)) continue;
+      this.scene.remove(m);
+      this.crewVehicles.delete(id);
+    }
   }
 
   /**
@@ -953,6 +1085,7 @@ export class World {
       this.areaLine,
       this.coverage,
       this.aircraft.group,
+      this.fx.group,
     ];
     for (const o of hide) if (o) k.set(o, 'hide');
     if (this.osm) for (const c of this.osm.group.children) k.set(c, osmThermalKind(c.name));

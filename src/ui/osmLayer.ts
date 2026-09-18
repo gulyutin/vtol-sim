@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { OsmData, OsmRunway } from '../sim/osm';
 import { addBuilding, createBuildingMaterial, MeshBuf } from './osmBuildings';
 import { OsmRoads } from './osmRoads';
+import { FarForest, GroundCover } from './osmCover';
 import { createOsmUniforms, hash3, LazyChunks, osmRanges, segDist2, type ChunkPart, type GroundAt, type OsmEnv } from './osmShared';
 import { OsmWaterLayer } from './osmWater';
 import type { QualitySettings } from './quality';
@@ -36,6 +37,8 @@ const ROAD_BUDGET_MS = 1;
 const TREE_BUDGET_MS = 2.5;
 /** Всего деревьев не больше. */
 const TREE_CAP = 80_000;
+/** Пересборка дальнего леса — не дольше этого за кадр, мс. */
+const FAR_BUDGET_MS = 3;
 /** Ячейка маски леса, м. */
 const MASK_CELL_M = 10;
 /** Ячеек в маске не больше — иначе ячейка крупнее. */
@@ -273,6 +276,88 @@ function fillRings(mask: ForestMask, rings: readonly Float32Array[], code: numbe
 }
 
 /** Растеризация лесов, затем вода, поляны у домов и полос, просеки дорог и рек. */
+/**
+ * Где не расти траве и кустам: вода (озеро, река площадью — контуры с островами), полосы и дороги
+ * (осевая линия с шириной и запасом). Решётка по 250 м со списком того, что в клетке.
+ */
+function waterTest(data: OsmData): (e: number, n: number) => boolean {
+  const water = waterAreaTest(data);
+  const CELL = 250;
+  const lines = new Map<number, { line: ArrayLike<number>; half: number }[]>();
+  const key = (i: number, j: number) => i * 100_003 + j;
+  const addLine = (line: ArrayLike<number>, widthM: number) => {
+    const half = widthM / 2 + 1.5;
+    for (let k = 0; k + 3 < line.length; k += 2) {
+      const e0 = Math.min(line[k]!, line[k + 2]!) - half, e1 = Math.max(line[k]!, line[k + 2]!) + half;
+      const n0 = Math.min(line[k + 1]!, line[k + 3]!) - half, n1 = Math.max(line[k + 1]!, line[k + 3]!) + half;
+      for (let i = Math.floor(e0 / CELL); i <= Math.floor(e1 / CELL); i++)
+        for (let j = Math.floor(n0 / CELL); j <= Math.floor(n1 / CELL); j++) {
+          const kk = key(i, j);
+          const seg = { line: [line[k]!, line[k + 1]!, line[k + 2]!, line[k + 3]!], half };
+          const l = lines.get(kk);
+          if (l) l.push(seg);
+          else lines.set(kk, [seg]);
+        }
+    }
+  };
+  for (const r of data.runways) addLine(r.line, r.widthM);
+  for (const r of data.roads) addLine(r.line, r.widthM);
+  return (e, n) => {
+    const l = lines.get(key(Math.floor(e / CELL), Math.floor(n / CELL)));
+    if (l)
+      for (const s of l) {
+        const [x0, y0, x1, y1] = s.line as number[];
+        const dx = x1! - x0!, dy = y1! - y0!;
+        const L2 = dx * dx + dy * dy;
+        const f = L2 > 0 ? Math.max(0, Math.min(1, ((e - x0!) * dx + (n - y0!) * dy) / L2)) : 0;
+        if ((e - x0! - dx * f) ** 2 + (n - y0! - dy * f) ** 2 < s.half * s.half) return true;
+      }
+    return water(e, n);
+  };
+}
+
+/** Точка в воде (озеро, река площадью): решётка по 250 м со списком водоёмов и проверка контуров с островами. */
+function waterAreaTest(data: OsmData): (e: number, n: number) => boolean {
+  const CELL = 250;
+  const bins = new Map<number, number[]>();
+  const key = (i: number, j: number) => i * 100_003 + j;
+  data.water.forEach((w, idx) => {
+    const o = w.rings[0];
+    if (!o) return;
+    let e0 = Infinity, n0 = Infinity, e1 = -Infinity, n1 = -Infinity;
+    for (let i = 0; i + 1 < o.length; i += 2) {
+      e0 = Math.min(e0, o[i]!);
+      e1 = Math.max(e1, o[i]!);
+      n0 = Math.min(n0, o[i + 1]!);
+      n1 = Math.max(n1, o[i + 1]!);
+    }
+    for (let i = Math.floor(e0 / CELL); i <= Math.floor(e1 / CELL); i++)
+      for (let j = Math.floor(n0 / CELL); j <= Math.floor(n1 / CELL); j++) {
+        const k = key(i, j);
+        const l = bins.get(k);
+        if (l) l.push(idx);
+        else bins.set(k, [idx]);
+      }
+  });
+  const inRing = (r: ArrayLike<number>, e: number, n: number) => {
+    let inside = false;
+    for (let i = 0, j = r.length - 2; i + 1 < r.length; j = i, i += 2) {
+      const ei = r[i]!, ni = r[i + 1]!, ej = r[j]!, nj = r[j + 1]!;
+      if (ni > n !== nj > n && e < ((ej - ei) * (n - ni)) / (nj - ni) + ei) inside = !inside;
+    }
+    return inside;
+  };
+  return (e, n) => {
+    const l = bins.get(key(Math.floor(e / CELL), Math.floor(n / CELL)));
+    if (!l) return false;
+    for (const idx of l) {
+      const rings = data.water[idx]!.rings;
+      if (inRing(rings[0]!, e, n) && !rings.slice(1).some((h) => inRing(h, e, n))) return true;
+    }
+    return false;
+  };
+}
+
 function buildForestMask(data: OsmData): ForestMask | null {
   let minE = Infinity, minN = Infinity, maxE = -Infinity, maxN = -Infinity;
   for (const f of data.forests) {
@@ -564,9 +649,20 @@ export class OsmLayer {
     };
     this.conifers = makeTrees(coniferGeometry(), 'osm-conifers');
     this.broadleaves = makeTrees(broadleafGeometry(), 'osm-broadleaves');
+    // Дальний лес до горизонта и подстилка у камеры (osmCover.ts).
+    this.farForest = new FarForest(this.uniforms);
+    this.farForest.autumn = this.autumn;
+    this.cover = new GroundCover(this.uniforms);
+    this.cover.autumn = this.autumn;
+    this.group.add(this.farForest.mesh, this.cover.grass, this.cover.bushes);
+    this.isWater = waterTest(data);
 
     this.createRunways();
   }
+
+  private readonly farForest: FarForest;
+  private readonly cover: GroundCover;
+  private readonly isWater: (e: number, n: number) => boolean;
 
   setQuality(q: QualitySettings): void {
     const old = this.quality;
@@ -598,7 +694,43 @@ export class OsmLayer {
     this.water.update(ce, cn, r.waterM, performance.now() + WATER_BUDGET_MS);
     this.roads.update(ce, cn, r.roadsM, u.osmNight.value, r.streetLights, performance.now() + ROAD_BUDGET_MS);
     this.updateTrees(ce, cn);
+    const mask = this.mask;
+    if (mask) {
+      const q = this.quality as QualitySettings & { farTreeRadiusM?: number; farTreeSpacingM?: number; groundCover?: boolean };
+      const at = (e: number, n: number) => maskAt(mask, e, n);
+      this.farForest.update(ce, cn, q.treeRadiusM, q.farTreeRadiusM ?? 0, q.farTreeSpacingM ?? 32, at, this.groundAt, performance.now() + FAR_BUDGET_MS);
+      if (q.groundCover) this.cover.update(ce, cn, camera.y - this.groundAt(ce, cn), u.osmSnow.value, at, this.groundAt, this.isWater);
+      else this.cover.grass.visible = this.cover.bushes.visible = false;
+    }
     this.lastUpdateMs = performance.now() - t0;
+  }
+
+  /** Уровень ближайшей воды у точки (м сцены) — для зеркала; null — рядом воды нет. */
+  waterLevelNear(e: number, n: number, radius: number): { y: number; d: number } | null {
+    return this.water.levelNear(e, n, radius);
+  }
+
+  /** Вода — чтобы спрятать её на время съёмки отражения. */
+  get waterGroup(): THREE.Group {
+    return this.water.group;
+  }
+
+  get reflectionOn(): boolean {
+    return this.uniforms.osmReflOn.value > 0.5;
+  }
+
+  /** Временно без зеркала (кадр с другой камеры) и обратно. */
+  suspendReflection(on: boolean) {
+    this.uniforms.osmReflOn.value = on ? 0 : this.uniforms.osmRefl.value ? 1 : 0;
+  }
+
+  /** Зеркало воды: текстура отражения, её матрица, уровень воды; tex = null — выключить. */
+  setReflection(tex: THREE.Texture | null, matrix: THREE.Matrix4 | null, y: number) {
+    const u = this.uniforms;
+    u.osmReflOn.value = tex ? 1 : 0;
+    u.osmRefl.value = tex;
+    if (matrix) u.osmReflMatrix.value.copy(matrix);
+    u.osmReflY.value = y;
   }
 
   /** Время года: снег на кронах и крышах, лёд, голые лиственные; осенняя листва — перекраска деревьев. */
@@ -610,6 +742,9 @@ export class OsmLayer {
     if (Math.abs(autumn - this.autumn) > 0.01) {
       this.autumn = autumn;
       this.treesDirty = true;
+      this.farForest.autumn = this.cover.autumn = autumn;
+      this.farForest.invalidate();
+      this.cover.invalidate();
     }
   }
 
