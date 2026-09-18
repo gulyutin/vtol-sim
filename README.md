@@ -9,9 +9,9 @@ The in-app interface is in Russian.
 ## Missions
 
 - **Transfer A → B** (default) — take off at the airfield, fly your own waypoints, land at point B; point B can be dragged on the map.
-- **Aerial survey** — survey lines from the required GSD and overlaps, photo frames, area coverage, shutter speed and lighting.
+- **Aerial survey** — survey lines from the required GSD and overlaps, photo frames, area coverage, shutter speed and lighting. The area can be drawn from scratch on the map; vertices can be dragged, added and removed.
 - **Delivery** — fly out with cargo, land and unload, fly back.
-- **Route flight** — your own waypoints and heights above terrain; the route can be edited in flight.
+- **Route flight** — your own waypoints; heights above terrain (terrain following), above sea level or relative to the takeoff point; the route can be edited in flight.
 - **Search and rescue** — search lines over an area with a thermal camera; missing people are among bears, wolves, moose and deer that are warm too. Click a hot spot in the thermal window to mark a find.
 - **Forest fire patrol** — patrol a zone, spot smoke columns that are visible for kilometres and report them from the 3D view, then confirm the fire with the thermal camera and mark hot spots: smouldering spots inside the burn, spot fires beyond the edge and lone smouldering trees with almost no smoke. Sun-heated rock fields and a cabin with a burning stove are decoys.
 
@@ -23,7 +23,9 @@ Takeoff and landing are into the wind: a departure leg with acceleration, a thre
 
 ## Trainer
 
-- **Emergencies** — the Instructor window: failures of the data link, GNSS, airspeed sensor, control surfaces, pusher and lift motors, power and more; an alert panel with the checklist; "Failsafe" — manual control from a gamepad or keyboard.
+- **Emergencies** — the Instructor window: failures of the data link, GNSS, airspeed sensor, control surfaces, pusher and lift motors, power and more; an alert panel with the checklist; "Failsafe" — manual control from a gamepad, the keyboard or on-screen RC sticks dragged with the mouse.
+- **Manual control** — course set with a compass dial; "Orbit point" — click the map and the aircraft flies there and circles.
+- **Gimbal camera** — a camera window that can go full screen: pan and tilt by dragging, zoom with the wheel, click to track a point or a moving target. Thermal and day channels in search and rescue and in the fire patrol; a day camera in the other missions.
 - **Link-loss reaction** — set per mission: return home, continue the mission or land in place, after 5–120 s without the link.
 - **Weather** — from the mission, the actual weather now (Open-Meteo) or presets: gusts, rain, snow, fog, low cloud; turbulence, including in the lee of hills.
 - **Modes** — from training to an exam with random failures. After landing: a one-paragraph flight summary, a score and a debrief with charts, events and a 3D replay. Flights are saved to a file. A recording with a flight location opens where it was flown: the region is built from the recording — terrain, imagery, wind and route — so the same flight can be replayed on the model.

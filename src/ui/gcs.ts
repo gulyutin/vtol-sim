@@ -1,5 +1,5 @@
 import type { Check } from '../game/preflight';
-import type { RoutePoint, Scenario, ScenarioKind, Settings } from '../game/scenarios';
+import type { AltitudeRef, RoutePoint, Scenario, ScenarioKind, Settings } from '../game/scenarios';
 import { EMERGENCY_COMMANDS, MODE_NAMES, type Command, type Controls, type LiveState } from '../sim/flight';
 import { CAMERAS } from '../sim/payload';
 import { loadQuality, QUALITY, type Quality } from './quality';
@@ -46,6 +46,8 @@ export interface GcsHandlers {
   onPrepRequired(on: boolean): void;
   onResize(): void;
   onRouteEdit(points: RoutePoint[]): void;
+  /** Нарисовать участок съёмки заново на карте. */
+  onAreaDraw(): void;
   /** Район полётов. Переключение — перезагрузка страницы (делает main.ts). */
   onRegion?(id: string): void;
   /** Окно «Районы и карты»: пакеты районов для работы без сети. */
@@ -151,7 +153,8 @@ export interface Gcs {
   mapEl: HTMLElement;
   viewEl: HTMLElement;
   loadScenario(sc: Scenario, s: Settings, forecastError: boolean): void;
-  setRoute(points: RoutePoint[] | null, first: string, last: string, editable: boolean): void;
+  /** alt — как показывать и править высоту точек (система высот задания); без него — над рельефом. */
+  setRoute(points: RoutePoint[] | null, first: string, last: string, editable: boolean, alt?: RouteAltitude): void;
   showPlan(info: PlanInfo): void;
   showPreflight(checks: Check[]): void;
   /** Предполётная подготовка: состояние шагов, обязательна ли перед АРМ, что показывает идущая проверка. */
@@ -247,7 +250,25 @@ const group = (cls: string, title: string, ...buttons: string[]) => `<div class=
 const WINDOWS = ['task', 'profile', 'prep', 'instructor', 'zones', 'telemetry', 'horizon', 'control', 'console'];
 const ZONE_HINT = 'Выберите вид и нарисуйте на карте. Зона РЭБ — круг: щелчок — центр, второй щелчок — граница. Запретная зона — многоугольник: щелчки по вершинам, двойной щелчок — завершить. Правый щелчок по зоне — удалить.';
 
-type NumKey = Exclude<keyof Settings, 'cameraId' | 'shutter' | 'linkLossAction'>;
+/** Высота точек в таблице маршрута: показ и правка в системе высот задания. */
+export interface RouteAltitude {
+  unit: string;
+  min: number;
+  max: number;
+  value(p: RoutePoint): number;
+  apply(p: RoutePoint, v: number): RoutePoint;
+}
+
+/** Над рельефом — как было: высота точки и есть heightAglM. */
+const AGL_ALTITUDE: RouteAltitude = { unit: 'м над рельефом', min: 20, max: 3000, value: (p) => p.heightAglM, apply: (p, v) => ({ ...p, heightAglM: v }) };
+
+export const ALTITUDE_REFS: readonly { id: AltitudeRef; title: string }[] = [
+  { id: 'agl', title: 'над рельефом' },
+  { id: 'msl', title: 'над морем (абсолютная)' },
+  { id: 'takeoff', title: 'от точки взлёта' },
+];
+
+type NumKey = Exclude<keyof Settings, 'cameraId' | 'shutter' | 'linkLossAction' | 'altitudeRef'>;
 const FORMAT: Record<NumKey, (v: number) => string> = {
   linkLossTimeoutS: (v) => `${v} с`,
   gsdCm: (v) => `${fmt(v, 2)} см`,
@@ -273,6 +294,46 @@ function win(id: string, title: string, body: string, pos: string, open = false)
     <div class="win-body">${body}</div></div>`;
 }
 
+
+/**
+ * Крутилка курса, как у компаса: шкала через 10°, стороны света, стрелка — заданный курс,
+ * треугольник снаружи — фактический путевой угол. Размер — в единицах viewBox, центр в нуле.
+ */
+function courseDial(): string {
+  const r = (a: number, rad: number) => [Math.sin((a * Math.PI) / 180) * rad, -Math.cos((a * Math.PI) / 180) * rad].map((x) => x.toFixed(1));
+  const ticks: string[] = [];
+  for (let a = 0; a < 360; a += 10) {
+    const major = a % 30 === 0;
+    const [x0, y0] = r(a, major ? 42 : 46);
+    const [x1, y1] = r(a, 50);
+    ticks.push(`<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y1}" class="${major ? 'maj' : ''}"/>`);
+  }
+  const labels = [
+    [0, 'С'],
+    [90, 'В'],
+    [180, 'Ю'],
+    [270, 'З'],
+    [30, '3'],
+    [60, '6'],
+    [120, '12'],
+    [150, '15'],
+    [210, '21'],
+    [240, '24'],
+    [300, '30'],
+    [330, '33'],
+  ] as const;
+  const text = labels.map(([a, t]) => {
+    const [x, y] = r(a, 33);
+    return `<text x="${x}" y="${y}" class="${a % 90 === 0 ? 'card' : ''}" dy="0.35em">${t}</text>`;
+  });
+  return `<svg class="dial" viewBox="-62 -62 124 124" tabindex="0" role="slider" aria-label="Курс, градусы" aria-valuemin="0" aria-valuemax="359">
+    <circle r="50" class="ring"/>${ticks.join('')}${text.join('')}
+    <g class="trk"><path d="M0,-52 L5,-60 L-5,-60 Z"/></g>
+    <g class="cmd"><line x1="0" y1="10" x2="0" y2="-40"/><path d="M0,-50 L6,-38 L-6,-38 Z"/></g>
+    <path class="plane" d="M0,-9 L2,-2 L9,1 L9,3 L2,2 L1,7 L4,9 L4,10 L-4,10 L-4,9 L-1,7 L-2,2 L-9,3 L-9,1 L-2,-2 Z"/>
+  </svg>`;
+}
+
 const CTL_FORMAT: Record<'iasMs' | 'heightAglM' | 'courseDeg', (v: number) => string> = {
   iasMs: (v) => `${fmt(v, 1)} м/с`,
   heightAglM: (v) => `${v} м`,
@@ -291,7 +352,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     </div>
     <label class="range"><span>Скорость</span><output data-c="iasMs"></output><input type="range" data-ctl="iasMs" min="15" max="28" step="0.5"></label>
     <label class="range"><span>Высота над рельефом</span><output data-c="heightAglM"></output><input type="range" data-ctl="heightAglM" min="40" max="500" step="5"></label>
-    <label class="range"><span>Курс (РУЧНОЙ)</span><output data-c="courseDeg"></output><input type="range" data-ctl="courseDeg" min="0" max="355" step="5"></label>
+    <div class="course"><span>Курс (РУЧНОЙ)</span><output data-c="courseDeg"></output>${courseDial()}<input type="hidden" data-ctl="courseDeg" value="0">
+      <p class="hint">Тяните стрелку или щёлкните по шкале; колёсико и стрелки клавиатуры — по 5°. Треугольник снаружи — путевой угол.</p></div>
     <p class="hint">В МАРШРУТЕ меняется только скорость. РУЧНОЙ держит курс и высоту над рельефом с упреждением. ОЖИДАНИЕ — круг над аэродромом.</p>`;
 
   el.innerHTML = `
@@ -361,10 +423,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           'maptools',
           'Карта',
           button('follow', 'Навигация', icon('nav'), 'title="Карта следует за аппаратом"'),
-          button('target', 'Цель', icon('target'), 'title="Оперативная точка: указать на карте"'),
+          button('target', 'Облёт точки', icon('target'), 'title="ОПЕР. ТОЧКА: щёлкните по карте — аппарат уйдёт к точке и будет кружить над ней. Esc — отмена"'),
           button('reach', 'Досягаемость', icon('reach'), `title="Куда долетит и вернётся: запас 25 %, 10 %, впритык, в один конец" ${h.onReach ? '' : 'hidden'}`),
-          button('zoomIn', 'Зум +', icon('zoomIn')),
-          button('zoomOut', 'Зум −', icon('zoomOut')),
           button('clear', 'Очистить', icon('clear'), 'title="Очистить траекторию на карте и в 3D"'),
         )}
         ${group(
@@ -640,6 +700,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     if (e.key === 'Escape') {
       closeMenus();
       if (zoneTool) setTool(null, true);
+      // Выбор точки облёта на карте — отмена.
+      if (el.classList.contains('picking')) h.onCommand('target');
       return;
     }
     if (e.code === 'Space' && !(e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement)) {
@@ -655,6 +717,55 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       h.onControls({ [k]: +input.value });
     }),
   );
+  // Крутилка курса.
+  const dial = q<SVGSVGElement>('.course .dial');
+  const dragging = new Set<number>();
+  const capture = (el: Element, id: number) => {
+    dragging.add(id);
+    try {
+      el.setPointerCapture(id);
+    } catch {
+      // Указатель уже отпущен — перетаскивание дойдёт и без захвата.
+    }
+  };
+  dial.addEventListener('pointerup', (e) => dragging.delete(e.pointerId));
+  dial.addEventListener('pointercancel', (e) => dragging.delete(e.pointerId));
+  const setCourse = (deg: number, fromUser: boolean) => {
+    const v = ((Math.round(deg) % 360) + 360) % 360;
+    dial.querySelector('.cmd')!.setAttribute('transform', `rotate(${v})`);
+    dial.setAttribute('aria-valuenow', String(v));
+    q<HTMLInputElement>('[data-ctl="courseDeg"]').value = String(v);
+    q<HTMLOutputElement>('[data-c="courseDeg"]').textContent = CTL_FORMAT.courseDeg(v);
+    if (fromUser) h.onControls({ courseDeg: v });
+  };
+  const courseAt = (e: PointerEvent) => {
+    const b = dial.getBoundingClientRect();
+    return (Math.atan2(e.clientX - (b.left + b.width / 2), -(e.clientY - (b.top + b.height / 2))) * 180) / Math.PI;
+  };
+  dial.addEventListener('pointerdown', (e) => {
+    capture(dial, e.pointerId);
+    dial.focus();
+    setCourse(courseAt(e), true);
+  });
+  dial.addEventListener('pointermove', (e) => {
+    if (dragging.has(e.pointerId)) setCourse(courseAt(e), true);
+  });
+  const courseNow = () => +q<HTMLInputElement>('[data-ctl="courseDeg"]').value;
+  dial.addEventListener(
+    'wheel',
+    (e) => {
+      e.preventDefault();
+      setCourse(Math.round(courseNow() / 5) * 5 + (e.deltaY > 0 ? 5 : -5), true);
+    },
+    { passive: false },
+  );
+  dial.addEventListener('keydown', (e) => {
+    const d = e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 5 : e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? -5 : 0;
+    if (!d) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setCourse(Math.round(courseNow() / 5) * 5 + d, true);
+  });
   q<HTMLSelectElement>('.camera').addEventListener('change', (e) => h.onCamera((e.target as HTMLSelectElement).value as CameraMode));
   q<HTMLSelectElement>('.quality').addEventListener('change', (e) => h.onQuality((e.target as HTMLSelectElement).value as Quality));
   q<HTMLSelectElement>('[data-voice-pick]').addEventListener('change', (e) => h.onVoicePick?.((e.target as HTMLSelectElement).value));
@@ -772,6 +883,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       const k = i.dataset.k as keyof Settings;
       if (k === 'cameraId') s.cameraId = i.value;
       else if (k === 'linkLossAction') s.linkLossAction = i.value as LinkLossAction;
+      else if (k === 'altitudeRef') s.altitudeRef = i.value as AltitudeRef;
       else (s as Record<string, number | string>)[k] = +i.value;
     });
     return s;
@@ -837,7 +949,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           <label class="select"><span>Выдержка</span><select data-k="shutter">
             ${[500, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000].map((d) => `<option value="${d}" ${d === s.shutter ? 'selected' : ''}>1/${d} с</option>`).join('')}
           </select></label>
-          <p class="hint">Вершины участка можно двигать на карте до взлёта.</p>
+          <div class="row"><button class="small" data-a="area-draw" title="Щелчки по карте — вершины, двойной щелчок — готово, Esc — отмена">Нарисовать участок</button></div>
+          <p class="hint">До взлёта участок правится на карте: вершины перетаскиваются, правый щелчок по вершине — удалить, «+» на стороне — добавить вершину. «Нарисовать участок» — новый участок с нуля.</p>
         </details>`
             : ''
         }
@@ -849,7 +962,16 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
             ? '<details open><summary>Лесопожарный патруль</summary><p class="hint">Маршрут облёта зоны можно менять. Дым виден в 3D-виде за километры: нажмите «Дым» под видом и щёлкните по столбу — это донесение о пожаре. Подойдя, найдите очаг в окне тепловизора: дым он просвечивает, видно горящую кромку. Щелчок по пятну — отметка «здесь огонь». Огневые точки — тлеющие места в гари, очаги переброса за кромкой и одиночные тлеющие деревья почти без дыма. Нагретый солнцем курумник и зимовье с печью — ложные цели.</p></details>'
             : ''
         }
-        ${survey ? '' : '<details open><summary>Маршрут</summary><div class="route-box"></div></details>'}
+        ${
+          survey
+            ? ''
+            : `<details open><summary>Маршрут</summary>
+          <label class="select"><span>Высота точек</span><select data-k="altitudeRef">
+            ${ALTITUDE_REFS.map((a) => `<option value="${a.id}" ${a.id === s.altitudeRef ? 'selected' : ''}>${a.title}</option>`).join('')}
+          </select></label>
+          <p class="hint">Над рельефом — автопилот огибает рельеф на этой высоте. Над морем и от точки взлёта — между точками прямая по высоте, рельеф не огибается: следите за запасом в проверках.</p>
+          <div class="route-box"></div></details>`
+        }
         <details open><summary>Полёт</summary>
           ${range('iasMs', 'Скорость (приборная)', 15, 28, 0.5, s.iasMs)}
           ${range('localHour', 'Время вылета (местное)', 5, 21, 0.25, s.localHour)}
@@ -880,10 +1002,11 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         <details open><summary>Предполётные проверки (РЛЭ)</summary><ul class="checks"></ul></details>
         <div class="verdict"></div>`;
       bindSettings();
+      taskBody.querySelector<HTMLButtonElement>('[data-a="area-draw"]')?.addEventListener('click', () => h.onAreaDraw());
       this.lockPlanning(locked, keepRouteOpen);
     },
 
-    setRoute(points, first, last, editable) {
+    setRoute(points, first, last, editable, alt = AGL_ALTITUDE) {
       const box = taskBody.querySelector<HTMLElement>('.route-box');
       if (!box) return;
       if (!points) {
@@ -897,7 +1020,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           ${points
             .map(
               (p, i) => `<tr><td>${i + 1}</td>
-              <td><input type="number" min="40" max="800" step="10" value="${p.heightAglM}" data-rh="${i}" ${editable ? '' : 'disabled'}> м над рельефом</td>
+              <td><input type="number" min="${alt.min}" max="${alt.max}" step="10" value="${Math.round(alt.value(p))}" data-rh="${i}" ${editable ? '' : 'disabled'}> ${alt.unit}</td>
               <td><button class="x" data-rdel="${i}" title="Удалить точку" ${editable ? '' : 'disabled'}>✕</button></td></tr>`,
             )
             .join('')}
@@ -907,8 +1030,9 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       box.querySelectorAll<HTMLInputElement>('[data-rh]').forEach((input) =>
         input.addEventListener('change', () => {
           const i = +input.dataset.rh!;
-          const v = Math.min(800, Math.max(40, +input.value || 150));
-          h.onRouteEdit(points.map((p, k) => (k === i ? { ...p, heightAglM: v } : { ...p })));
+          const raw = Number(input.value);
+          const v = Math.min(alt.max, Math.max(alt.min, Number.isFinite(raw) && input.value !== '' ? raw : alt.value(points[i]!)));
+          h.onRouteEdit(points.map((p, k) => (k === i ? alt.apply(p, v) : { ...p })));
         }),
       );
       box.querySelectorAll<HTMLButtonElement>('[data-rdel]').forEach((b) =>
@@ -1037,6 +1161,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
 
     update(tm) {
       const s = tm.state;
+      dial.querySelector('.trk')!.setAttribute('transform', `rotate(${Math.round(s.trackDeg)})`);
       const status = q<HTMLDivElement>('[data-v="status"]');
       const notReady = s.mode === 'ground' && tm.notReady;
       const armedOnGround = s.armed && (s.mode === 'ground' || s.mode === 'landed') ? ' · АРМ' : '';
@@ -1079,7 +1204,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         ['Приборная / ист.', `${fmt(s.iasMs, 1)} / ${fmt(s.tasMs, 1)} м/с`],
         ['Путевая', `${fmt(s.groundSpeedMs, 1)} м/с`],
         ['Курс / ПУ', `${fmt(s.headingDeg)}° / ${fmt(s.trackDeg)}°`],
-        ['Снос / крен', `${fmt(s.driftDeg, 1)}° / ${fmt(s.bankDeg, 1)}°`],
+        // Угол сноса — путевой минус курс: плюс — сносит вправо (ветер слева), минус — влево.
+        ['Угол сноса / крен', `${fmt(Math.abs(s.driftDeg), 1)}°${s.driftDeg > 0.5 ? ' вправо' : s.driftDeg < -0.5 ? ' влево' : ''} / ${fmt(s.bankDeg, 1)}°`],
         ['Ветер', fmtWind(s.wind)],
         ['Мощность', `${fmt(s.powerW)} Вт`],
         ['Энергия', `${fmt(s.energyWh)} / ${fmt(tm.capacityWh)} Вт·ч`],
@@ -1133,10 +1259,11 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     },
 
     setControls(c) {
-      for (const k of ['iasMs', 'heightAglM', 'courseDeg'] as const) {
+      for (const k of ['iasMs', 'heightAglM'] as const) {
         q<HTMLInputElement>(`[data-ctl="${k}"]`).value = String(c[k]);
         q<HTMLOutputElement>(`[data-c="${k}"]`).textContent = CTL_FORMAT[k](c[k]);
       }
+      setCourse(c.courseDeg, false);
     },
 
     targetMode(on) {

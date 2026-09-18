@@ -61,6 +61,11 @@ export interface TerrainFollowing {
   heightAglM: number | ((leg: number, f: number) => number);
   /** Путевая скорость на участке с путевым углом trackDeg — для перевода Vz в градиент. */
   groundSpeedMs(trackDeg: number): number;
+  /**
+   * Заданная высота над морем, м, на участках, где высота не над рельефом (точки с абсолютной
+   * высотой): число — лететь на ней, null — огибать рельеф на heightAglM.
+   */
+  altitudeM?: (leg: number, f: number) => number | null;
   /** Шаг выборки рельефа, м. */
   stepM?: number;
   /**
@@ -148,7 +153,7 @@ export function terrainEndAltitudes(
   const ground = samples.map((s) => terrain.elevationM(s));
   const req = (i: number) => ground[i]! + clearanceM;
   const hold = (s: RouteSample) => (typeof holdAglM === 'number' ? holdAglM : holdAglM(s.leg, s.f));
-  const want = (i: number) => Math.max(req(i), ground[i]! + hold(samples[i]!));
+  const want = (i: number) => Math.max(req(i), o.altitudeM?.(samples[i]!.leg, samples[i]!.f) ?? ground[i]! + hold(samples[i]!));
   // Наименьшая высота над площадкой взлёта, с которой набором не круче предельного проходим над всеми точками на h(i).
   const startFor = (h: (i: number) => number) => {
     let v = -Infinity;
@@ -193,7 +198,7 @@ export function followTerrain(
   const samples = sampleRoute(points, climbRateMs, descentRateMs, o);
   const last = samples.length - 1;
   const height = (s: { leg: number; f: number }) => (typeof o.heightAglM === 'number' ? o.heightAglM : o.heightAglM(s.leg, s.f));
-  const alt = samples.map((s, i) => (i === 0 ? startAltitudeM : i === last ? endAltitudeM : terrain.elevationM(s) + height(s)));
+  const alt = samples.map((s, i) => (i === 0 ? startAltitudeM : i === last ? endAltitudeM : (o.altitudeM?.(s.leg, s.f) ?? terrain.elevationM(s) + height(s))));
   const dd = (i: number) => samples[i + 1]!.d - samples[i]!.d;
   // Набор заранее перед подъёмом рельефа.
   for (let i = last - 1; i >= 0; i--) alt[i] = Math.max(alt[i]!, alt[i + 1]! - samples[i + 1]!.climb * dd(i));

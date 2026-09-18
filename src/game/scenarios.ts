@@ -8,7 +8,7 @@ import { CAMERAS } from '../sim/payload';
 import { windProcedures, type WindProcedures } from '../sim/procedures';
 import { heightForGsdM, planSurvey, type SurveyCamera, type SurveyParams, type SurveyPlan } from '../sim/survey';
 import { followTerrain, terrainEndAltitudes } from '../sim/terrain';
-import type { LocationSpec, RoutePoint } from '../sim/profile';
+import type { AltitudeRef, LocationSpec, RoutePoint } from '../sim/profile';
 import type { Relay } from '../sim/radio';
 import type { GeoPoint, MissionPlan, PayloadLoad, Site, Terrain, Weather } from '../sim/types';
 import { windAt, windTriangle } from '../sim/wind';
@@ -38,11 +38,13 @@ export interface Settings {
   /** Потеря связи с НСУ: что делает автопилот и через сколько секунд без связи. */
   linkLossAction: LinkLossAction;
   linkLossTimeoutS: number;
+  /** Высота точек маршрута: над рельефом, над морем или от точки взлёта. */
+  altitudeRef: AltitudeRef;
 }
 
 export type ScenarioKind = 'transfer' | 'survey' | 'delivery' | 'route' | 'search' | 'fire';
 
-export type { RoutePoint };
+export type { AltitudeRef, RoutePoint };
 
 interface ScenarioBase {
   id: string;
@@ -170,6 +172,7 @@ export function buildScenarios(L: LocationSpec): Scenario[] {
     localHour: L.localHour ?? 11,
     linkLossAction: 'rtl',
     linkLossTimeoutS: LINK_TIMEOUT_S,
+    altitudeRef: 'agl',
   };
   const list: Scenario[] = [
     {
@@ -410,7 +413,11 @@ function routeStage(
   landingName: string,
 ): { plan: MissionPlan; proc: WindProcedures } {
   const proc = windProcedures(from, to, windAt(weather, 10), points[0] ?? to, points[points.length - 1] ?? from);
-  const h = points.map((p) => p.heightAglM);
+  // Высота точек над морем или от взлёта — между точками прямая по высоте; к первой точке и от
+  // последней — огибание рельефа до этой же высоты над ним.
+  const absolute = s.altitudeRef !== 'agl';
+  const abs = points.map((p) => p.altitudeM ?? terrain.elevationM(p) + p.heightAglM);
+  const h = absolute ? points.map((p, i) => Math.max(AIRCRAFT.minClearanceM, abs[i]! - terrain.elevationM(p))) : points.map((p) => p.heightAglM);
   const first = h[0] ?? 150;
   const heights = [first, first, ...h, APPROACH_AGL[0], APPROACH_AGL[1], VT.backTransitionHeightM];
   const mean = heights.reduce((a, b) => a + b, 0) / heights.length;
@@ -426,7 +433,14 @@ function routeStage(
   const loops = { start: 0, end: 0 };
   const build = () => {
     const r = withOrbits(base, radius, loops);
-    const follow = { heightAglM: byNodes(heights), groundSpeedMs: (track: number) => windTriangle(tas, track, wind)?.groundSpeedMs ?? tas, stepM: 100, parts: r.parts };
+    const follow = {
+      heightAglM: byNodes(heights),
+      groundSpeedMs: (track: number) => windTriangle(tas, track, wind)?.groundSpeedMs ?? tas,
+      stepM: 100,
+      parts: r.parts,
+      // Участки между точками оператора (2…число точек) — по заданной высоте над морем.
+      ...(absolute ? { altitudeM: (leg: number, f: number) => (leg >= 2 && leg <= points.length ? abs[leg - 2]! + (abs[leg - 1]! - abs[leg - 2]!) * f : null) } : {}),
+    };
     const ends = terrainEndAltitudes(r.points, terrain, from.elevationM + VT.transitionHeightM, to.elevationM + VT.backTransitionHeightM, CLIMB(), DESCENT(), follow, AIRCRAFT.minClearanceM + BETWEEN_SAMPLES_M, MAX_EXTRA_VERTICAL_M, hold);
     return { points: r.points, follow, ends };
   };

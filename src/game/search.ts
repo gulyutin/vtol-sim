@@ -947,6 +947,7 @@ export class SearchWorld {
   private readonly terrain: Terrain | undefined;
   private readonly center: LocalPoint;
   private lastPose: CameraPose | null = null;
+  private lastFocalMm = NaN;
 
   constructor(setup: SearchSetup) {
     this.origin = setup.origin;
@@ -980,12 +981,20 @@ export class SearchWorld {
   }
 
   /** Кадр камеры в покрытие района; кадры чаще, чем сдвиг на полклетки, пропускаются. */
-  observe(pose: CameraPose): void {
+  observe(pose: CameraPose, camera: ThermalCamera = this.camera): void {
     const p = this.lastPose;
     const c = this.coverage.cellM / 2;
-    if (p && Math.hypot(pose.east - p.east, pose.north - p.north) < c && Math.abs(angleDiff(p.headingDeg, pose.headingDeg)) < 2 && Math.abs(pose.aglM - p.aglM) < 2 && pose.tiltDeg === p.tiltDeg) return;
+    const same =
+      p &&
+      Math.hypot(pose.east - p.east, pose.north - p.north) < c &&
+      Math.abs(angleDiff(p.headingDeg, pose.headingDeg)) < 2 &&
+      Math.abs(pose.aglM - p.aglM) < 2 &&
+      Math.abs((pose.tiltDeg ?? 0) - (p.tiltDeg ?? 0)) < 1 &&
+      camera.focalLengthMm === this.lastFocalMm;
+    if (same) return;
     this.lastPose = { ...pose };
-    this.coverage.add(pose, this.camera);
+    this.lastFocalMm = camera.focalLengthMm;
+    this.coverage.add(pose, camera);
   }
 
   /** Тела для сцены (World.setHeatBodies). */

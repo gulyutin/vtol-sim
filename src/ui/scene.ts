@@ -756,6 +756,7 @@ export class World {
    * rect — в CSS-пикселях от правого нижнего угла вида. up — «верх» кадра (нужен, когда смотрим вниз).
    */
   renderPip(rect: { right: number; bottom: number; width: number; height: number }, eye: LocalPoint, look: LocalPoint, fovDeg: number, up?: THREE.Vector3) {
+    this.lastPipRect = { width: rect.width, height: rect.height };
     const size = this.renderer.getSize(new THREE.Vector2());
     const cam = this.pipCamera;
     toScene(eye, cam.position);
@@ -772,6 +773,22 @@ export class World {
     this.renderer.setScissorTest(false);
     this.renderer.setViewport(0, 0, size.x, size.y);
   }
+
+  /**
+   * Точка на рельефе под щелчком в последнем кадре окна камеры (renderPip): x, y — CSS-пиксели
+   * от левого верхнего угла окна. null — кадра не было или луч в небо.
+   */
+  pipPick(xCss: number, yCss: number): LocalPoint | null {
+    const r = this.lastPipRect;
+    if (!r) return null;
+    const cam = this.pipCamera;
+    const p = new THREE.Vector3((xCss / r.width) * 2 - 1, -(yCss / r.height) * 2 + 1, 0.5).unproject(cam);
+    const c = cam.position;
+    const origin = { east: c.x, north: -c.z, up: c.y };
+    return marchToGround(origin, { east: p.x - c.x, north: -(p.z - c.z), up: p.y - c.y }, (e, n) => this.groundAt(e, n), 30000);
+  }
+
+  private lastPipRect: { width: number; height: number } | null = null;
 
   /**
    * Люди и звери для поиска (heat.ts): создаются, обновляются и убираются по id, ставятся на

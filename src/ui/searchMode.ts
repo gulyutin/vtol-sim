@@ -4,6 +4,7 @@ import type { DifficultyId, SearchOutcome } from '../game/scoring';
 import { SearchWorld, type SearchMark } from '../game/search';
 import { fromLocal } from '../sim/mission';
 import type { Site, Terrain } from '../sim/types';
+import type { Gimbal, Point3 } from './gimbal';
 import type { HeatBody } from './heat';
 import type { Map2D } from './map2d';
 import type { World } from './scene';
@@ -22,6 +23,8 @@ export interface SearchHost {
   terrain: Terrain;
   /** Окно картинки подвеса под 3D-видом (.pip). */
   pipEl: HTMLElement;
+  /** Подвес: азимут, наклон, зум и сопровождение (gimbal.ts). */
+  gimbal: Gimbal;
   /** Отметка поставлена: reveal — можно ли сказать пилоту, что под ней. */
   onMark(m: SearchMark, reveal: boolean): void;
 }
@@ -36,17 +39,17 @@ export interface SearchAircraft {
   headingDeg: number;
 }
 
-/** Окно тепловизора не шире, px, и доля ширины 3D-вида. */
-const WINDOW_MAX_PX = 360;
-const WINDOW_SHARE = 0.45;
-/** Тепловизор под фюзеляжем — чуть ниже центра аппарата, м. */
-const CAMERA_BELOW_M = 0.4;
+/** Щелчок ближе этого к человеку или зверю — сопровождать его, а не точку на земле, м. */
+const TRACK_BODY_M = 20;
+
+/** Вертикальное поле зрения камеры по матрице и объективу, °. */
+const fovOf = (cam: { heightPx: number; pixelPitchUm: number; focalLengthMm: number }) =>
+  (2 * Math.atan((cam.heightPx * cam.pixelPitchUm * 1e-3) / (2 * cam.focalLengthMm)) * 180) / Math.PI;
 
 export class SearchMode {
   readonly world: SearchWorld;
   private readonly reveal: boolean;
-  private camera: { eye: { east: number; north: number; up: number }; look: { east: number; north: number; up: number }; up: THREE.Vector3 } | null = null;
-  private readonly onClick = (e: MouseEvent) => this.click(e);
+  private camera: { eye: Point3; look: Point3; up: THREE.Vector3; fovDeg: number } | null = null;
   /** Номера тел для 3D: у логики поиска — строки («wolf-3»), у моделей — числа. */
   private readonly ids = new Map<string, number>();
   private tNow = 0;
@@ -58,7 +61,6 @@ export class SearchMode {
   ) {
     this.world = new SearchWorld({ origin: sc.site, area: sc.area, difficulty: opts.difficulty, seed: opts.seed, animals: sc.animals, terrain: host.terrain, camera: sc.camera });
     this.reveal = opts.difficulty !== 'exam';
-    host.pipEl.addEventListener('click', this.onClick);
     host.world.setHeatBodies(this.bodies());
     host.map.setSearchMarks(null);
   }
@@ -79,17 +81,11 @@ export class SearchMode {
       this.camera = null;
       return;
     }
-    const tilt = (this.sc.tiltDeg * Math.PI) / 180;
-    const h = (a.headingDeg * Math.PI) / 180;
-    this.world.observe({ east: a.east, north: a.north, aglM: a.aglM, headingDeg: a.headingDeg, tiltDeg: this.sc.tiltDeg, altitudeM: a.up + this.host.site.elevationM });
-    const eye = { east: a.east, north: a.north, up: a.up - CAMERA_BELOW_M };
-    const d = 100;
-    this.camera = {
-      eye,
-      look: { east: eye.east + Math.sin(h) * Math.cos(tilt) * d, north: eye.north + Math.cos(h) * Math.cos(tilt) * d, up: eye.up - Math.sin(tilt) * d },
-      // Почти отвесно вниз — верх кадра по курсу, иначе горизонт горизонтален.
-      up: this.sc.tiltDeg > 80 ? new THREE.Vector3(Math.sin(h), 0, -Math.cos(h)) : new THREE.Vector3(0, 1, 0),
-    };
+    const cam = this.sc.camera;
+    const f = this.host.gimbal.frame(a, fovOf(cam), (id) => this.bodyAt(id));
+    // Покрытие района — по оси подвеса и с зумом (поле зрения уже).
+    this.world.observe({ east: a.east, north: a.north, aglM: a.aglM, headingDeg: f.headingDeg, tiltDeg: f.tiltDeg, altitudeM: a.up + this.host.site.elevationM }, { ...cam, focalLengthMm: cam.focalLengthMm * f.zoom });
+    this.camera = { eye: f.eye, look: f.look, up: f.up, fovDeg: f.fovDeg };
   }
 
   /** Окно тепловизора открыто: борт в воздухе. */
@@ -97,17 +93,25 @@ export class SearchMode {
     return this.camera !== null;
   }
 
-  /** Кадр тепловизора в окне под 3D-видом. */
-  render(viewWidthPx: number) {
+  /** Кадр подвеса в окне rect: тепловизор или дневная камера (ir = false). */
+  render(rect: { right: number; bottom: number; width: number; height: number }, ir: boolean) {
     const el = this.host.pipEl;
-    el.classList.toggle('thermal', !!this.camera);
+    el.classList.toggle('thermal', !!this.camera && ir);
     if (!this.camera) return;
-    const cam = this.sc.camera;
-    const w = Math.round(Math.min(WINDOW_MAX_PX, viewWidthPx * WINDOW_SHARE));
-    const r = { right: 12, bottom: 12, width: w, height: Math.round((w * cam.heightPx) / cam.widthPx) };
-    Object.assign(el.style, { width: `${r.width}px`, height: `${r.height}px` });
-    const fov = (2 * Math.atan((cam.heightPx * cam.pixelPitchUm * 1e-3) / (2 * cam.focalLengthMm)) * 180) / Math.PI;
-    this.host.world.renderThermal(r, this.camera.eye, this.camera.look, fov, this.camera.up);
+    Object.assign(el.style, { width: `${rect.width}px`, height: `${rect.height}px` });
+    const c = this.camera;
+    if (ir) this.host.world.renderThermal(rect, c.eye, c.look, c.fovDeg, c.up);
+    else this.host.world.renderPip(rect, c.eye, c.look, c.fovDeg, c.up);
+  }
+
+  /** Поле зрения кадра подвеса, °. */
+  get fovDeg(): number {
+    return this.camera?.fovDeg ?? fovOf(this.sc.camera);
+  }
+
+  /** Отношение сторон матрицы тепловизора. */
+  get aspect(): number {
+    return this.sc.camera.widthPx / this.sc.camera.heightPx;
   }
 
   /** Подпись окна: что найдено (на зачёте — только число отметок). */
@@ -125,7 +129,6 @@ export class SearchMode {
 
   /** Убрать режим: слушатель окна, модели людей и зверей, отметки на карте. */
   dispose() {
-    this.host.pipEl.removeEventListener('click', this.onClick);
     this.host.pipEl.classList.remove('thermal');
     this.host.world.setHeatBodies([]);
     this.host.map.setSearchMarks(null);
@@ -140,14 +143,32 @@ export class SearchMode {
     });
   }
 
-  private click(e: MouseEvent) {
-    if (!this.camera) return;
+  /** Отметка по щелчку в кадре подвеса: точка на земле под курсором (ir — в тепловом кадре). */
+  markAt(clientX: number, clientY: number, ir: boolean): SearchMark | null {
+    if (!this.camera) return null;
     const box = this.host.pipEl.getBoundingClientRect();
-    const p = this.host.world.thermalPick(e.clientX - box.left, e.clientY - box.top);
-    if (!p) return;
+    const p = ir ? this.host.world.thermalPick(clientX - box.left, clientY - box.top) : this.host.world.pipPick(clientX - box.left, clientY - box.top);
+    if (!p) return null;
     const m = this.world.mark({ east: p.east, north: p.north }, this.tNow);
     this.host.onMark(m, this.reveal);
     this.drawMarks();
+    return m;
+  }
+
+  /** Человек или зверь рядом с точкой — чтобы сопровождать его, а не место. */
+  bodyNear(p: { east: number; north: number }): string | null {
+    let best: { id: string; d: number } | null = null;
+    for (const b of this.world.bodies) {
+      const d = Math.hypot(b.east - p.east, b.north - p.north);
+      if (d <= TRACK_BODY_M && (!best || d < best.d)) best = { id: b.id, d };
+    }
+    return best?.id ?? null;
+  }
+
+  /** Где сейчас цель сопровождения. */
+  bodyAt(id: string): Point3 | null {
+    const b = this.world.bodies.find((x) => x.id === id);
+    return b ? { east: b.east, north: b.north, up: this.host.world.groundAt(b.east, b.north) + 0.8 } : null;
   }
 
   private drawMarks() {

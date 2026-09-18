@@ -129,6 +129,9 @@ interface ZoneDraw {
   pts: L.LatLng[];
   preview: L.LayerGroup;
   dblZoom: boolean;
+  /** Не зона, а другой многоугольник (участок съёмки): своё название и цвет подсказки. */
+  title?: string;
+  color?: string;
 }
 
 // Снимки — с двух серверов Esri: по HTTP/1.1 браузер держит 6 соединений на сервер, и с одним
@@ -322,10 +325,10 @@ export interface LegLabel {
   text: string;
 }
 
-const pinIcon = (label: string, altitudeM: number | null, cls = '') =>
+const pinIcon = (label: string, alt: string | number | null, cls = '') =>
   L.divIcon({
     className: `wp-pin ${cls}`,
-    html: `${altitudeM === null ? '' : `<span class="alt">${Math.round(altitudeM)} м</span>`}<b>${label}</b>`,
+    html: `${alt === null ? '' : `<span class="alt">${typeof alt === 'number' ? `${Math.round(alt)} м` : alt}</span>`}<b>${label}</b>`,
     iconSize: [30, 44],
     iconAnchor: [15, 42],
   });
@@ -363,6 +366,7 @@ export class Map2D {
   private draw: ZoneDraw | null = null;
   private area: L.Polygon | null = null;
   private vertices: L.Marker[] = [];
+  private midpoints: L.Marker[] = [];
   private readonly route = L.layerGroup();
   private readonly marks = L.layerGroup();
   private readonly editLayer = L.layerGroup();
@@ -379,6 +383,8 @@ export class Map2D {
 
   constructor(el: HTMLElement, site: Site) {
     this.map = L.map(el, { zoomControl: false, preferCanvas: true, maxZoom: 19 }).setView(ll(site), 13);
+    // Подпись библиотеки — без флажка, который Leaflet 1.9 ставит по умолчанию.
+    this.map.attributionControl.setPrefix('<a href="https://leafletjs.com" title="Библиотека интерактивных карт">Leaflet</a>');
     // Подложка — когда известно, есть ли пакет района (к этому времени обычно уже известно).
     void activePack().then(() => this.addBaseLayers());
     L.control.scale({ imperial: false, position: 'bottomright' }).addTo(this.map);
@@ -447,16 +453,23 @@ export class Map2D {
     this.edit = typeof on === 'boolean' ? { area: on, route: on, destination: on } : { ...on };
     const toggle = (m: L.Marker, ok: boolean) => (ok ? m.dragging?.enable() : m.dragging?.disable());
     for (const m of this.vertices) toggle(m, this.edit.area);
+    for (const m of this.midpoints) m.setOpacity(this.edit.area ? 1 : 0);
     for (const m of this.routeMarkers) toggle(m, this.edit.route);
     if (this.dest) toggle(this.dest, this.edit.destination);
   }
 
   /** Участок съёмки; null — участка нет. */
-  setArea(area: GeoPoint[] | null) {
+  /**
+   * Многоугольник участка. editable — вершины двигаются, правый щелчок по вершине удаляет её
+   * (остаётся не меньше трёх), «+» на середине стороны добавляет вершину.
+   */
+  setArea(area: GeoPoint[] | null, editable = true) {
     this.area?.remove();
     this.area = null;
     for (const m of this.vertices) m.remove();
     this.vertices = [];
+    for (const m of this.midpoints) m.remove();
+    this.midpoints = [];
     if (!area) return;
     this.area = L.polygon(area.map(ll), {
       color: '#ffffff',
@@ -467,21 +480,51 @@ export class Map2D {
       renderer: this.renderer,
       interactive: false,
     }).addTo(this.map);
-    for (const p of area) {
+    if (!editable) return;
+    const current = () => this.vertices.map((v) => ({ lat: v.getLatLng().lat, lon: v.getLatLng().lng }));
+    area.forEach((p, i) => {
       const m = L.marker(ll(p), {
         draggable: true,
         icon: L.divIcon({ className: 'vertex', iconSize: [14, 14], iconAnchor: [7, 7] }),
-        title: 'Перетащите, чтобы изменить участок',
+        title: 'Перетащите — сдвинуть вершину, правый щелчок — удалить',
       }).addTo(this.map);
       if (!this.edit.area) m.dragging?.disable();
       m.on('drag', () => this.area?.setLatLngs(this.vertices.map((v) => v.getLatLng())));
-      m.on('dragend', () => this.onAreaChange?.(this.vertices.map((v) => ({ lat: v.getLatLng().lat, lon: v.getLatLng().lng }))));
+      m.on('dragend', () => this.onAreaChange?.(current()));
+      m.on('contextmenu', (e: L.LeafletMouseEvent) => {
+        L.DomEvent.preventDefault(e.originalEvent);
+        if (!this.edit.area || this.vertices.length <= 3) return;
+        this.onAreaChange?.(current().filter((_, k) => k !== i));
+      });
       this.vertices.push(m);
-    }
+    });
+    // Середины сторон: щелчок — новая вершина.
+    area.forEach((p, i) => {
+      const q = area[(i + 1) % area.length]!;
+      const m = L.marker(ll({ lat: (p.lat + q.lat) / 2, lon: (p.lon + q.lon) / 2 }), {
+        icon: L.divIcon({ className: 'vertex-add', html: '+', iconSize: [14, 14], iconAnchor: [7, 7] }),
+        title: 'Щелчок — добавить вершину',
+        keyboard: false,
+      }).addTo(this.map);
+      m.on('click', (e: L.LeafletMouseEvent) => {
+        L.DomEvent.stopPropagation(e);
+        if (!this.edit.area) return;
+        const pts = current();
+        pts.splice(i + 1, 0, { lat: (p.lat + q.lat) / 2, lon: (p.lon + q.lon) / 2 });
+        this.onAreaChange?.(pts);
+      });
+      this.midpoints.push(m);
+    });
+  }
+
+  /** Новый участок щелчками по карте: вершины, двойной щелчок или первая вершина — готово, Esc — отмена. */
+  startAreaDraw(onDone: (area: GeoPoint[]) => void, onCancel?: () => void) {
+    this.startZoneDraw('nofly', (zone) => onDone(zone.polygon ?? []), { shape: 'polygon', title: 'Участок съёмки', color: '#3aa0ff', ...(onCancel ? { onCancel } : {}) });
   }
 
   /** Точки маршрута оператора: перетаскивание — сдвиг, правый щелчок — удалить. */
-  setEditableRoute(points: RoutePoint[] | null) {
+  /** altLabel — подпись высоты у точки в системе высот задания; по умолчанию — над рельефом. */
+  setEditableRoute(points: RoutePoint[] | null, altLabel: (p: RoutePoint) => string = (p) => `${Math.round(p.heightAglM)} м`) {
     this.editLayer.clearLayers();
     this.routeMarkers = [];
     this.editPoints = points ? points.map((p) => ({ ...p })) : [];
@@ -489,7 +532,7 @@ export class Map2D {
     points.forEach((p, i) => {
       const m = L.marker(ll(p), {
         draggable: true,
-        icon: pinIcon(String(i + 1), p.heightAglM, 'edit'),
+        icon: pinIcon(String(i + 1), altLabel(p), 'edit'),
         title: 'Перетащите — сдвинуть, правый щелчок — удалить',
         zIndexOffset: 400,
       }).addTo(this.editLayer);
@@ -886,7 +929,7 @@ export class Map2D {
    * вершине. Esc — отмена (onCancel). Готовая зона — в onDone, с новым id; на карту её кладёт
    * setZones.
    */
-  startZoneDraw(kind: ZoneKind, onDone: (zone: Zone) => void, opts: { shape?: 'circle' | 'polygon'; onCancel?: () => void } = {}) {
+  startZoneDraw(kind: ZoneKind, onDone: (zone: Zone) => void, opts: { shape?: 'circle' | 'polygon'; onCancel?: () => void; title?: string; color?: string } = {}) {
     this.cancelZoneDraw();
     this.cancelRelayPlace();
     this.draw = {
@@ -897,6 +940,8 @@ export class Map2D {
       pts: [],
       preview: L.layerGroup().addTo(this.map),
       dblZoom: this.map.doubleClickZoom.enabled(),
+      ...(opts.title ? { title: opts.title } : {}),
+      ...(opts.color ? { color: opts.color } : {}),
     };
     this.map.doubleClickZoom.disable();
     this.map.getContainer().style.cursor = 'crosshair';
@@ -971,7 +1016,8 @@ export class Map2D {
     if (!d) return;
     const g = d.preview;
     g.clearLayers();
-    const color = ZONE_COLOR[d.kind];
+    const color = d.color ?? ZONE_COLOR[d.kind];
+    const title = d.title ?? ZONE_TITLE[d.kind];
     const opts: L.PathOptions = { renderer: this.zoneRenderer, pane: 'zones', color, weight: 2, dashArray: '4 4', fillColor: color, fillOpacity: 0.1, interactive: false };
     let hint: string;
     if (d.shape === 'circle') {
@@ -980,8 +1026,8 @@ export class Map2D {
         const r = this.map.distance(c, mouse);
         L.circle(c, { ...opts, radius: r }).addTo(g);
         L.polyline([c, mouse], { ...opts, weight: 1 }).addTo(g);
-        hint = `${ZONE_TITLE[d.kind]} · радиус ${fmtM(r)} · щелчок — граница, Esc — отмена`;
-      } else hint = `${ZONE_TITLE[d.kind]} · щелчок — центр, Esc — отмена`;
+        hint = `${title} · радиус ${fmtM(r)} · щелчок — граница, Esc — отмена`;
+      } else hint = `${title} · щелчок — центр, Esc — отмена`;
     } else {
       if (d.pts.length) {
         L.polygon([...d.pts, mouse], opts).addTo(g);
@@ -989,8 +1035,8 @@ export class Map2D {
       }
       hint =
         d.pts.length < 3
-          ? `${ZONE_TITLE[d.kind]} · щелчки — вершины, Esc — отмена`
-          : `${ZONE_TITLE[d.kind]} · двойной щелчок или первая вершина — готово, Esc — отмена`;
+          ? `${title} · щелчки — вершины, Esc — отмена`
+          : `${title} · двойной щелчок или первая вершина — готово, Esc — отмена`;
     }
     const at = this.map.containerPointToLatLng(this.map.latLngToContainerPoint(mouse).add([0, -22]));
     L.marker(at, { pane: 'zones', interactive: false, keyboard: false, icon: labelIcon(hint, color) }).addTo(g);

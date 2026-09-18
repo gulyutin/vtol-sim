@@ -434,6 +434,7 @@ export interface LiveState {
   up: number;
   headingDeg: number;
   trackDeg: number;
+  /** Угол сноса: путевой минус курс, °; плюс — сносит вправо. */
   driftDeg: number;
   /**
    * Крен корпуса, °: + вправо. В самолёте — крен, по которому идёт разворот (g·tg(крен)/V); на роторах —
@@ -872,7 +873,7 @@ export class LiveFlight {
       const gn = this.lastVel.n + v.n;
       tele.groundSpeedMs = Math.hypot(ge, gn);
       if (tele.groundSpeedMs > 0.5) tele.trackDeg = norm360(Math.atan2(ge, gn) / RAD);
-      tele.driftDeg = wrap180(s.headingDeg - tele.trackDeg);
+      tele.driftDeg = wrap180(tele.trackDeg - s.headingDeg);
       const w = windVec(s.wind);
       const we = w.e + v.e;
       const wn = w.n + v.n;
@@ -2814,7 +2815,7 @@ export class LiveFlight {
     s.up += (s.vzMs + this.upflowMs) * h;
     s.groundSpeedMs = Math.hypot(ve, vn);
     if (s.groundSpeedMs > 0.5) s.trackDeg = norm360(Math.atan2(ve, vn) / RAD);
-    s.driftDeg = wrap180(s.headingDeg - s.trackDeg);
+    s.driftDeg = wrap180(s.trackDeg - s.headingDeg);
     s.distanceM += s.groundSpeedMs * h;
   }
 
@@ -2871,7 +2872,7 @@ export class LiveFlight {
     s.up += (s.vzMs + this.upflowMs) * h;
     s.groundSpeedMs = Math.hypot(ve, vn);
     if (s.groundSpeedMs > 0.5) s.trackDeg = norm360(Math.atan2(ve, vn) / RAD);
-    s.driftDeg = wrap180(s.headingDeg - s.trackDeg);
+    s.driftDeg = wrap180(s.trackDeg - s.headingDeg);
     s.distanceM += s.groundSpeedMs * h;
     s.lift = 0;
     s.pusher = thrust / this.maxThrustN(rho);

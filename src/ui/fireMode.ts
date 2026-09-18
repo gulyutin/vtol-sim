@@ -4,6 +4,7 @@ import type { FireScenario } from '../game/scenarios';
 import type { DifficultyId, FireOutcome } from '../game/scoring';
 import { fromLocal } from '../sim/mission';
 import type { Site } from '../sim/types';
+import type { Gimbal, Point3 } from './gimbal';
 import type { HeatBody } from './heat';
 import type { Map2D } from './map2d';
 import type { World } from './scene';
@@ -22,6 +23,8 @@ export interface FireHost {
   /** Окно тепловизора под 3D-видом (.pip) и сам 3D-вид — по нему указывают дым. */
   pipEl: HTMLElement;
   viewEl: HTMLElement;
+  /** Подвес: азимут, наклон, зум и сопровождение (gimbal.ts). */
+  gimbal: Gimbal;
   /** Ветер на высоте над землёй: куда дует, м/с. */
   windAt(heightAglM: number): { east: number; north: number };
   onMark(m: FireMark, reveal: boolean): void;
@@ -38,25 +41,24 @@ export interface FireAircraft {
   headingDeg: number;
 }
 
-const WINDOW_MAX_PX = 360;
-const WINDOW_SHARE = 0.45;
-/** Тепловизор под фюзеляжем — чуть ниже центра аппарата, м. */
-const CAMERA_BELOW_M = 0.4;
 /** Дымы к началу полёта уже стоят: прокрутка столбов при постановке задания, с. */
 const PREWARM_S = 360;
 /** Щелчок с протяжкой дальше этого — вращение камеры, а не указание, px. */
 const DRAG_PX = 6;
 
+/** Вертикальное поле зрения камеры по матрице и объективу, °. */
+const fovOf = (cam: { heightPx: number; pixelPitchUm: number; focalLengthMm: number }) =>
+  (2 * Math.atan((cam.heightPx * cam.pixelPitchUm * 1e-3) / (2 * cam.focalLengthMm)) * 180) / Math.PI;
+
 export class FireMode {
   readonly world: FireWorld;
   private readonly reveal: boolean;
-  private camera: { eye: { east: number; north: number; up: number }; look: { east: number; north: number; up: number }; up: THREE.Vector3 } | null = null;
+  private camera: { eye: Point3; look: Point3; up: THREE.Vector3; fovDeg: number } | null = null;
   private readonly ids = new Map<string, number>();
   private readonly button: HTMLButtonElement;
   private armed = false;
   private down: { x: number; y: number } | null = null;
   private tNow = 0;
-  private readonly onPipClick = (e: MouseEvent) => this.markHere(e);
   private readonly onViewDown = (e: MouseEvent) => (this.down = { x: e.clientX, y: e.clientY });
   private readonly onViewClick = (e: MouseEvent) => this.reportHere(e);
   private readonly onKey = (e: KeyboardEvent) => {
@@ -84,7 +86,6 @@ export class FireMode {
     this.button.textContent = 'Дым';
     this.button.addEventListener('click', () => this.arm(!this.armed));
     host.viewEl.parentElement?.appendChild(this.button);
-    host.pipEl.addEventListener('click', this.onPipClick);
     host.viewEl.addEventListener('pointerdown', this.onViewDown);
     host.viewEl.addEventListener('click', this.onViewClick);
     window.addEventListener('keydown', this.onKey);
@@ -107,31 +108,31 @@ export class FireMode {
       this.camera = null;
       return;
     }
-    const tilt = (this.sc.tiltDeg * Math.PI) / 180;
-    const h = (a.headingDeg * Math.PI) / 180;
-    const eye = { east: a.east, north: a.north, up: a.up - CAMERA_BELOW_M };
-    const d = 100;
-    this.camera = {
-      eye,
-      look: { east: eye.east + Math.sin(h) * Math.cos(tilt) * d, north: eye.north + Math.cos(h) * Math.cos(tilt) * d, up: eye.up - Math.sin(tilt) * d },
-      up: this.sc.tiltDeg > 80 ? new THREE.Vector3(Math.sin(h), 0, -Math.cos(h)) : new THREE.Vector3(0, 1, 0),
-    };
+    const f = this.host.gimbal.frame(a, fovOf(this.sc.camera));
+    this.camera = { eye: f.eye, look: f.look, up: f.up, fovDeg: f.fovDeg };
   }
 
   get active(): boolean {
     return this.camera !== null;
   }
 
-  render(viewWidthPx: number) {
+  /** Кадр подвеса в окне rect: тепловизор или дневная камера (ir = false) — в ней виден и дым. */
+  render(rect: { right: number; bottom: number; width: number; height: number }, ir: boolean) {
     const el = this.host.pipEl;
-    el.classList.toggle('thermal', !!this.camera);
+    el.classList.toggle('thermal', !!this.camera && ir);
     if (!this.camera) return;
-    const cam = this.sc.camera;
-    const w = Math.round(Math.min(WINDOW_MAX_PX, viewWidthPx * WINDOW_SHARE));
-    const r = { right: 12, bottom: 12, width: w, height: Math.round((w * cam.heightPx) / cam.widthPx) };
-    Object.assign(el.style, { width: `${r.width}px`, height: `${r.height}px` });
-    const fov = (2 * Math.atan((cam.heightPx * cam.pixelPitchUm * 1e-3) / (2 * cam.focalLengthMm)) * 180) / Math.PI;
-    this.host.world.renderThermal(r, this.camera.eye, this.camera.look, fov, this.camera.up);
+    Object.assign(el.style, { width: `${rect.width}px`, height: `${rect.height}px` });
+    const c = this.camera;
+    if (ir) this.host.world.renderThermal(rect, c.eye, c.look, c.fovDeg, c.up);
+    else this.host.world.renderPip(rect, c.eye, c.look, c.fovDeg, c.up);
+  }
+
+  get fovDeg(): number {
+    return this.camera?.fovDeg ?? fovOf(this.sc.camera);
+  }
+
+  get aspect(): number {
+    return this.sc.camera.widthPx / this.sc.camera.heightPx;
   }
 
   /** Подпись окна: что подтверждено (на зачёте — только счёт отметок). */
@@ -147,7 +148,6 @@ export class FireMode {
   }
 
   dispose() {
-    this.host.pipEl.removeEventListener('click', this.onPipClick);
     this.host.viewEl.removeEventListener('pointerdown', this.onViewDown);
     this.host.viewEl.removeEventListener('click', this.onViewClick);
     window.removeEventListener('keydown', this.onKey);
@@ -175,15 +175,16 @@ export class FireMode {
     });
   }
 
-  /** Щелчок по окну тепловизора — отметка огня на земле. */
-  private markHere(e: MouseEvent) {
-    if (!this.camera) return;
+  /** Отметка огня по щелчку в кадре подвеса (ir — в тепловом кадре). */
+  markAt(clientX: number, clientY: number, ir: boolean): FireMark | null {
+    if (!this.camera) return null;
     const box = this.host.pipEl.getBoundingClientRect();
-    const p = this.host.world.thermalPick(e.clientX - box.left, e.clientY - box.top);
-    if (!p) return;
+    const p = ir ? this.host.world.thermalPick(clientX - box.left, clientY - box.top) : this.host.world.pipPick(clientX - box.left, clientY - box.top);
+    if (!p) return null;
     const m = this.world.mark({ east: p.east, north: p.north }, this.tNow);
     this.host.onMark(m, this.reveal);
     this.drawMarks();
+    return m;
   }
 
   /** Щелчок по столбу дыма в 3D-виде — донесение о пожаре. */

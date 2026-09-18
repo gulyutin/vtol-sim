@@ -5,11 +5,13 @@ import { PROFILE } from '@profile';
 import { parseOsm } from './sim/osm';
 import { loadQuality, QUALITY, saveQuality } from './ui/quality';
 import { Preparation, PREP_STEPS, type GroundTest, type PrepStepId } from './game/preparation';
-import { ACTIVE_REGION, buildMission, departure, forecastWeather, REGION, SCENARIOS, type Mission, type Scenario, type Settings } from './game/scenarios';
+import { ACTIVE_REGION, buildMission, departure, forecastWeather, REGION, SCENARIOS, type Mission, type RoutePoint, type Scenario, type Settings } from './game/scenarios';
 import { LOG_REGION_ID, osmRegionFor, REGIONS, saveLogRegion, setRegion } from './game/regions';
 import { inBounds, placeRecording, regionFromRecording, settleOnTerrain } from './game/logRegion';
 import { SurfaceMotion } from './game/surfaces';
 import { FireMode } from './ui/fireMode';
+import { Gimbal, GimbalWindow } from './ui/gimbal';
+import { RcSticks } from './ui/rcSticks';
 import { SearchMode } from './ui/searchMode';
 import { loadLastLog, saveLastLog } from './ui/logStore';
 import { placeOsm } from './ui/placeOsm';
@@ -38,7 +40,7 @@ import { buildTimeline } from './sim/timeline';
 import type { GeoPoint, MissionResult, Site, Terrain, Weather } from './sim/types';
 import { windAt } from './sim/wind';
 import { loadAircraft } from './ui/aircraftModel';
-import { createGcs, fmt, fmtTime, fmtWind, type GcsCommand, type SurveyInfo } from './ui/gcs';
+import { createGcs, fmt, fmtTime, fmtWind, type GcsCommand, type RouteAltitude, type SurveyInfo } from './ui/gcs';
 import type { ProfileData } from './ui/instruments';
 import { Map2D, type LegLabel, type Pin, type WindSiteMark } from './ui/map2d';
 import { World, type CameraMode } from './ui/scene';
@@ -324,7 +326,18 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       const sc = SCENARIOS.find((x) => x.id === id);
       if (sc && !started) loadScenario(sc);
     },
+    onAreaDraw: () => drawSurveyArea(),
     onSettings(s) {
+      // Другая система высот точек — точки остаются на тех же высотах, меняется только отсчёт.
+      if (s.altitudeRef !== settings.altitudeRef && scenario.kind !== 'survey') {
+        const toAbs = s.altitudeRef !== 'agl';
+        scenario = {
+          ...scenario,
+          route: scenario.route.map((p) =>
+            toAbs ? { ...p, altitudeM: Math.round(p.altitudeM ?? terrain.elevationM(p) + p.heightAglM) } : { ...p, heightAglM: Math.max(20, Math.round((p.altitudeM ?? terrain.elevationM(p) + p.heightAglM) - terrain.elevationM(p))) },
+          ),
+        };
+      }
       settings = s;
       replan();
     },
@@ -519,6 +532,15 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
 
   document.title = PROFILE.title;
   const quality = QUALITY[loadQuality()];
+  // Экранный пульт — поверх 3D-вида, виден в ФЭЙЛСЕЙФе.
+  const rc = new RcSticks(gcs.viewEl.parentElement!);
+  // Камера на подвесе: в поиске и патруле — тепловизор, в перелёте, облёте и доставке — дневная по кнопке.
+  const pipEl = gcs.viewEl.parentElement!.querySelector<HTMLElement>('.pip')!;
+  const gimbal = new Gimbal();
+  const gwin = new GimbalWindow(pipEl, gcs.viewEl, gimbal, { onClick: (x, y, shift) => gimbalClick(x, y, shift) });
+  /** Поле зрения дневной камеры подвеса без зума, °. */
+  const DAY_FOV_DEG = 40;
+  let gimbalLabelFrame = 0;
   const world = new World(gcs.viewEl, { terrain, site: siteA, bounds, area: [], maxImageryZoom: quality.maxImageryZoom, cloudBaseM: 1500, cloudCover: 0.3, quality });
   // По умолчанию камера за хвостом: аппарат на экране смотрит туда же, куда летит.
   world.setCameraMode('chase');
@@ -602,6 +624,20 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   map.setZones(zones);
   world.setZones(zones);
   gcs.setZones(zoneItems());
+  /** Участок съёмки заново — щелчками по карте. */
+  function drawSurveyArea() {
+    if (scenario.kind !== 'survey') return;
+    if (started) return gcs.log(flight.state.t, 'Участок меняется только до взлёта', 'warn');
+    gcs.log(0, 'Участок съёмки: щелчки по карте — вершины, двойной щелчок или первая вершина — готово, Esc — отмена');
+    map.startAreaDraw((area) => {
+      if (scenario.kind !== 'survey' || area.length < 3) return;
+      if (!area.every(inRegion)) return gcs.log(0, 'Участок выходит за загруженный рельеф — нарисуйте ближе к площадке', 'warn');
+      scenario = { ...scenario, area };
+      world.setArea(area);
+      replan();
+    });
+  }
+
   map.onAreaChange = (area) => {
     if (started || scenario.kind !== 'survey') return;
     scenario = { ...scenario, area };
@@ -647,7 +683,10 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     if (scenario.kind === 'survey') return;
     if (!inRegion(p)) return gcs.log(0, 'Точка вне загруженного рельефа', 'warn');
     const last = scenario.route[scenario.route.length - 1];
-    scenario = { ...scenario, route: [...scenario.route, { ...p, heightAglM: last?.heightAglM ?? 150 }] };
+    // Новая точка — на высоте последней: над рельефом — той же высоты над ним, иначе — той же над морем.
+    const next: RoutePoint = { ...p, heightAglM: last?.heightAglM ?? 150 };
+    if (settings.altitudeRef !== 'agl') next.altitudeM = last?.altitudeM ?? Math.round(terrain.elevationM(p) + next.heightAglM);
+    scenario = { ...scenario, route: [...scenario.route, next] };
     if (started) replanInFlight();
     else replan();
   };
@@ -657,10 +696,10 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     if (c === 'arm' && prep.running) return gcs.log(s.t, 'Идёт проверка подготовки — дождитесь окончания', 'warn');
     if (c === 'arm' && prepNeeded() && !prep.done) return gcs.log(s.t, 'Сначала предполётная подготовка — окно «Подготовка»', 'warn');
     if (c === 'target') {
-      if (!airborne()) return gcs.log(s.t, 'ЦЕЛЬ — только в полёте', 'warn');
+      if (!airborne() && !targetMode) return gcs.log(s.t, 'Облёт точки — только в полёте', 'warn');
       targetMode = !targetMode;
       gcs.targetMode(targetMode);
-      if (targetMode) gcs.log(s.t, 'Укажите точку на карте');
+      if (targetMode) gcs.log(s.t, 'Облёт точки: щёлкните по карте — аппарат уйдёт к ней и будет кружить (Esc — отмена)');
       return;
     }
     if (c === 'unload') {
@@ -841,8 +880,9 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       for (let i = 1; i < pts.length; i++) leg(pts[i - 1]!, pts[i]!);
     }
     map.setRoute(path, pins, labels);
-    map.setArea(scenario.kind === 'survey' || scenario.kind === 'search' || scenario.kind === 'fire' ? scenario.area : null);
-    map.setEditableRoute(scenario.kind === 'survey' ? null : scenario.route);
+    // Участок съёмки правится на карте; район поиска и зона патруля — только показываются.
+    map.setArea(scenario.kind === 'survey' || scenario.kind === 'search' || scenario.kind === 'fire' ? scenario.area : null, scenario.kind === 'survey');
+    map.setEditableRoute(scenario.kind === 'survey' ? null : scenario.route, (p) => routeAltitude().label(p));
     map.setDestination(destinationOf(scenario));
     map.setEditing({ area: !started, route: true, destination: !started });
 
@@ -857,14 +897,36 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     world.setMarkers(
       scenario.kind === 'survey'
         ? []
-        : scenario.route.map((p, i) => ({ ...local(p), up: terrain.elevationM(p) + p.heightAglM - siteA.elevationM, label: String(i + 1) })),
+        : scenario.route.map((p, i) => ({ ...local(p), up: pointAltitude(p) - siteA.elevationM, label: String(i + 1) })),
     );
-    gcs.setRoute(
-      scenario.kind === 'survey' ? null : scenario.route,
-      scenario.siteName,
-      destinationNameOf(scenario),
-      true,
-    );
+    gcs.setRoute(scenario.kind === 'survey' ? null : scenario.route, scenario.siteName, destinationNameOf(scenario), true, routeAltitude());
+  }
+
+  /** Высота точки маршрута над морем, м: над рельефом — по рельефу, иначе — заданная. */
+  function pointAltitude(p: RoutePoint): number {
+    return settings.altitudeRef !== 'agl' && p.altitudeM !== undefined ? p.altitudeM : terrain.elevationM(p) + p.heightAglM;
+  }
+
+  /** Как показывать и править высоту точек в системе высот задания. */
+  function routeAltitude(): RouteAltitude & { label(p: RoutePoint): string } {
+    const site = siteA.elevationM;
+    const ground = (p: RoutePoint) => terrain.elevationM(p);
+    const withAbs = (p: RoutePoint, abs: number): RoutePoint => ({ ...p, altitudeM: abs, heightAglM: Math.max(20, Math.round(abs - ground(p))) });
+    switch (settings.altitudeRef) {
+      case 'msl':
+        return { unit: 'м над морем', min: -100, max: 8000, value: pointAltitude, apply: withAbs, label: (p) => `${Math.round(pointAltitude(p))} м абс.` };
+      case 'takeoff':
+        return {
+          unit: 'м от точки взлёта',
+          min: -2000,
+          max: 5000,
+          value: (p) => pointAltitude(p) - site,
+          apply: (p, v) => withAbs(p, v + site),
+          label: (p) => `${pointAltitude(p) - site >= 0 ? '+' : '−'}${Math.abs(Math.round(pointAltitude(p) - site))} м`,
+        };
+      default:
+        return { unit: 'м над рельефом', min: 20, max: 3000, value: (p) => p.heightAglM, apply: (p, v) => ({ ...p, heightAglM: v }), label: (p) => `${Math.round(p.heightAglM)} м` };
+    }
   }
 
   function startStage(i: number, t0: number, e0: number) {
@@ -938,6 +1000,10 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     // Отказы разыгрываются заново на каждую попытку — зачёт не выучить наизусть.
     failurePlan = planFailures(findDifficulty(difficultyId), Math.floor(Math.random() * 2 ** 31), planned.durationS);
     frames = [];
+    // Подвес — к началу задания: в поиске и патруле тепловизор под наклоном задания, иначе — вперёд-вниз.
+    const thermal = scenario.kind === 'search' || scenario.kind === 'fire';
+    gimbal.reset(scenario.kind === 'search' || scenario.kind === 'fire' ? scenario.tiltDeg : 25);
+    gwin.configure({ ir: thermal, marks: thermal, launcher: !thermal && scenario.kind !== 'survey' });
     // Люди и звери — заново на каждую попытку, как отказы.
     searchMode?.dispose();
     searchMode =
@@ -949,7 +1015,8 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
               map,
               site: siteA,
               terrain,
-              pipEl: gcs.viewEl.parentElement!.querySelector<HTMLElement>('.pip')!,
+              pipEl,
+              gimbal,
               onMark: (m, reveal) => {
                 const t = flight.state.t;
                 rec.event(t, `Отметка: ${m.text}`, m.result === 'found' ? 'info' : 'warn');
@@ -970,7 +1037,8 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
               world,
               map,
               site: siteA,
-              pipEl: gcs.viewEl.parentElement!.querySelector<HTMLElement>('.pip')!,
+              pipEl,
+              gimbal,
               viewEl: gcs.viewEl,
               windAt: windTo,
               onMark: (m, reveal) => {
@@ -1364,7 +1432,10 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     // «Фэйлсейф» — ручное управление с ПДУ: стик каждый кадр, время без ускорения.
     const manual = flight.state.mode === 'failsafe';
     pilot.enableKeyboard(manual);
-    controls = { ...controls, stick: manual ? pilot.poll() : null };
+    rc.show(manual);
+    const stick = manual ? rc.merge(pilot.poll()) : null;
+    if (stick) rc.display(stick);
+    controls = { ...controls, stick };
     if (!paused) {
       flight.step(dt * (manual ? 1 : rate), controls, (st) => {
         if (!trigger) return;
@@ -1578,9 +1649,11 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       const lastFrame = frames[frames.length - 1];
       gcs.pip(
         searchMode?.active
-          ? searchMode.label()
+          ? channelLabel(searchMode.label())
           : fireMode?.active
-          ? fireMode.label()
+          ? channelLabel(fireMode.label())
+          : dayGimbal()
+          ? 'Камера подвеса · тянуть — поворот, колёсико — зум, щелчок — сопровождение'
           : pip
           ? lastFrame
             ? `Кадр ${frames.length} · ${fmt(lastFrame.aglM)} м · GSD ${fmt(lastFrame.gsdM * 100, 2)} см · смаз ${fmt(lastFrame.blurPx, 2)} px · ISO ${fmt(lastFrame.iso)}${lastFrame.ok ? '' : ` · БРАК: ${lastFrame.reason}`}`
@@ -1592,18 +1665,55 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
 
   function draw(dt: number) {
     world.render(dt);
-    // Поиск: окно тепловизора вместо окна фотокамеры.
-    if (searchMode?.active) searchMode.render(gcs.viewEl.clientWidth);
-    else if (fireMode?.active) fireMode.render(gcs.viewEl.clientWidth);
-    else if (pip && mission.camera) {
+    // Поиск и патруль: окно подвеса с тепловизором вместо окна фотокамеры.
+    const thermalMode = searchMode?.active ? searchMode : fireMode?.active ? fireMode : null;
+    const day = dayGimbal();
+    gwin.setActive(!!thermalMode || !!day);
+    // Углы подвеса меняются и сами — при сопровождении: подписи — раз в несколько кадров.
+    if ((thermalMode || day) && ++gimbalLabelFrame % 6 === 0) gwin.sync();
+    if (thermalMode) {
+      gwin.lastFovDeg = thermalMode.fovDeg;
+      thermalMode.render(gwin.rect(thermalMode.aspect), gwin.ir);
+    } else if (day) {
+      const r = gwin.rect(4 / 3);
+      Object.assign(pipEl.style, { width: `${r.width}px`, height: `${r.height}px` });
+      gwin.lastFovDeg = day.fovDeg;
+      world.renderPip(r, day.eye, day.look, day.fovDeg, day.up);
+    } else if (pip && mission.camera) {
       const w = Math.round(Math.min(260, gcs.viewEl.clientWidth * 0.4));
       const r = { right: 12, bottom: 12, width: w, height: Math.round((w * 2) / 3) };
-      const pipEl = gcs.viewEl.parentElement!.querySelector<HTMLElement>('.pip')!;
       Object.assign(pipEl.style, { width: `${r.width}px`, height: `${r.height}px` });
       const cam = mission.camera;
       const fov = (2 * Math.atan((cam.heightPx * cam.pixelPitchUm * 1e-3) / (2 * cam.focalLengthMm)) * 180) / Math.PI;
       world.renderPip(r, pip.eye, pip.look, fov, pip.up);
     }
+  }
+
+  /** Подпись окна поиска и патруля — по каналу подвеса: тепловизор или дневная камера. */
+  function channelLabel(text: string): string {
+    return gwin.ir ? text : text.replace(/^Тепловизор/, 'Дневная камера');
+  }
+
+  /** Кадр дневной камеры подвеса — если её окно включено кнопкой «Подвес» и аппарат в воздухе. */
+  function dayGimbal() {
+    if (!gwin.dayShown || !airborne() || searchMode || fireMode || scenario.kind === 'survey') return null;
+    return gimbal.frame(flight.state, DAY_FOV_DEG);
+  }
+
+  /** Щелчок по кадру подвеса: в поиске и патруле — отметка, с «Сопровождением» или Shift — взять цель. */
+  function gimbalClick(x: number, y: number, shift: boolean) {
+    const mode = searchMode ?? fireMode;
+    if (mode && !gwin.trackMode && !shift) {
+      mode.markAt(x, y, gwin.ir);
+      return;
+    }
+    const box = pipEl.getBoundingClientRect();
+    const p = mode && gwin.ir ? world.thermalPick(x - box.left, y - box.top) : world.pipPick(x - box.left, y - box.top);
+    if (!p) return;
+    const body = searchMode?.bodyNear(p) ?? null;
+    gimbal.track = body ? { kind: 'body', id: body } : { kind: 'point', p: { east: p.east, north: p.north, up: p.up } };
+    gwin.sync();
+    gcs.log(flight.state.t, body ? 'Подвес: сопровождение цели' : 'Подвес: сопровождение точки на земле');
   }
 
   gcs.setSoundMuted(mutedPref);

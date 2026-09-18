@@ -78,6 +78,33 @@ describe('построение маршрута', () => {
     for (let i = 1; i < between.length; i++) expect(between[i]!).toBeGreaterThanOrEqual(between[i - 1]! - 1e-9);
   });
 
+  it('высота точек над морем или от взлёта — между точками ровно по высоте, над рельефом — огибая холм', () => {
+    // Холм 200 м между точками 1 и 2 (с 4 до 6 км на север).
+    const ground = (p: GeoPoint) => {
+      const n = toLocal(route.site, p).north;
+      return 260 + 200 * Math.max(0, 1 - Math.abs(n - 5000) / 1000);
+    };
+    const hills = { elevationM: ground };
+    const pts = [
+      { ...fromLocal(route.site, 0, 3000), heightAglM: 300, altitudeM: 560 },
+      { ...fromLocal(route.site, 0, 7000), heightAglM: 300, altitudeM: 560 },
+    ];
+    const weather = calm(forecastWeather(route, route.defaults));
+    const between = (ref: 'agl' | 'msl' | 'takeoff') => {
+      const sc: RouteScenario = { ...route, route: pts };
+      const plan = buildMission(sc, { ...sc.defaults, altitudeRef: ref }, hills, weather).stages[0]!;
+      return plan.waypoints.filter((w) => w.routeLeg === 2).map((w) => ({ n: toLocal(route.site, w).north, alt: w.altitudeM }));
+    };
+    const agl = between('agl');
+    const msl = between('msl');
+    const top = (xs: { n: number; alt: number }[]) => xs.reduce((a, b) => (Math.abs(b.n - 5000) < Math.abs(a.n - 5000) ? b : a));
+    // Над рельефом — над холмом выше на его высоту; над морем — те же 560 м по всему участку.
+    expect(top(agl).alt).toBeGreaterThan(700);
+    for (const w of msl) expect(w.alt).toBeCloseTo(560, 0);
+    // От точки взлёта — та же абсолютная высота точек, отсчёт другой только для показа.
+    expect(between('takeoff').map((w) => Math.round(w.alt))).toEqual(msl.map((w) => Math.round(w.alt)));
+  });
+
   it('склон за площадкой круче, чем успеваем набрать, — круги над площадкой, дальше не ниже половины заданной высоты, а не сквозь склон', () => {
     // От 1 до 2,5 км на север рельеф поднимается на 900 м — 60 %.
     const ground = (p: GeoPoint) => 260 + 900 * Math.min(1, Math.max(0, (toLocal(route.site, p).north - 1000) / 1500));
