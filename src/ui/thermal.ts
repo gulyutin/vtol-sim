@@ -37,7 +37,19 @@ export interface ThermalEnv {
   /** Дальность, на которой воздух заметно съедает контраст, м. */
   airRangeM: number;
   whiteHot: boolean;
+  /** Палитра; нет — по whiteHot: белое или чёрное — горячее. */
+  palette?: ThermalPalette;
 }
+
+export type ThermalPalette = 'white' | 'black' | 'iron' | 'rainbow';
+
+/** Палитры тепловизора по порядку в шейдере (uPalette). */
+export const THERMAL_PALETTES: readonly { id: ThermalPalette; title: string }[] = [
+  { id: 'white', title: 'Белый — горячо' },
+  { id: 'black', title: 'Чёрный — горячо' },
+  { id: 'iron', title: 'Железо' },
+  { id: 'rainbow', title: 'Радуга' },
+];
 
 /** Наибольшая ширина кадра датчика, пикс. */
 const MAX_W = 640;
@@ -110,7 +122,7 @@ void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
 const POST_FRAGMENT = /* glsl */ `uniform sampler2D tHeat;
 uniform vec2 uRes;
 uniform float uFrame;
-uniform float uWhiteHot;
+uniform float uPalette;
 uniform mat4 uInvProj;
 uniform mat4 uCamWorld;
 uniform float uSkyZenith;
@@ -118,6 +130,20 @@ uniform float uSkyHorizon;
 uniform float uLo;
 uniform float uHi;
 varying vec2 vUv;
+// Палитры тепловизора: «железо» — чёрный, фиолетовый, красный, оранжевый, жёлтый, белый; радуга — от синего к красному.
+vec3 ironbow(float t) {
+  t = clamp(t, 0.0, 1.0) * 5.0;
+  vec3 c0 = vec3(0.0), c1 = vec3(0.17, 0.0, 0.42), c2 = vec3(0.66, 0.02, 0.52), c3 = vec3(0.94, 0.3, 0.05), c4 = vec3(1.0, 0.76, 0.12), c5 = vec3(1.0, 1.0, 0.86);
+  if (t < 1.0) return mix(c0, c1, t);
+  if (t < 2.0) return mix(c1, c2, t - 1.0);
+  if (t < 3.0) return mix(c2, c3, t - 2.0);
+  if (t < 4.0) return mix(c3, c4, t - 3.0);
+  return mix(c4, c5, t - 4.0);
+}
+vec3 rainbow(float t) {
+  float h = (1.0 - clamp(t, 0.0, 1.0)) * 0.7;
+  return clamp(abs(mod(h * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+}
 float hash(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
 // Небо: холодное в зените, к горизонту — теплее (длиннее путь в воздухе).
 float skyAt(vec2 uv) {
@@ -147,10 +173,10 @@ void main() {
   v += (hash(vec2(cell.x, 7.0)) - 0.5) * 0.012;
   // Узкий диапазон: ни чистого чёрного, ни чистого белого.
   float t = mix(0.05, 0.95, clamp((v - uLo) / (uHi - uLo), 0.0, 1.0));
-  float shade = uWhiteHot > 0.5 ? t : 1.0 - t;
+  vec3 col = uPalette < 0.5 ? vec3(t) : uPalette < 1.5 ? vec3(1.0 - t) : uPalette < 2.5 ? ironbow(t) : rainbow(t);
   vec2 q = vUv - 0.5;
-  shade *= 1.0 - 0.55 * dot(q, q);
-  gl_FragColor = vec4(vec3(shade), 1.0);
+  col *= 1.0 - 0.55 * dot(q, q);
+  gl_FragColor = vec4(col, 1.0);
 }`;
 
 interface CacheEntry {
@@ -201,7 +227,7 @@ export class ThermalView {
         tHeat: { value: this.target.texture },
         uRes: { value: new THREE.Vector2(4, 3) },
         uFrame: { value: 0 },
-        uWhiteHot: { value: 1 },
+        uPalette: { value: 0 },
         uInvProj: { value: new THREE.Matrix4() },
         uCamWorld: { value: new THREE.Matrix4() },
         uSkyZenith: { value: 0.03 },
@@ -268,7 +294,7 @@ export class ThermalView {
     const pu = this.post.uniforms;
     (pu['uRes']!.value as THREE.Vector2).set(w, h);
     pu['uFrame']!.value = ++this.frame % 1000;
-    pu['uWhiteHot']!.value = env.whiteHot ? 1 : 0;
+    pu['uPalette']!.value = THERMAL_PALETTES.findIndex((x) => x.id === (env.palette ?? (env.whiteHot === false ? 'black' : 'white')));
     (pu['uInvProj']!.value as THREE.Matrix4).copy(cam.projectionMatrixInverse);
     (pu['uCamWorld']!.value as THREE.Matrix4).copy(cam.matrixWorld);
     pu['uSkyZenith']!.value = 0.03 + 0.22 * env.overcast;

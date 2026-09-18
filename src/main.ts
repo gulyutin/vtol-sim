@@ -553,7 +553,10 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   document.title = PROFILE.title;
   const quality = QUALITY[loadQuality()];
   // Экранный пульт — поверх 3D-вида, виден в ФЭЙЛСЕЙФе; настоящий пульт — окно «Пульт ДУ» в настройках.
-  const rc = new RcSticks(gcs.viewEl.parentElement!);
+  const rc = new RcSticks(gcs.viewEl.parentElement!, {
+    onTake: () => command('failsafe'),
+    onSetup: () => document.querySelector<HTMLButtonElement>('[data-a="rc"]')?.click(),
+  });
   new RcSetup(document.querySelector<HTMLElement>('.rc-setup')!, pilot);
   // Камера на подвесе: в поиске и патруле — тепловизор, в перелёте, облёте и доставке — дневная по кнопке.
   const pipEl = gcs.viewEl.parentElement!.querySelector<HTMLElement>('.pip')!;
@@ -1508,9 +1511,11 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     // «Фэйлсейф» — ручное управление с ПДУ: стик каждый кадр, время без ускорения.
     const manual = flight.state.mode === 'failsafe';
     pilot.enableKeyboard(manual);
-    rc.show(manual);
-    const stick = manual ? rc.merge(pilot.poll()) : null;
-    if (stick) rc.display(stick);
+    const src = pilot.source === 'gamepad' ? (pilot.device()?.standard ? 'геймпад' : 'пульт USB') : pilot.source === 'keyboard' ? 'клавиатура' : null;
+    rc.show(manual, src, airborne());
+    const shown = manual || rc.userShown ? rc.merge(pilot.poll()) : null;
+    if (shown) rc.display(shown);
+    const stick = manual ? shown : null;
     controls = { ...controls, stick };
     if (!paused) {
       flight.step(dt * (manual ? 1 : rate), controls, (st) => {
@@ -1730,7 +1735,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
           : fireMode?.active
           ? channelLabel(fireMode.label())
           : dayGimbal()
-          ? 'Камера подвеса · тянуть — поворот, колёсико — зум, щелчок — сопровождение'
+          ? `${gwin.ir ? 'Тепловизор' : 'Дневная камера'} подвеса · тянуть — поворот, колёсико — зум, щелчок — сопровождение`
           : pip
           ? lastFrame
             ? `Кадр ${frames.length} · ${fmt(lastFrame.aglM)} м · GSD ${fmt(lastFrame.gsdM * 100, 2)} см · смаз ${fmt(lastFrame.blurPx, 2)} px · ISO ${fmt(lastFrame.iso)}${lastFrame.ok ? '' : ` · БРАК: ${lastFrame.reason}`}`
@@ -1752,17 +1757,19 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     if (thermalMode) {
       gwin.lastFovDeg = thermalMode.fovDeg;
       const r = gwin.rect(thermalMode.aspect);
-      thermalMode.render(r, gwin.ir);
+      thermalMode.render(r, gwin.ir, gwin.palette);
       vlink.present(r, videoLinkState(), performance.now() / 1000);
     } else if (day) {
       const r = gwin.rect(4 / 3);
       Object.assign(pipEl.style, { width: `${r.width}px`, height: `${r.height}px` });
       gwin.lastFovDeg = day.fovDeg;
-      world.renderPip(r, day.eye, day.look, day.fovDeg, day.up);
+      // Подвес с двумя каналами: дневная камера (RGB) или тепловизор.
+      if (gwin.ir) world.renderThermal(r, day.eye, day.look, day.fovDeg, day.up, { palette: gwin.palette });
+      else world.renderPip(r, day.eye, day.look, day.fovDeg, day.up);
       vlink.present(r, videoLinkState(), performance.now() / 1000);
     } else vlink.reset();
     if (!video) osd.update(null);
-    else if (gimbalLabelFrame % 6 === 0) osd.update(osdData(video, thermalMode ? (gwin.ir ? 'ИК' : 'ТВ') : 'ТВ'));
+    else if (gimbalLabelFrame % 6 === 0) osd.update(osdData(video, gwin.ir ? 'ИК' : 'RGB'));
     if (thermalMode || day) {
       // Окно камеры уже нарисовано.
     } else if (pip && mission.camera) {
@@ -1871,7 +1878,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
 
   /** Подпись окна поиска и патруля — по каналу подвеса: тепловизор или дневная камера. */
   function channelLabel(text: string): string {
-    return gwin.ir ? text : text.replace(/^Тепловизор/, 'Дневная камера');
+    return gwin.ir ? text : text.replace(/^Тепловизор/, 'Дневная камера (RGB)');
   }
 
   /** Кадр дневной камеры подвеса — если её окно включено кнопкой «Подвес» и аппарат в воздухе. */

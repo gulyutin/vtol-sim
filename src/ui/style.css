@@ -1799,12 +1799,12 @@ i.zk.rk {
 
 .osd-tl {
   left: 6px;
-  top: 26px;
+  top: 32px;
 }
 
 .osd-tr {
   right: 6px;
-  top: 26px;
+  top: 32px;
   text-align: right;
 }
 
@@ -1951,4 +1951,45 @@ i.zk.rk {
 
 ul.log li.good {
   color: var(--good);
+}
+
+/* Каналы подвеса: RGB | ИК — одной группой. */
+.pip-seg {
+  display: inline-flex;
+}
+
+.pip-seg button:first-child {
+  border-radius: 3px 0 0 3px;
+}
+
+.pip-seg button:last-child {
+  border-left: 0;
+  border-radius: 0 3px 3px 0;
+}
+
+/* Кнопка «Пульт» — под кнопкой «Подвес». */
+.rc-btn {
+  top: 40px;
+}
+
+.rc-take {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.rc-take button {
+  padding: 2px 10px;
+  border: 1px solid #ffd43b;
+  border-radius: 4px;
+  background: rgba(255, 212, 59, 0.12);
+  color: #ffd43b;
+  font: inherit;
+  cursor: pointer;
+}
+
+.rc-take button:disabled {
+  opacity: 0.45;
+  cursor: default;
 }

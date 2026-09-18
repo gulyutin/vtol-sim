@@ -8,6 +8,7 @@ import type { Gimbal, Point3 } from './gimbal';
 import type { HeatBody } from './heat';
 import type { Map2D } from './map2d';
 import type { World } from './scene';
+import type { ThermalPalette } from './thermal';
 
 /*
  * Режим «Поиск людей» в полёте: люди и звери ходят по времени полёта (src/game/search.ts), 3D-вид
@@ -94,13 +95,13 @@ export class SearchMode {
   }
 
   /** Кадр подвеса в окне rect: тепловизор или дневная камера (ir = false). */
-  render(rect: { right: number; bottom: number; width: number; height: number }, ir: boolean) {
+  render(rect: { right: number; bottom: number; width: number; height: number }, ir: boolean, palette?: ThermalPalette) {
     const el = this.host.pipEl;
     el.classList.toggle('thermal', !!this.camera && ir);
     if (!this.camera) return;
     Object.assign(el.style, { width: `${rect.width}px`, height: `${rect.height}px` });
     const c = this.camera;
-    if (ir) this.host.world.renderThermal(rect, c.eye, c.look, c.fovDeg, c.up);
+    if (ir) this.host.world.renderThermal(rect, c.eye, c.look, c.fovDeg, c.up, palette ? { palette } : {});
     else this.host.world.renderPip(rect, c.eye, c.look, c.fovDeg, c.up);
   }
 

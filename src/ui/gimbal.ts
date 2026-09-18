@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { THERMAL_PALETTES, type ThermalPalette } from './thermal';
 
 /*
  * Камера на подвесе: азимут относительно носа, наклон ниже горизонта и зум; сопровождение —
@@ -103,7 +104,7 @@ export class Gimbal {
 export interface GimbalWindowHandlers {
   /** Щелчок по кадру (не перетаскивание): координаты окна и Shift. */
   onClick(clientX: number, clientY: number, shift: boolean): void;
-  /** Переключили ИК / дневной канал. */
+  /** Переключили канал: ИК или RGB (дневная камера). */
   onChannel?(ir: boolean): void;
 }
 
@@ -114,6 +115,8 @@ export interface GimbalWindowHandlers {
 export class GimbalWindow {
   full = false;
   ir = true;
+  /** Палитра тепловизора. */
+  palette: ThermalPalette = 'white';
   /** Щелчок по кадру — сопровождение (иначе — отметка, где отметки есть). */
   trackMode = false;
   private readonly bar: HTMLElement;
@@ -133,7 +136,8 @@ export class GimbalWindow {
     this.bar.className = 'pip-bar';
     this.bar.innerHTML = `
       <button data-g="full" title="Во весь экран (Esc — обратно)">⤢</button>
-      <button data-g="ir" title="Канал: тепловизор или дневная камера">ИК</button>
+      <span class="pip-seg"><button data-g="rgb" title="Дневная камера (RGB)">RGB</button><button data-g="ir" title="Тепловизор">ИК</button></span>
+      <button data-g="palette" title="Палитра тепловизора — щелчок переключает">Белый — горячо</button>
       <button data-g="track" title="Щелчок по кадру — сопровождение цели (Shift+щелчок — всегда)">Сопровождение</button>
       <button data-g="reset" title="Подвес вперёд-вниз, зум ×1, без сопровождения">Сброс</button>
       <output></output>`;
@@ -144,9 +148,13 @@ export class GimbalWindow {
       const b = (e.target as HTMLElement).closest<HTMLButtonElement>('button');
       if (!b) return;
       if (b.dataset.g === 'full') this.setFull(!this.full);
-      if (b.dataset.g === 'ir') {
-        this.ir = !this.ir;
+      if ((b.dataset.g === 'ir' && !this.ir) || (b.dataset.g === 'rgb' && this.ir)) {
+        this.ir = b.dataset.g === 'ir';
         this.h.onChannel?.(this.ir);
+      }
+      if (b.dataset.g === 'palette') {
+        const i = THERMAL_PALETTES.findIndex((p) => p.id === this.palette);
+        this.palette = THERMAL_PALETTES[(i + 1) % THERMAL_PALETTES.length]!.id;
       }
       if (b.dataset.g === 'track') this.trackMode = !this.trackMode;
       if (b.dataset.g === 'reset') this.gimbal.reset(this.gimbal.tiltDeg > 60 ? 90 : 30);
@@ -156,7 +164,7 @@ export class GimbalWindow {
     this.launcher = document.createElement('button');
     this.launcher.className = 'gimbal-btn';
     this.launcher.textContent = 'Подвес';
-    this.launcher.title = 'Окно камеры на подвесе: поворот — перетаскиванием, зум — колёсиком';
+    this.launcher.title = 'Окно камеры на подвесе — дневная (RGB) и тепловизор: поворот — перетаскиванием, зум — колёсиком';
     this.launcher.hidden = true;
     this.launcher.addEventListener('click', () => {
       this.shownDay = !this.shownDay;
@@ -214,7 +222,8 @@ export class GimbalWindow {
    * отметку, launcher — дневная камера по кнопке «Подвес» (перелёт, облёт, доставка).
    */
   configure(o: { ir: boolean; marks: boolean; launcher: boolean }) {
-    this.hasIr = o.ir;
+    // Тепловизор на подвесе есть в любом задании; ir — начинать с него (поиск, патруль).
+    this.hasIr = true;
     this.ir = o.ir;
     this.marks = o.marks;
     this.trackMode = !o.marks;
@@ -256,8 +265,11 @@ export class GimbalWindow {
     const g = this.gimbal;
     const q = (k: string) => this.bar.querySelector<HTMLButtonElement>(`[data-g="${k}"]`)!;
     q('full').classList.toggle('on', this.full);
-    q('ir').hidden = !this.hasIr;
-    q('ir').textContent = this.ir ? 'ИК' : 'День';
+    q('ir').hidden = q('rgb').hidden = !this.hasIr;
+    q('ir').classList.toggle('on', this.ir);
+    q('rgb').classList.toggle('on', !this.ir);
+    q('palette').hidden = !this.ir;
+    q('palette').textContent = THERMAL_PALETTES.find((p) => p.id === this.palette)!.title;
     q('track').classList.toggle('on', this.trackMode || !this.marks);
     q('track').hidden = !this.marks;
     this.launcher.classList.toggle('on', this.shownDay);

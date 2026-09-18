@@ -4,8 +4,17 @@ import type { Stick } from '../sim/flight';
  * Экранный пульт: два стика по «моде 2» — левый: газ (вверх — набор или быстрее) и курс,
  * правый: тангаж (вверх — ручка от себя) и крен. Стик тянут мышью (или пальцем); отпущенный —
  * возвращается в центр. Когда стики не держат, пульт показывает, куда их отклоняют клавиатура
- * или геймпад. Работает только в ФЭЙЛСЕЙФе — ручном управлении с пульта.
+ * или геймпад. Работает только в ФЭЙЛСЕЙФе — ручном управлении с пульта. Кнопка «Пульт» на
+ * 3D-виде показывает пульт и вне ФЭЙЛСЕЙФа — проверить, как ходят ручки подключённого пульта, и
+ * одной кнопкой взять управление.
  */
+
+export interface RcSticksHandlers {
+  /** «Взять управление»: перейти в ФЭЙЛСЕЙФ. */
+  onTake(): void;
+  /** Настройка пульта по USB — окно «Пульт ДУ». */
+  onSetup(): void;
+}
 
 type Side = 'left' | 'right';
 
@@ -24,19 +33,34 @@ export class RcSticks {
   readonly el: HTMLElement;
   private readonly knobs: Record<Side, HTMLElement>;
   private readonly held: Record<Side, { x: number; y: number } | null> = { left: null, right: null };
+  private readonly launcher: HTMLButtonElement;
+  /** Пульт показан кнопкой «Пульт» (не только в ФЭЙЛСЕЙФе). */
+  userShown = false;
 
-  constructor(parent: HTMLElement) {
+  constructor(parent: HTMLElement, h: RcSticksHandlers) {
+    this.launcher = document.createElement('button');
+    this.launcher.className = 'gimbal-btn rc-btn';
+    this.launcher.textContent = '🎮 Пульт';
+    this.launcher.title = 'Показать пульт: экранные ручки и пульт по USB; управление с пульта — в ФЭЙЛСЕЙФе';
+    this.launcher.addEventListener('click', () => {
+      this.userShown = !this.userShown;
+      this.launcher.classList.toggle('on', this.userShown);
+    });
+    parent.appendChild(this.launcher);
     this.el = document.createElement('div');
     this.el.className = 'rc-sticks';
     this.el.hidden = true;
     this.el.innerHTML = `
       <div class="rc-title">Пульт · ФЭЙЛСЕЙФ</div>
+      <div class="rc-take"><button data-rc="take" title="Перейти в ФЭЙЛСЕЙФ: управление с пульта">Взять управление</button><button data-rc="setup" title="Пульт по USB: оси, инверсия, калибровка">⚙</button></div>
       <div class="rc-pads">
         <div class="rc-pad" data-side="left" title="Газ (вверх — набор) и курс"><i></i><b></b><span>газ · курс</span></div>
         <div class="rc-pad" data-side="right" title="Тангаж (вверх — от себя) и крен"><i></i><b></b><span>тангаж · крен</span></div>
       </div>
       <div class="rc-hint">мышью — тянуть стик · клавиатура: W/S газ, A/D курс, стрелки — тангаж и крен</div>`;
     parent.appendChild(this.el);
+    this.el.querySelector('[data-rc="take"]')!.addEventListener('click', () => h.onTake());
+    this.el.querySelector('[data-rc="setup"]')!.addEventListener('click', () => h.onSetup());
     const pad = (side: Side) => this.el.querySelector<HTMLElement>(`.rc-pad[data-side="${side}"]`)!;
     this.knobs = { left: pad('left').querySelector('b')!, right: pad('right').querySelector('b')! };
     for (const side of ['left', 'right'] as const) {
@@ -60,9 +84,21 @@ export class RcSticks {
     }
   }
 
-  show(on: boolean) {
+  /**
+   * Показать пульт: manual — идёт ФЭЙЛСЕЙФ (ручки управляют); иначе пульт виден, если его показали
+   * кнопкой, ручки только показываются. source — откуда ручки: пульт по USB, клавиатура или мышь.
+   */
+  show(manual: boolean, source: string | null = null, canTake = false) {
+    const on = manual || this.userShown;
     this.el.hidden = !on;
-    if (!on) this.held.left = this.held.right = null;
+    if (!on) {
+      this.held.left = this.held.right = null;
+      return;
+    }
+    this.el.querySelector('.rc-title')!.textContent = manual ? `Пульт · ФЭЙЛСЕЙФ${source ? ` · ${source}` : ''}` : `Пульт · только показ${source ? ` · ${source}` : ''}`;
+    const take = this.el.querySelector<HTMLButtonElement>('[data-rc="take"]')!;
+    take.hidden = manual;
+    take.disabled = !canTake;
   }
 
   /** Стик с учётом мыши: оси удерживаемого мышью стика заменяют клавиатуру и геймпад. */

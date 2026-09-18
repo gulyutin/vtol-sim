@@ -60,7 +60,7 @@ const HAZE_SUN = 0.33;
 const CLEAR_VISIBILITY_M = 80_000;
 import type { Bounds } from './terrainData';
 import { TerrainLod } from './terrainLod';
-import { ThermalView, type ThermalKind } from './thermal';
+import { ThermalView, type ThermalKind, type ThermalPalette } from './thermal';
 import { ZoneWalls } from './zones3d';
 import type { GroundSeason } from '../game/season';
 
@@ -892,7 +892,7 @@ export class World {
     look: LocalPoint,
     fovDeg: number,
     up?: THREE.Vector3,
-    opts: { whiteHot?: boolean } = {},
+    opts: { whiteHot?: boolean; palette?: ThermalPalette } = {},
   ) {
     const view = (this.thermal ??= new ThermalView(this.renderer));
     const cam = view.camera;
@@ -917,6 +917,7 @@ export class World {
         overcast: this.overcast,
         airRangeM,
         whiteHot: opts.whiteHot ?? true,
+        ...(opts.palette ? { palette: opts.palette } : {}),
       });
     } finally {
       this.heat.cull(this.camera.position, HEAT_VIEW_M);
