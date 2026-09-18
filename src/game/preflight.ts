@@ -1,5 +1,6 @@
 import { takeoffMassKg } from '../sim/aero';
 import { AIRCRAFT } from '../sim/aircraft';
+import { airDensity, tasFromIas } from '../sim/atmosphere';
 import { LINK_TIMEOUT_S } from '../sim/failures';
 import { backTransitionAltitudeM, distanceM, transitionAltitudeM } from '../sim/mission';
 import { windComponents, type WindProcedures } from '../sim/procedures';
@@ -60,6 +61,7 @@ const ICING_WET_MAX_C = 2;
 /** Стандартный градиент температуры, °C/м. */
 const LAPSE_C_PER_M = 0.0065;
 
+const RAD = Math.PI / 180;
 const fmt = (x: number, d = 0) => x.toLocaleString('ru-RU', { minimumFractionDigits: d, maximumFractionDigits: d });
 const fmtDistance = (m: number) => (m < 1000 ? `${fmt(Math.round(m / 10) * 10)} м` : `${fmt(m / 1000, m < 10_000 ? 1 : 0)} км`);
 
@@ -74,12 +76,36 @@ export function preflightChecks(o: PreflightInput): Check[] {
   // РЛЭ, предварительная подготовка: отложить полёт при сильном ветре, порывах, боковом ветре
   // на разгоне, плохой видимости, осадках. Поля погоды, которых нет, не проверяются.
   add(wind10.speedMs <= L.windMaxMs, 'block', `Ветер у земли ${fmt(wind10.speedMs, 1)} м/с — допустимо до ${L.windMaxMs} м/с`);
+  // Ветер на высоте полёта сильнее, чем у земли: по нему снос и путевая. Нос развернётся против
+  // бокового ветра на угол сноса, крылья при этом ровные — так летит и настоящий аппарат.
+  const cruise = o.stages[0]?.waypoints.map((p) => p.altitudeM - o.terrain.elevationM(p)).sort((a, b) => a - b);
+  if (cruise?.length) {
+    const agl = Math.max(10, cruise[Math.floor(cruise.length / 2)]!);
+    const aloft = windAt(w, agl);
+    const first = o.stages[0]!;
+    const tas = tasFromIas(first.iasMs, airDensity({ altitudeM: first.takeoff.elevationM + agl, temperatureC: w.groundTemperatureC }));
+    const crab = aloft.speedMs < tas ? Math.asin(aloft.speedMs / tas) / RAD : 90;
+    add(true, 'warn', `Ветер на высоте полёта (~${fmt(Math.round(agl / 10) * 10)} м над рельефом) ${fmt(aloft.speedMs, 1)} м/с: чисто боковой развернёт нос против ветра до ${fmt(crab)}°`);
+  }
   if (w.gustMs !== undefined) add(w.gustMs <= L.gustMaxMs, 'block', `Порывы ${fmt(w.gustMs, 1)} м/с — допустимо до ${L.gustMaxMs} м/с`);
   o.procedures.forEach((p, i) => {
     const c = windComponents(wind10, p.takeoffHeadingDeg);
     const ok = wind10.speedMs <= L.takeoffAnyWindMs || (c.headwindMs > 0 && c.crosswindMs <= L.takeoffAnyWindMs);
     const where = o.stages.length > 1 ? ` (взлёт ${i + 1})` : '';
     add(ok, 'block', `Разгон${where} на ${fmt(p.takeoffHeadingDeg)}°: встречный ${fmt(c.headwindMs, 1)}, боковой ${fmt(c.crosswindMs, 1)} м/с — при ветре сильнее ${L.takeoffAnyWindMs} м/с только против ветра`);
+  });
+  // Курс захода задан вручную (не против ветра) — чем он оплачен: попутный и боковой ветер на посадочной прямой.
+  o.procedures.forEach((p, i) => {
+    const off = Math.abs(((p.landingHeadingDeg - wind10.fromDeg + 540) % 360) - 180);
+    if (wind10.speedMs < 1 || off < 1) return;
+    const c = windComponents(wind10, p.landingHeadingDeg);
+    const ok = wind10.speedMs <= L.takeoffAnyWindMs || (c.headwindMs > 0 && c.crosswindMs <= L.takeoffAnyWindMs);
+    const where = o.stages.length > 1 ? ` (посадка ${i + 1})` : '';
+    add(
+      ok,
+      'warn',
+      `Заход${where} курсом ${fmt(p.landingHeadingDeg)}°: ${c.headwindMs >= 0 ? 'встречный' : 'попутный'} ${fmt(Math.abs(c.headwindMs), 1)}, боковой ${fmt(c.crosswindMs, 1)} м/с${ok ? '' : ` — при ветре сильнее ${L.takeoffAnyWindMs} м/с заход против ветра`}`,
+    );
   });
   const cloudBase = w.cloudBaseM ?? o.cloudBaseM;
   add(cloudBase >= L.minCloudBaseM, 'block', `Нижняя граница облаков ${fmt(cloudBase)} м — не ниже ${L.minCloudBaseM} м`);

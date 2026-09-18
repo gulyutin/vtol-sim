@@ -941,6 +941,8 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       weather: actual,
       origin: siteA,
       home: siteA,
+      // Заданный курс захода — и для ВОЗВРАТА, если задание и так садится дома.
+      ...(settings.approachDeg != null && distanceM(mission.stages[mission.stages.length - 1]!.landing, siteA) < 50 ? { homeApproachDeg: settings.approachDeg } : {}),
       startT: t0,
       initialEnergyWh: e0,
       // Порывы — свои для дня и полёта; термики — от Солнца над склонами.

@@ -21,7 +21,8 @@ const terrain = flatTerrain(260);
 const route = SCENARIOS.find((s): s is RouteScenario => s.kind === 'route')!;
 const delivery = SCENARIOS.find((s): s is DeliveryScenario => s.kind === 'delivery')!;
 const wrap = (d: number) => ((((d + 180) % 360) + 360) % 360) - 180;
-const controls: Controls = { iasMs: 21, heightAglM: 150, courseDeg: 0, target: null };
+// Уставка — как в плане задания: иначе живой полёт летит на другой скорости, чем считал планировщик.
+const controls: Controls = { iasMs: route.defaults.iasMs, heightAglM: 150, courseDeg: 0, target: null };
 const windy = (sc: Scenario, speedMs: number, fromDeg: number): Weather => ({ ...forecastWeather(sc, sc.defaults), wind: { speedMs, fromDeg } });
 
 describe('план совпадает с живым полётом', () => {
@@ -79,6 +80,14 @@ describe('взлётный и посадочный маршруты (РЛЭ)', (
     expect(distanceM(p.approach[1], route.site)).toBeCloseTo(AIRCRAFT.procedures.approachLegM, 0);
     expect(distanceM(p.approach[0], p.approach[1])).toBeCloseTo(AIRCRAFT.procedures.approachLegM, 0);
     expect(Math.abs(wrap(bearingDeg(p.approach[1], route.site) - 250))).toBeLessThan(0.5);
+  });
+
+  it('курс захода задан вручную — посадочный маршрут по нему, разгон по-прежнему против ветра', () => {
+    const q = windProcedures(route.site, route.site, { speedMs: 6, fromDeg: 250 }, route.route[0]!, route.route[3]!, 160);
+    expect(q.landingHeadingDeg).toBe(160);
+    expect(q.takeoffHeadingDeg).toBe(250);
+    expect(Math.abs(wrap(bearingDeg(q.approach[0], q.approach[1]) - 160))).toBeLessThan(0.5);
+    expect(Math.abs(wrap(bearingDeg(q.approach[1], route.site) - 160))).toBeLessThan(0.5);
   });
 
   it('в штиль разгон — на первую точку маршрута', () => {
@@ -213,5 +222,36 @@ describe('штатная камера с гиростабилизацией', ()
   it('подвес держит кадр по линии пути, жёсткая камера разворачивается на снос', () => {
     expect(frameAt(pose, nadir, params, ctx).headingDeg).toBe(0);
     expect(frameAt(pose, fixed, params, ctx).headingDeg).toBe(25);
+  });
+});
+
+describe('живой полёт: заданный курс захода', () => {
+  const weather = windy(route, 4, 250);
+  const m = buildMission(route, { ...route.defaults, approachDeg: 160 }, terrain, weather);
+  const land = (g: LiveFlight, rtlAt: number | null) => {
+    g.command('arm');
+    g.command('takeoff');
+    let heading = NaN;
+    while (g.state.mode !== 'landed' && g.state.mode !== 'crashed' && g.state.t < 7200) {
+      if (rtlAt !== null && g.state.t >= rtlAt && g.state.t < rtlAt + 0.3) g.command('rtl');
+      g.step(0.2, controls);
+      if (g.state.mode === 'final') heading = g.state.headingDeg;
+    }
+    return heading;
+  };
+
+  it('по заданию садится курсом 160°', () => {
+    const f = new LiveFlight({ plan: m.stages[0]!, terrain, weather, origin: m.site, home: m.site });
+    const heading = land(f, null);
+    expect(f.state.mode).toBe('landed');
+    expect(Math.abs(wrap(heading - 160))).toBeLessThan(5);
+  });
+
+  it('ВОЗВРАТ садится дома тем же курсом', () => {
+    const f = new LiveFlight({ plan: m.stages[0]!, terrain, weather, origin: m.site, home: m.site, homeApproachDeg: 160 });
+    const heading = land(f, 500);
+    expect(f.state.mode).toBe('landed');
+    expect(Math.abs(wrap(heading - 160))).toBeLessThan(5);
+    expect(Math.hypot(f.state.east - f.home.east, f.state.north - f.home.north)).toBeLessThan(AIRCRAFT.limits.landingZoneRadiusM);
   });
 });

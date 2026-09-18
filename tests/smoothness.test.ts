@@ -261,13 +261,15 @@ describe('тангаж корпуса (pitchDeg)', () => {
   const calmTrace = trace(calm);
 
   it('в самолёте — угол пути плюс ~2° на крейсерской приборной; в наборе нос выше; в вираже угол атаки больше', () => {
-    const straight = calmTrace.filter((x) => x.mode === 'auto' && x.modeT > 30 && Math.abs(x.bank) < 1);
+    // Прямая — крен у постоянного перекоса крейсера (AIRCRAFT.cruiseTrim).
+    const level = AIRCRAFT.cruiseTrim?.rollDeg ?? 0;
+    const straight = calmTrace.filter((x) => x.mode === 'auto' && x.modeT > 30 && Math.abs(x.bank - level) < 1);
     expect(straight.length).toBeGreaterThan(100);
     for (const x of straight) expect(Math.abs(x.pitch - x.gamma - 2)).toBeLessThan(0.7);
-    const climb = calmTrace.filter((x) => x.mode === 'auto' && x.vz > 0.5 * AIRCRAFT.planeClimbRateMaxMs && Math.abs(x.bank) < 1);
+    const climb = calmTrace.filter((x) => x.mode === 'auto' && x.vz > 0.5 * AIRCRAFT.planeClimbRateMaxMs && Math.abs(x.bank - level) < 1);
     expect(climb.length).toBeGreaterThan(10);
     for (const x of climb) expect(x.pitch).toBeGreaterThan(2.5);
-    const turn = calmTrace.filter((x) => x.mode === 'auto' && Math.abs(x.bank) > 0.8 * AIRCRAFT.maxBankDeg);
+    const turn = calmTrace.filter((x) => x.mode === 'auto' && Math.abs(x.bank - level) > 0.8 * AIRCRAFT.maxBankDeg);
     expect(turn.length).toBeGreaterThan(10);
     for (const x of turn) expect(x.pitch - x.gamma).toBeGreaterThan(2);
   });

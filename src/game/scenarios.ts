@@ -11,7 +11,8 @@ import { followTerrain, terrainEndAltitudes } from '../sim/terrain';
 import type { AltitudeRef, LocationSpec, RoutePoint } from '../sim/profile';
 import type { Relay } from '../sim/radio';
 import type { GeoPoint, MissionPlan, PayloadLoad, Site, Terrain, Weather } from '../sim/types';
-import { windAt, windTriangle } from '../sim/wind';
+import { sunPosition } from '../sim/sun';
+import { stabilityShear, windAt, windTriangle } from '../sim/wind';
 import { activeRegion } from './regions';
 import { searchPattern, THERMAL_CAMERA, type AnimalWeights, type ThermalCamera } from './search';
 
@@ -40,6 +41,8 @@ export interface Settings {
   linkLossTimeoutS: number;
   /** Высота точек маршрута: над рельефом, над морем или от точки взлёта. */
   altitudeRef: AltitudeRef;
+  /** Курс захода на посадку, градусы; нет (null) — против ветра. */
+  approachDeg?: number | null;
 }
 
 export type ScenarioKind = 'transfer' | 'survey' | 'delivery' | 'route' | 'search' | 'fire';
@@ -54,8 +57,8 @@ interface ScenarioBase {
   /** Площадка взлёта; высота берётся из рельефа. */
   site: GeoPoint;
   siteName: string;
-  /** Показатель роста ветра с высотой для этой местности. */
-  shearExponent: number;
+  /** Показатель роста ветра с высотой; null — по устойчивости воздуха в час вылета (stabilityShear). */
+  shearExponent: number | null;
   cloudCover: number;
   /** Нижняя граница облаков над площадкой, м. */
   cloudBaseM: number;
@@ -151,7 +154,7 @@ export function buildScenarios(L: LocationSpec): Scenario[] {
     site: L.site,
     siteName: L.siteName,
     relays: L.relays ?? [],
-    shearExponent: 0.2,
+    shearExponent: null,
     cloudCover: 0.3,
     cloudBaseM: 1500,
     date: L.date,
@@ -289,7 +292,7 @@ export function forecastWeather(sc: Scenario, s: Settings): Weather {
   return {
     groundTemperatureC: s.temperatureC,
     wind: { speedMs: s.windSpeedMs, fromDeg: s.windFromDeg },
-    windProfile: { referenceHeightM: 10, shearExponent: sc.shearExponent },
+    windProfile: { referenceHeightM: 10, shearExponent: sc.shearExponent ?? stabilityShear(sunPosition(departure(sc, s), sc.site).elevationDeg, sc.cloudCover, s.windSpeedMs) },
     cloudCover: sc.cloudCover,
     cloudBaseM: sc.cloudBaseM,
     precipitation: null,
@@ -412,7 +415,7 @@ function routeStage(
   label: (leg: number, legs: number) => string,
   landingName: string,
 ): { plan: MissionPlan; proc: WindProcedures } {
-  const proc = windProcedures(from, to, windAt(weather, 10), points[0] ?? to, points[points.length - 1] ?? from);
+  const proc = windProcedures(from, to, windAt(weather, 10), points[0] ?? to, points[points.length - 1] ?? from, s.approachDeg ?? null);
   // Высота точек над морем или от взлёта — между точками прямая по высоте; к первой точке и от
   // последней — огибание рельефа до этой же высоты над ним.
   const absolute = s.altitudeRef !== 'agl';
@@ -512,7 +515,7 @@ function surveyMission(sc: SurveyScenario, s: Settings, terrain: Terrain, weathe
   const base = start || end ? planSurvey(sc.area, sc.site, camera, params, radius, { loops: { start, end } }) : draft;
 
   // Взлётный маршрут в начало, посадочный — в конец; номера участков съёмки сдвигаются на один.
-  const proc = windProcedures(site, site, windAt(weather, 10), base.firstLineStart, base.lastLineEnd);
+  const proc = windProcedures(site, site, windAt(weather, 10), base.firstLineStart, base.lastLineEnd, s.approachDeg ?? null);
   const n = base.route.length;
   const survey: SurveyPlan = {
     ...base,

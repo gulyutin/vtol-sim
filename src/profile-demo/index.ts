@@ -58,6 +58,8 @@ export const PROFILE: Profile = {
     figureOfMerit: 0.6932,
     auxPowerHoverW: 500,
 
+    cruiseTrim: { rollDeg: 1.5, slipDeg: -2.5 },
+
     transitionLowIasMs: 14,
     transitionHighIasMs: 18,
     cruiseIasMs: 22,

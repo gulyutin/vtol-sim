@@ -89,6 +89,8 @@ const ROTOR_LOSS_LIFT = 0.8;
 /** Реактивный момент без пары — вращение на висении, °/с. */
 const ROTOR_SPIN_DEG_S = 120;
 /** Сопротивление плашмя при вертикальном движении: CdA ≈ площадь крыла (пластина). */
+/** Постоянная времени, с которой перекос крейсера появляется и уходит на переходах. */
+const TRIM_TAU_S = 1.5;
 const VERTICAL_DRAG_AREA_M2 = AIRCRAFT.wingAreaM2 * 1.1;
 /** Посадка на брюхо: не круче этой вертикальной и не быстрее этой путевой, м/с; крен — меньше. */
 const BELLY_SINK_MS = 1.5;
@@ -499,6 +501,8 @@ export interface FlightSetup {
   origin?: Site;
   /** Куда уходить по команде ВОЗВРАТ; по умолчанию — площадка посадки этого полёта. */
   home?: Site;
+  /** Курс захода на посадку дома по ВОЗВРАТУ, градусы; нет — против фактического ветра. */
+  homeApproachDeg?: number;
   /** Время и израсходованная энергия к началу полёта — для второго полёта на той же батарее. */
   startT?: number;
   initialEnergyWh?: number;
@@ -538,6 +542,7 @@ export class LiveFlight {
   rcRangeM = RC_RANGE_M;
   private readonly site: Site;
   private readonly homeSite: Site;
+  private readonly homeApproachDeg: number | null;
   private readonly mass: number;
   private readonly payloadW: number;
   private readonly terrain: Terrain;
@@ -571,6 +576,10 @@ export class LiveFlight {
   private prevAlong = NaN;
   /** Добавки порывов к крену и вертикальной на прошлом шаге — регуляторы их не видят. */
   private bankGust = 0;
+  /** Доля постоянного перекоса крейсера (AIRCRAFT.cruiseTrim) и что из него сейчас добавлено к крену и курсу. */
+  private trimK = 0;
+  private trimRoll = 0;
+  private trimYaw = 0;
   private vzGust = 0;
   /** Путевая скорость по перемещению за прошлый шаг. */
   private lastVel = { e: 0, n: 0 };
@@ -678,6 +687,7 @@ export class LiveFlight {
     this.site = setup.origin ?? plan.takeoff;
     if (setup.linkLoss) this.linkLoss = { ...setup.linkLoss };
     this.homeSite = setup.home ?? plan.landing;
+    this.homeApproachDeg = setup.homeApproachDeg ?? null;
     this.terrain = setup.terrain;
     this.weather = setup.weather;
     this.mass = takeoffMassKg(plan.payload?.massKg ?? 0);
@@ -1423,13 +1433,13 @@ export class LiveFlight {
 
   /**
    * ВОЗВРАТ: посадочный маршрут к дому строится по фактическому ветру (как у автопилота; с полем
-   * рельефа — по ветру, измеренному у борта). Сразу — высоты, нужные на пути над рельефом.
+   * рельефа — по ветру, измеренному у борта) или по заданному курсу захода. Сразу — высоты, нужные на пути над рельефом.
    */
   private startRtl() {
     const p = this.navPos();
     const wind10 = this.lw ? this.windNow() : windAt(this.weather, 10);
     const here = fromLocal(this.site, p.east, p.north);
-    const proc = windProcedures(this.homeSite, this.homeSite, wind10, null, here);
+    const proc = windProcedures(this.homeSite, this.homeSite, wind10, null, here, this.homeApproachDeg);
     this.rtlApproach = proc.approach.map((q) => this.local(q, 0));
     this.rtlStage = 0;
     this.hoverHeadingDeg = proc.landingHeadingDeg;
@@ -1945,6 +1955,10 @@ export class LiveFlight {
     s.vzMs -= this.vzGust;
     this.bankGust = 0;
     this.vzGust = 0;
+    // И перекос крейсера: регуляторы и путь считаются по потоку, нос и крен — поверх.
+    const trim = AIRCRAFT.cruiseTrim;
+    s.bankDeg -= this.trimRoll;
+    s.headingDeg = norm360(s.headingDeg - this.trimYaw);
     const e0 = s.east;
     const n0 = s.north;
     const psi0 = s.headingDeg;
@@ -2118,6 +2132,15 @@ export class LiveFlight {
     // Вне висения скорость рыскания — какая вышла: с неё начнётся разворот на роторах.
     if (!this.yawOn) this.yawRate = wrap180(s.headingDeg - psi0) / h;
     if (s.mode !== 'crashed') this.attitude(h, rho);
+    if (trim) {
+      // На крыле с работающим маршевым — полностью, на переходах — по доле веса на крыле; плавно.
+      const on = s.mode !== 'crashed' && s.mode !== 'falling' && s.pusher > 0 ? this.wingShare() : 0;
+      this.trimK += (on - this.trimK) * (1 - Math.exp(-h / TRIM_TAU_S));
+      this.trimRoll = this.trimK * trim.rollDeg;
+      this.trimYaw = this.trimK * trim.slipDeg;
+      s.bankDeg += this.trimRoll;
+      s.headingDeg = norm360(s.headingDeg + this.trimYaw);
+    }
   }
 
   /** Ручки ПДУ доходят до борта только в зоне действия пульта. */

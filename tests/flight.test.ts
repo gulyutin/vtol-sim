@@ -32,7 +32,8 @@ describe('живой полёт', () => {
     expect(Math.abs(f.state.energyWh / planned.budget.totalWh - 1)).toBeLessThan(0.04);
     expect(Math.abs(f.state.t / planned.durationS - 1)).toBeLessThan(0.05);
     expect(Math.hypot(f.state.east - f.home.east, f.state.north - f.home.north)).toBeLessThan(5);
-    expect(maxBank).toBeLessThanOrEqual(AIRCRAFT.maxBankDeg + 1e-9);
+    // Автопилот кренит не больше предельного; постоянный перекос планера — сверху.
+    expect(maxBank).toBeLessThanOrEqual(AIRCRAFT.maxBankDeg + Math.abs(AIRCRAFT.cruiseTrim?.rollDeg ?? 0) + 1e-9);
   });
 
   it('ВОЗВРАТ с середины задания приводит на площадку', () => {

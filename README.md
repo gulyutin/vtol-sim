@@ -19,7 +19,7 @@ Regions with different terrain are selected in the top bar: Moscow region (Oka v
 
 The flight procedure follows a real aircraft: optional pre-flight checks (power — the navigation lights come on after it; the data link; servo checks — the ailerons and V-tail surfaces move on the model; air data — blowing into the pitot tube shows in telemetry; lift rotor controllers, lights and the pusher motor), then ARM and takeoff; after touchdown — DISARM. DISARM in flight is possible too: the motors stop and the aircraft glides or falls, which is how a failure is practised.
 
-Takeoff and landing are into the wind: a departure leg with acceleration, a three-point final approach, braking with the pusher off and a descent in copter mode. Pre-flight checks cover wind, temperature, cloud base, mass and line of sight to the GCS.
+Takeoff and landing are into the wind: a departure leg with acceleration, a three-point final approach, braking with the pusher off and a descent in copter mode. The landing approach course can also be set by hand when the site can only be approached from one side; the pre-flight checks then show the tailwind and crosswind on that course, and RETURN lands home on the same course. Pre-flight checks cover wind, temperature, cloud base, mass and line of sight to the GCS.
 
 ## Trainer
 
@@ -35,7 +35,7 @@ Takeoff and landing are into the wind: a departure leg with acceleration, a thre
 
 ## Autopilot and physics
 
-Wing polar with induced drag in turns, hover from momentum theory, climb and descent limited by vertical speed, wind with height shear and the wind triangle, terrain following, battery capacity by temperature. The planner and the live flight share the same physics, so in-flight consumption matches the plan.
+Wing polar with induced drag in turns, hover from momentum theory, climb and descent limited by vertical speed, wind with height shear that depends on air stability (weak on a sunny afternoon, strong on a clear calm night) and the wind triangle, terrain following, battery capacity by temperature. The planner and the live flight share the same physics, so in-flight consumption matches the plan. In a crosswind the aircraft crabs: the nose turns into the wind by the drift angle and the wings stay level, as an autopilot flies it; on top of that the airframe has a small constant asymmetry (a slight bank with the nose a little off the airflow) that is there in calm air too. The pre-flight checks show the wind at flight height and the largest crab angle it gives.
 
 The route planner follows the terrain along the route. If the slope beyond the takeoff site is steeper than the aircraft can climb along the way, the plan adds climb orbits over the site (and descent orbits before landing) instead of cutting through the slope; the orbits show on the map and count in the energy budget. In flight, if a downdraft still leaves the aircraft short of height before a slope, it climbs in an orbit and then continues the route.
 

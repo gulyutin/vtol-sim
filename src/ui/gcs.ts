@@ -279,6 +279,7 @@ const FORMAT: Record<NumKey, (v: number) => string> = {
   iasMs: (v) => `${fmt(v, 1)} м/с`,
   windSpeedMs: (v) => `${fmt(v, 1)} м/с`,
   windFromDeg: (v) => `${v}° · ${COMPASS[Math.round(v / 45) % 8]}`,
+  approachDeg: (v) => `${v}° · на ${COMPASS[Math.round(v / 45) % 8]}`,
   temperatureC: (v) => `${v > 0 ? '+' : ''}${v} °C`,
   localHour: (v) => `${Math.floor(v)}:${String(Math.round((v % 1) * 60)).padStart(2, '0')}`,
 };
@@ -884,9 +885,20 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       if (k === 'cameraId') s.cameraId = i.value;
       else if (k === 'linkLossAction') s.linkLossAction = i.value as LinkLossAction;
       else if (k === 'altitudeRef') s.altitudeRef = i.value as AltitudeRef;
+      else if (k === 'approachDeg') s.approachDeg = approachIntoWind() ? null : +i.value;
       else (s as Record<string, number | string>)[k] = +i.value;
     });
     return s;
+  };
+  // Курс захода: галочка «против ветра» — ползунок следует за ветром и не трогается.
+  const approachIntoWind = () => taskBody.querySelector<HTMLInputElement>('[data-a="approach-wind"]')?.checked ?? true;
+  const syncApproach = () => {
+    const range = taskBody.querySelector<HTMLInputElement>('[data-k="approachDeg"]');
+    if (!range) return;
+    range.disabled = locked || approachIntoWind();
+    if (!approachIntoWind()) return;
+    range.value = taskBody.querySelector<HTMLInputElement>('[data-k="windFromDeg"]')?.value ?? range.value;
+    taskBody.querySelector<HTMLOutputElement>('[data-o="approachDeg"]')!.textContent = FORMAT.approachDeg(+range.value);
   };
   let pending = 0;
   const bindSettings = () => {
@@ -894,6 +906,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       input.addEventListener('input', () => {
         const k = input.dataset.k as keyof Settings;
         if (k in FORMAT) taskBody.querySelector<HTMLOutputElement>(`[data-o="${k}"]`)!.textContent = FORMAT[k as NumKey](+input.value);
+        if (k === 'windFromDeg') syncApproach();
         // Пересчёт тяжёлый — не чаще раза в 150 мс.
         window.clearTimeout(pending);
         pending = window.setTimeout(() => {
@@ -902,6 +915,13 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         }, 150);
       }),
     );
+    const approach = taskBody.querySelector<HTMLInputElement>('[data-a="approach-wind"]')!;
+    approach.addEventListener('change', () => {
+      syncApproach();
+      current = read();
+      h.onSettings(current);
+    });
+    syncApproach();
     const err = taskBody.querySelector<HTMLInputElement>('[data-a="error"]')!;
     err.addEventListener('change', () => h.onForecastError(err.checked));
     const diff = taskBody.querySelector<HTMLSelectElement>('[data-a="diff"]')!;
@@ -975,6 +995,11 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
         <details open><summary>Полёт</summary>
           ${range('iasMs', 'Скорость (приборная)', 15, 28, 0.5, s.iasMs)}
           ${range('localHour', 'Время вылета (местное)', 5, 21, 0.25, s.localHour)}
+        </details>
+        <details ${s.approachDeg == null ? '' : 'open'}><summary>Заход на посадку</summary>
+          <label class="check"><input type="checkbox" data-a="approach-wind" ${s.approachDeg == null ? 'checked' : ''}> Против ветра</label>
+          ${range('approachDeg', 'Курс захода', 0, 355, 5, s.approachDeg ?? s.windFromDeg)}
+          <p class="hint">По РЛЭ заход — против ветра. Если к площадке можно подойти только с одной стороны (лес, склон, строения), снимите галочку и задайте курс на посадочной прямой: две точки посадочного маршрута встанут по нему. Попутный и боковой ветер на этом курсе покажут проверки. Возврат садится дома тем же курсом.</p>
         </details>
         <details><summary>Потеря связи</summary>
           <label class="select"><span>Без связи</span><select data-k="linkLossAction">
@@ -1152,7 +1177,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     lockPlanning(on, keepRoute = false) {
       locked = on;
       keepRouteOpen = keepRoute;
-      taskBody.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>('[data-k], [data-a="error"], [data-a="day"], [data-a="wsrc"], [data-a="diff"]').forEach((i) => (i.disabled = on));
+      taskBody.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>('[data-k], [data-a="error"], [data-a="day"], [data-a="wsrc"], [data-a="diff"], [data-a="approach-wind"]').forEach((i) => (i.disabled = on));
+      syncApproach();
       taskBody.querySelectorAll<HTMLInputElement | HTMLButtonElement>('[data-rh], [data-rdel], [data-a="route-clear"]').forEach((i) => (i.disabled = on && !keepRoute));
       scen.disabled = on;
       regionSel.disabled = on;
