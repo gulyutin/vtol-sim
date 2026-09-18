@@ -596,23 +596,22 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     return placeOsm(
       { site: siteA, bounds: loc.region, track: [loc.site, ...(loc.search?.area ?? []), ...(loc.fire?.area ?? []), ...loc.route.route, loc.transfer.destination] },
       {
-        // Прогресс приходит, только когда собираем заново; из кэша — сразу готово.
-        onProgress: (done, total, label) => {
+        // Прогресс приходит, только когда собираем заново; из кэша — сразу готово. Без всплывающего
+        // окна — одной строкой в консоли: сборка идёт в фоне и летать не мешает.
+        onProgress: () => {
+          if (building) return;
           building = true;
-          gcs.toast(`<b>Дома, лес, дороги и вода ${what}</b>Собираю из OpenStreetMap: запрос ${Math.min(total, done + 1)} из ${total} (${label}). Сервер отвечает не сразу — это один раз для места, дальше из памяти браузера.`, 'good');
+          gcs.log(0, `Дома, лес, дороги и вода ${what} собираются из OpenStreetMap в фоне — один раз для места, дальше из памяти браузера`);
         },
       },
     )
       .then((buf) => {
         world.setOsm(parseOsm(buf));
-        if (building) {
-          gcs.hideToast();
-          gcs.log(0, `Дома, лес, дороги и вода ${what} загружены из OpenStreetMap`);
-        }
+        if (building) gcs.log(0, `Дома, лес, дороги и вода ${what} загружены из OpenStreetMap`);
       })
       .catch((e: unknown) => {
         console.warn(`Дома и лес ${what} не собрались:`, e);
-        if (building) gcs.toast(`<b>Дома и лес не загрузились</b>${e instanceof Error ? e.message : String(e)}. Снимки и рельеф — на месте; при следующем открытии попробую снова.`, 'warn');
+        if (building) gcs.log(0, `Дома и лес не загрузились: ${e instanceof Error ? e.message : String(e)}. Снимки и рельеф — на месте; при следующем открытии попробую снова`, 'warn');
       });
   }
 
