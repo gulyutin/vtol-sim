@@ -70,6 +70,8 @@ export interface GcsHandlers {
   /** Речевые сообщения НСУ: вкл/выкл. */
   onVoice?(on: boolean): void;
   /** Выбран голос из списка; «Прослушать» — пробная фраза. */
+  /** Кнопка «Пульт»: показать или спрятать пульт; вернуть — показан ли. */
+  onSticks?(): boolean;
   onVoicePick?(uri: string): void;
   onVoicePreview?(): void;
 }
@@ -209,6 +211,7 @@ const ICON: Record<string, string> = {
   takeoff: '<path d="M12 20V5M6 11l6-6 6 6"/>',
   mode: '<path d="M5 3v18M12 3v18M19 3v18"/><circle cx="5" cy="9" r="2.2"/><circle cx="12" cy="15" r="2.2"/><circle cx="19" cy="7" r="2.2"/>',
   emergency: '<path d="M12 3 22 21H2Z"/><path d="M12 10v5M12 18v.5"/>',
+  sticks: '<rect x="2" y="6" width="20" height="12" rx="4"/><circle cx="8" cy="12" r="2"/><circle cx="16" cy="12" r="2"/>',
   arm: '<path d="M12 3v8"/><path d="M6.8 6.8a7.5 7.5 0 1 0 10.4 0"/>',
   debrief: '<path d="M4 20V4M4 20h16"/><path d="M7 15l4-5 3 3 5-7"/>',
   instructor: '<circle cx="12" cy="7" r="3.2"/><path d="M5 20c1.2-4 3.8-6 7-6s5.8 2 7 6"/><path d="M12 14l-1.5 3 1.5 3 1.5-3z"/>',
@@ -414,6 +417,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           button('takeoff', 'Взлёт', icon('takeoff')),
           button('mode', 'Режим', icon('mode'), 'title="Режим полёта"'),
           button('emergency', 'Аварийная', icon('emergency'), 'title="Возврат, посадка, фэйлсейф"'),
+          button('sticks', 'Пульт', icon('sticks'), 'title="Пульт ДУ: показать ручки (экранные, пульт по USB, клавиатура); управление с пульта — в ФЭЙЛСЕЙФе"'),
           button('unload', 'Разгрузка', icon('unload'), 'hidden'),
         )}
         ${group(
@@ -529,20 +533,36 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     const a = area();
     moveTo(w, clamp(x, a.l + GAP, a.r - GAP - w.offsetWidth), clamp(y, a.t + GAP, a.b - GAP - w.offsetHeight));
   };
-  // Окно выросло (загрузилось задание, пришла телеметрия) — не дать ему уйти за нижний край.
+  // Окно выросло (загрузилось задание, пришла телеметрия). Не сдвинутое оператором — поставить заново
+  // по настоящему размеру, если только что открыто или теперь налезает на другое окно; иначе — не
+  // дать ему уйти за нижний край.
+  const overlapsOther = (w: HTMLElement) => {
+    const b = boxOf(w);
+    return openWins().some((o) => {
+      if (o === w) return false;
+      const c = boxOf(o);
+      return Math.min(b.r, c.r) - Math.max(b.l, c.l) > 4 && Math.min(b.b, c.b) - Math.max(b.t, c.t) > 4;
+    });
+  };
   const grown = new ResizeObserver((entries) => {
     const a = area();
     for (const { target } of entries) {
       const w = target as HTMLElement;
+      if (w.hidden) continue;
       const b = boxOf(w);
-      if (!w.hidden && b.b > a.b - GAP) keepIn(w, b.l, b.t);
+      const changed = Math.abs(b.b - b.t - +(w.dataset.placedH ?? 0)) > 12;
+      const fresh = Date.now() - +(w.dataset.openedAt ?? 0) < 2000;
+      if (!w.dataset.moved && changed && (fresh || overlapsOther(w))) place(w);
+      else if (b.b > a.b - GAP) keepIn(w, b.l, b.t);
     }
   });
   el.querySelectorAll('.win').forEach((w) => grown.observe(w));
   const place = (w: HTMLElement) => {
+    // Окно не выше экрана под верхней строкой: длинное — с прокруткой внутри.
+    const a = area();
+    w.style.maxHeight = `${Math.round(a.b - a.t - 2 * GAP)}px`;
     const r = boxOf(w);
     if (w.dataset.moved) return keepIn(w, r.l, r.t);
-    const a = area();
     const wd = r.r - r.l;
     const ht = r.b - r.t;
     // Желаемое место — напротив своей кнопки: справа от левой колонки, слева от правой.
@@ -558,9 +578,10 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     }
     px = clamp(px, a.l + GAP, a.r - GAP - wd);
     py = clamp(py, a.t + GAP, a.b - GAP - ht);
-    const busy = [...root.querySelectorAll<HTMLElement>('.win, .grp, .view-pane .camera')]
-      .filter((x) => x !== w && x.offsetParent !== null)
-      .map((x) => ({ ...boxOf(x), k: x.classList.contains('win') ? 1 : 4 }));
+    // Занято: окна, кнопки, кнопки и окна поверх 3D-вида; сам 3D-вид — чуть дороже карты.
+    const busy = [...root.querySelectorAll<HTMLElement>('.win, .grp, .view-pane .camera, .gimbal-btn, .smoke-btn, .pip, .rc-sticks, .view-pane')]
+      .filter((x) => x !== w && x.offsetParent !== null && !x.hidden)
+      .map((x) => ({ ...boxOf(x), k: x.classList.contains('view-pane') ? 0.05 : x.classList.contains('win') ? 1 : 4 }));
     // Цена места: сколько закрыто (кнопки — вчетверо дороже окон), затем — удалённость от желаемого.
     const cost = (x: number, y: number) => {
       let s = 0;
@@ -584,6 +605,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           }
         }
     moveTo(w, ...best);
+    w.dataset.placedH = String(ht);
   };
   /** Окно поверх остальных; порядок — через z-index, чтобы не сбрасывать прокрутку. */
   const front = (w: HTMLElement) => {
@@ -605,6 +627,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     w.hidden = show === undefined ? !w.hidden : !show;
     el.querySelector(`.gbtn[data-a="${id}"]`)?.classList.toggle('open', !w.hidden);
     if (!w.hidden) {
+      w.dataset.openedAt = String(Date.now());
       front(w);
       place(w);
     } else if (id === 'zones') {
@@ -670,6 +693,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       else if (a === 'mode' || a === 'emergency' || a === 'settings') openMenu(a, b);
       else if (a === 'packs') h.onPacks?.();
       else if (a === 'forecast') h.onForecast?.();
+      else if (a === 'sticks') b.classList.toggle('open', h.onSticks?.() ?? false);
       else if (a === 'reach') {
         reach = !reach;
         b.classList.toggle('on', reach);

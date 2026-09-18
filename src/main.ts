@@ -380,6 +380,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       replan();
     },
     onCommand: command,
+    onSticks: () => rc.toggleShown(),
     onControls(c) {
       controls = { ...controls, ...c };
     },
@@ -605,7 +606,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       renderBatteries(true);
     },
   });
-  document.querySelector('.gbtn[data-a="batteries"]')?.addEventListener('click', () => setTimeout(() => renderBatteries(true)));
+  document.querySelector('.gbtn[data-a="batteries"]')?.addEventListener('click', () => renderBatteries(true));
   // Камера на подвесе: в поиске и патруле — тепловизор, в перелёте, облёте и доставке — дневная по кнопке.
   const pipEl = gcs.viewEl.parentElement!.querySelector<HTMLElement>('.pip')!;
   const gimbal = new Gimbal();
@@ -868,6 +869,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     checks = preflightChecks({ stages: mission.stages, weather: forecast, procedures: mission.procedures, cloudBaseM: scenario.cloudBaseM, terrain, gcs: siteA, zones, relays, terrainWind: windForecast ?? undefined });
     checks.push(...batteryChecks());
     gcs.showPreflight(checks);
+    renderBatteries(true);
     drawWind();
     drawReachPlan();
 
@@ -1948,8 +1950,9 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     const now = performance.now();
     if (!force && now - batteryUiAt < 1000) return;
     batteryUiAt = now;
+    // Закрытое окно тоже заполнено: при открытии у него сразу настоящий размер и место.
     const panel = document.querySelector<HTMLElement>('.win[data-win="batteries"]');
-    if (panel && !panel.hidden) batPanel.render(park, canSwap(), actual.groundTemperatureC);
+    if (panel && (force || !panel.hidden)) batPanel.render(park, canSwap(), actual.groundTemperatureC);
   }
 
   /** Время на земле: зарядка, температура; план — заново, если АКБ на аппарате заметно изменилась. */

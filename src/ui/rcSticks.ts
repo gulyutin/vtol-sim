@@ -4,8 +4,8 @@ import type { Stick } from '../sim/flight';
  * Экранный пульт: два стика по «моде 2» — левый: газ (вверх — набор или быстрее) и курс,
  * правый: тангаж (вверх — ручка от себя) и крен. Стик тянут мышью (или пальцем); отпущенный —
  * возвращается в центр. Когда стики не держат, пульт показывает, куда их отклоняют клавиатура
- * или геймпад. Работает только в ФЭЙЛСЕЙФе — ручном управлении с пульта. Кнопка «Пульт» на
- * 3D-виде показывает пульт и вне ФЭЙЛСЕЙФа — проверить, как ходят ручки подключённого пульта, и
+ * или геймпад. Работает только в ФЭЙЛСЕЙФе — ручном управлении с пульта. Кнопка «Пульт» в группе
+ * «Полёт» показывает пульт и вне ФЭЙЛСЕЙФа — проверить, как ходят ручки подключённого пульта, и
  * одной кнопкой взять управление.
  */
 
@@ -33,20 +33,10 @@ export class RcSticks {
   readonly el: HTMLElement;
   private readonly knobs: Record<Side, HTMLElement>;
   private readonly held: Record<Side, { x: number; y: number } | null> = { left: null, right: null };
-  private readonly launcher: HTMLButtonElement;
-  /** Пульт показан кнопкой «Пульт» (не только в ФЭЙЛСЕЙФе). */
+  /** Пульт показан кнопкой «Пульт» на панели (не только в ФЭЙЛСЕЙФе). */
   userShown = false;
 
   constructor(parent: HTMLElement, h: RcSticksHandlers) {
-    this.launcher = document.createElement('button');
-    this.launcher.className = 'gimbal-btn rc-btn';
-    this.launcher.textContent = '🎮 Пульт';
-    this.launcher.title = 'Показать пульт: экранные ручки и пульт по USB; управление с пульта — в ФЭЙЛСЕЙФе';
-    this.launcher.addEventListener('click', () => {
-      this.userShown = !this.userShown;
-      this.launcher.classList.toggle('on', this.userShown);
-    });
-    parent.appendChild(this.launcher);
     this.el = document.createElement('div');
     this.el.className = 'rc-sticks';
     this.el.hidden = true;
@@ -82,6 +72,12 @@ export class RcSticks {
       p.addEventListener('pointerup', release);
       p.addEventListener('pointercancel', release);
     }
+  }
+
+  /** Кнопка «Пульт»: показать или спрятать. */
+  toggleShown(): boolean {
+    this.userShown = !this.userShown;
+    return this.userShown;
   }
 
   /**
