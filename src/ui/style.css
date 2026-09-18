@@ -1993,3 +1993,62 @@ ul.log li.good {
   opacity: 0.45;
   cursor: default;
 }
+
+/* Окно «Аккумуляторы» (batteryPanel.ts). */
+.bat-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.bat-table td {
+  padding: 4px 4px;
+  border-bottom: 1px solid #e3e6ea;
+  vertical-align: top;
+}
+
+.bat-table tr.aircraft td:first-child b {
+  color: var(--accent);
+}
+
+.bat-table small {
+  color: var(--muted);
+}
+
+.bat-bar {
+  display: block;
+  width: 90px;
+  height: 9px;
+  margin: 2px 0;
+  border-radius: 3px;
+  background: #d9dde2;
+  overflow: hidden;
+}
+
+.bat-bar i {
+  display: block;
+  height: 100%;
+  background: var(--good);
+}
+
+.bat-bar.mid i {
+  background: var(--warn);
+}
+
+.bat-bar.low i {
+  background: var(--bad);
+}
+
+.bat-bar.charging i {
+  background-image: repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.35) 0 4px, transparent 4px 8px);
+}
+
+.bat-act {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.bat-act button {
+  display: block;
+  margin: 0 0 3px auto;
+}

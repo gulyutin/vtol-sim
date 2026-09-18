@@ -39,6 +39,8 @@ import { VideoLink, VideoOsd, type OsdData, type VideoLinkState } from './ui/vid
 import { buildOrthophoto } from './ui/orthophoto';
 import { RcSetup } from './ui/rcSetup';
 import { flightRemarks } from './game/remarks';
+import { afterFlight, capacityWh as batteryCapacityOf, install as installBattery, installed, loadPark, savePark, tickPark, toggleCharger } from './game/batteries';
+import { BatteryPanel } from './ui/batteryPanel';
 import { backTransitionAltitudeM, combineResults, distanceM, fromLocal, simulateMission, toLocal, transitionAltitudeM } from './sim/mission';
 import { sunPosition } from './sim/sun';
 import { TerrainRelief, TerrainWind } from './sim/terrainWind';
@@ -138,6 +140,14 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   let daySeed = 1;
   let forecast!: Weather;
   let actual!: Weather;
+  // Аккумуляторы расчёта (batteries.ts): на аппарате, на зарядке, в машине; хранятся в браузере.
+  const park = loadPark(settings.temperatureC);
+  /** Батарея для плана (сейчас на аппарате) и для этого полёта (на взлёте): ёмкость и израсходованное до взлёта. */
+  let planBattery = { capacityWh: 0, startWh: 0 };
+  let flightBattery = { capacityWh: 0, startWh: 0 };
+  let batteryAccounted = true;
+  let batteryUiAt = 0;
+  let batterySavedAt = 0;
   // Погода, которая меняется в полёте (weatherEvent.ts): что уже сообщено и когда обновляли вид.
   let wxEvent: WeatherEvent | null = null;
   const wxNotes = new Set<string>();
@@ -558,6 +568,44 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     onSetup: () => document.querySelector<HTMLButtonElement>('[data-a="rc"]')?.click(),
   });
   new RcSetup(document.querySelector<HTMLElement>('.rc-setup')!, pilot);
+  // Аккумуляторы: поставить на аппарат, на зарядку, ждать — только на земле без АРМ.
+  const batPanel = new BatteryPanel(document.querySelector<HTMLElement>('.bat-panel')!, {
+    onInstall(id) {
+      if (!canSwap()) return gcs.log(flight.state.t, 'АКБ меняют на земле без АРМ', 'warn');
+      accountBattery();
+      installBattery(park, id);
+      savePark(park);
+      const b = installed(park)!;
+      gcs.log(flight.state.t, `На аппарате ${b.name}: заряд ${Math.round(b.soc * 100)} %, ${Math.round(b.tempC)} °C`);
+      if (!started) {
+        replan();
+        resetFlight();
+      }
+      renderBatteries(true);
+    },
+    onCharger(id) {
+      toggleCharger(park, id);
+      savePark(park);
+      renderBatteries(true);
+    },
+    onWarm(on) {
+      park.warmStore = on;
+      savePark(park);
+      renderBatteries(true);
+    },
+    onWait() {
+      if (!canSwap()) return;
+      tickPark(park, 900, actual.groundTemperatureC, true);
+      savePark(park);
+      settings = { ...settings, localHour: Math.min(23.75, settings.localHour + 0.25) };
+      gcs.loadScenario(scenario, settings, forecastError);
+      gcs.log(flight.state.t, `Прошло 15 мин: вылет в ${Math.floor(settings.localHour)}:${String(Math.round((settings.localHour % 1) * 60)).padStart(2, '0')}`);
+      replan();
+      if (!started) resetFlight();
+      renderBatteries(true);
+    },
+  });
+  document.querySelector('.gbtn[data-a="batteries"]')?.addEventListener('click', () => setTimeout(() => renderBatteries(true)));
   // Камера на подвесе: в поиске и патруле — тепловизор, в перелёте, облёте и доставке — дневная по кнопке.
   const pipEl = gcs.viewEl.parentElement!.querySelector<HTMLElement>('.pip')!;
   const gimbal = new Gimbal();
@@ -813,9 +861,12 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       gcs.log(0, e instanceof Error ? e.message : String(e), 'bad');
       return;
     }
-    parts = mission.stages.map((p) => simulateMission(p, forecast));
+    const bat = batteryPlan();
+    planBattery = bat;
+    parts = mission.stages.map((p) => simulateMission(p, forecast, { battery: bat }));
     planned = combineResults(parts, groundS());
     checks = preflightChecks({ stages: mission.stages, weather: forecast, procedures: mission.procedures, cloudBaseM: scenario.cloudBaseM, terrain, gcs: siteA, zones, relays, terrainWind: windForecast ?? undefined });
+    checks.push(...batteryChecks());
     gcs.showPreflight(checks);
     drawWind();
     drawReachPlan();
@@ -862,7 +913,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       gcs.log(flight.state.t, e instanceof Error ? e.message : String(e), 'bad');
       return;
     }
-    parts = mission.stages.map((p) => simulateMission(p, forecast));
+    parts = mission.stages.map((p) => simulateMission(p, forecast, { battery: flightBattery }));
     planned = combineResults(parts, groundS());
     drawPlan();
     flight.replacePlan(mission.stages[stage]!);
@@ -971,6 +1022,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       weather: actual,
       origin: siteA,
       home: siteA,
+      capacityWh: flightBattery.capacityWh,
       ...(wxEvent ? { weatherEvent: wxEvent } : {}),
       // Заданный курс захода — и для ВОЗВРАТА, если задание и так садится дома.
       ...(settings.approachDeg != null && distanceM(mission.stages[mission.stages.length - 1]!.landing, siteA) < 50 ? { homeApproachDeg: settings.approachDeg } : {}),
@@ -1105,7 +1157,11 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     wxKey = '';
     wxAt = 0;
     map.setWeatherHazard(null);
-    startStage(0, 0, 0);
+    // АКБ на аппарате: прошлый полёт — в её заряд и циклы; этот — с её ёмкостью и зарядом.
+    accountBattery();
+    flightBattery = batteryPlan();
+    batteryAccounted = false;
+    startStage(0, 0, flightBattery.startWh);
     controls = {
       iasMs: settings.iasMs,
       heightAglM: mission.survey ? Math.round(mission.survey.heightAglM / 5) * 5 : 150,
@@ -1518,6 +1574,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     const stick = manual ? shown : null;
     controls = { ...controls, stick };
     if (!paused) {
+      batteryTick(dt * (manual ? 1 : rate));
       flight.step(dt * (manual ? 1 : rate), controls, (st) => {
         if (!trigger) return;
         const f = trigger.offer(
@@ -1563,6 +1620,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       endT ??= s.t;
       if (s.mode === 'crashed' || !s.armed || s.t - endT > 60) {
         assessed = true;
+        accountBattery();
         showAssessment();
       }
     }
@@ -1843,6 +1901,72 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
         );
       if (a.distanceM > 0 && a.distanceM <= 5000) note('5', `Метео: гроза в ${km(a.distanceM)} км на ${where}${a.etaS !== null ? `, выйдет на борт через ~${min(a.etaS)} мин` : ''}`, 'warn');
       if (a.distanceM === 0) note('in', 'Метео: борт в зоне грозы — сильная болтанка, порывы от ячейки, под ядром ливень и нисходящий поток до 6 м/с', 'bad');
+    }
+  }
+
+  /** Установленная АКБ для расчёта: доступная ёмкость при её температуре и износе, израсходованное до взлёта. */
+  function batteryPlan(): { capacityWh: number; startWh: number } {
+    const b = installed(park);
+    if (!b) return { capacityWh: 0, startWh: 0 };
+    const cap = batteryCapacityOf(b);
+    return { capacityWh: cap, startWh: cap * (1 - b.soc) };
+  }
+
+  /** Предполётные проверки установленной АКБ: заряд, температура, износ. */
+  function batteryChecks(): Check[] {
+    const b = installed(park);
+    if (!b) return [{ ok: false, level: 'block', text: 'АКБ не установлена' }];
+    const out: Check[] = [];
+    const pct = Math.round(b.soc * 100);
+    if (b.soc < 0.3) out.push({ ok: false, level: 'block', text: `${b.name}: заряд ${pct} % — сменить АКБ (окно «АКБ»)` });
+    else if (b.soc < 0.97) out.push({ ok: false, level: 'warn', text: `${b.name}: заряд ${pct} % — не полная, расчёт энергии — от этого заряда` });
+    else out.push({ ok: true, level: 'warn', text: `${b.name}: заряд ${pct} %, ${Math.round(batteryCapacityOf(b))} Вт·ч при ${Math.round(b.tempC)} °C` });
+    if (b.tempC < 5) out.push({ ok: false, level: 'warn', text: `${b.name} холодная (${Math.round(b.tempC)} °C): ёмкость ниже — держите запасные в тепле и ставьте перед самым вылетом` });
+    if (b.health < 0.85) out.push({ ok: false, level: 'warn', text: `${b.name} изношена: ${Math.round(b.health * 100)} % ёмкости, ${Math.round(b.cycles)} циклов` });
+    return out;
+  }
+
+  /** Итог полёта — в АКБ на аппарате (один раз на попытку). */
+  function accountBattery() {
+    if (batteryAccounted || !flight) return;
+    batteryAccounted = true;
+    const s = flight.state;
+    const used = s.energyWh - flightBattery.startWh;
+    if (used <= 1) return;
+    afterFlight(park, used, flightBattery.capacityWh, started ? Math.max(0, s.t - takeoffT) : 0, s.mode === 'crashed');
+    savePark(park);
+    renderBatteries(true);
+  }
+
+  /** АКБ можно менять и ждать: аппарат на земле без АРМ. */
+  function canSwap(): boolean {
+    const s = flight?.state;
+    return !s || (!s.armed && (s.mode === 'ground' || s.mode === 'landed' || s.mode === 'crashed'));
+  }
+
+  function renderBatteries(force = false) {
+    const now = performance.now();
+    if (!force && now - batteryUiAt < 1000) return;
+    batteryUiAt = now;
+    const panel = document.querySelector<HTMLElement>('.win[data-win="batteries"]');
+    if (panel && !panel.hidden) batPanel.render(park, canSwap(), actual.groundTemperatureC);
+  }
+
+  /** Время на земле: зарядка, температура; план — заново, если АКБ на аппарате заметно изменилась. */
+  function batteryTick(dtS: number) {
+    const s = flight.state;
+    tickPark(park, dtS, actual.groundTemperatureC, s.mode === 'ground' || s.mode === 'landed');
+    renderBatteries();
+    if (performance.now() - batterySavedAt > 10_000) {
+      batterySavedAt = performance.now();
+      savePark(park);
+    }
+    if (!started && !s.armed && planBattery.capacityWh > 0) {
+      const now = batteryPlan();
+      if (Math.abs(now.capacityWh - planBattery.capacityWh) > 0.015 * planBattery.capacityWh || Math.abs(now.startWh - planBattery.startWh) > 0.01 * now.capacityWh) {
+        replan();
+        resetFlight();
+      }
     }
   }
 

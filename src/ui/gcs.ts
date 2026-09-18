@@ -223,6 +223,7 @@ const ICON: Record<string, string> = {
   terrain: '<path d="M2 20 8 9l4 6 3-4 7 9z"/>',
   console: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/>',
   horizon: '<circle cx="12" cy="12" r="9"/><path d="M3 13h18M8 9h8"/>',
+  battery: '<rect x="2" y="7" width="17" height="10" rx="2"/><path d="M22 10.5v3M6 10.5v3M10 10.5v3M14 10.5v3"/>',
   control: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
   forecast: '<path d="M7 15a4 4 0 0 1-.6-8A5 5 0 0 1 16 7a3.5 3.5 0 0 1 1 7H7z"/><path d="M8 18l-1 2M12 18l-1 2M16 18l-1 2"/>',
   reach: '<circle cx="12" cy="12" r="9" stroke-dasharray="3 3"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5"/>',
@@ -249,7 +250,7 @@ const button = (a: string, label: string, ic: string, extra = '') => `<button cl
 /** Группа кнопок с подписью. low — прижата к низу колонки. */
 const group = (cls: string, title: string, ...buttons: string[]) => `<div class="grp ${cls}"><i>${title}</i>${buttons.join('')}</div>`;
 /** Кнопки, открывающие одноимённые окна. */
-const WINDOWS = ['task', 'profile', 'prep', 'instructor', 'zones', 'telemetry', 'horizon', 'control', 'console', 'rc'];
+const WINDOWS = ['task', 'profile', 'prep', 'instructor', 'zones', 'telemetry', 'horizon', 'control', 'console', 'rc', 'batteries'];
 const ZONE_HINT = 'Выберите вид и нарисуйте на карте. Зона РЭБ — круг: щелчок — центр, второй щелчок — граница. Запретная зона — многоугольник: щелчки по вершинам, двойной щелчок — завершить. Правый щелчок по зоне — удалить.';
 
 /** Высота точек в таблице маршрута: показ и правка в системе высот задания. */
@@ -403,6 +404,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           button('task', 'Задача', icon('task'), 'title="Задание, маршрут, погода, бюджет энергии"'),
           button('profile', 'Рельеф', icon('terrain'), 'title="Профиль рельефа вдоль маршрута"'),
           button('forecast', 'Прогноз', icon('forecast'), `title="Прогноз на реальный вылет: задание по часам на погоду Open-Meteo" ${h.onForecast ? '' : 'hidden'}`),
+          button('batteries', 'АКБ', icon('battery'), 'title="Аккумуляторы: на аппарате, на зарядке, в машине — заряд, температура, износ"'),
         )}
         ${group(
           'flight',
@@ -500,6 +502,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   ${win('horizon', 'Авиагоризонт', '<canvas class="adi" width="150" height="150"></canvas><dl class="tm adi-tm"></dl>', 'width:170px')}
   ${win('console', 'Консоль', '<ul class="log"></ul>', 'width:320px')}
   ${win('rc', 'Пульт ДУ', '<div class="rc-setup"></div>', 'width:340px')}
+  ${win('batteries', 'Аккумуляторы', '<div class="bat-panel"></div>', 'width:420px')}
   ${win('profile', 'Рельеф вдоль маршрута', '<canvas class="prof" width="440" height="130"></canvas>', 'width:460px')}
   <div class="toast" hidden></div>`;
   root.appendChild(el);

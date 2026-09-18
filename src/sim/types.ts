@@ -148,7 +148,9 @@ export interface MissionResult {
   capacityWh: number;
   /** Доступно на задание: capacityWh · (1 − reserve), Вт·ч. */
   usableWh: number;
-  /** usableWh − totalWh. Отрицательный — до посадки не хватит. */
+  /** Израсходовано до взлёта — батарея заряжена не полностью, Вт·ч. */
+  startWh?: number;
+  /** usableWh − startWh − totalWh. Отрицательный — до посадки не хватит. */
   marginWh: number;
   /** Остаток заряда на посадке, доля от capacityWh. */
   socAtLanding: number;

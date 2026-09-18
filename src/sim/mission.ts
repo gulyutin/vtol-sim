@@ -159,6 +159,8 @@ const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
 export interface SimOptions {
   /** Аварийный запас, доля ёмкости. По умолчанию AIRCRAFT.reserve; 0 — до пустой батареи. */
   reserve?: number;
+  /** Установленная батарея: ёмкость, Вт·ч, и сколько из неё уже израсходовано к взлёту (неполный заряд). */
+  battery?: { capacityWh: number; startWh: number };
 }
 
 /**
@@ -275,9 +277,10 @@ export function simulateMission(plan: MissionPlan, weather: Weather, opts: SimOp
   const landingWh = sum(landing.map((p) => p.energyWh));
   const totalWh = takeoffWh + transitionWh + cruiseWh + payloadWh + landingWh;
 
-  const capacityWh = batteryCapacityWh(weather.groundTemperatureC);
+  const capacityWh = opts.battery?.capacityWh ?? batteryCapacityWh(weather.groundTemperatureC);
+  const startWh = opts.battery?.startWh ?? 0;
   const usableWh = capacityWh * (1 - (opts.reserve ?? AIRCRAFT.reserve));
-  const marginWh = usableWh - totalWh;
+  const marginWh = usableWh - startWh - totalWh;
   if (marginWh < 0 && Number.isFinite(totalWh)) {
     issues.push(`До посадки с запасом не хватает ${(-marginWh).toFixed(0)} Вт·ч`);
   }
@@ -292,8 +295,9 @@ export function simulateMission(plan: MissionPlan, weather: Weather, opts: SimOp
     durationS,
     capacityWh,
     usableWh,
+    startWh,
     marginWh,
-    socAtLanding: (capacityWh - totalWh) / capacityWh,
+    socAtLanding: (capacityWh - startWh - totalWh) / capacityWh,
     minClearanceM,
     feasible: issues.length === 0,
     issues,
@@ -319,7 +323,7 @@ export function combineResults(parts: MissionResult[], groundS = 0): MissionResu
   const issues = parts.flatMap((p, i) =>
     p.issues.filter((x) => !x.startsWith('До посадки')).map((x) => (parts.length > 1 ? `Полёт ${i + 1}: ${x}` : x)),
   );
-  const marginWh = first.usableWh - budget.totalWh;
+  const marginWh = first.usableWh - (first.startWh ?? 0) - budget.totalWh;
   if (marginWh < 0 && Number.isFinite(budget.totalWh)) {
     issues.push(`До последней посадки с запасом не хватает ${(-marginWh).toFixed(0)} Вт·ч`);
   }
@@ -331,7 +335,7 @@ export function combineResults(parts: MissionResult[], groundS = 0): MissionResu
     distanceM: sum(parts.map((p) => p.distanceM)),
     durationS: sum(parts.map((p) => p.durationS)) + groundS * (parts.length - 1),
     marginWh,
-    socAtLanding: (first.capacityWh - budget.totalWh) / first.capacityWh,
+    socAtLanding: (first.capacityWh - (first.startWh ?? 0) - budget.totalWh) / first.capacityWh,
     minClearanceM: Math.min(...parts.map((p) => p.minClearanceM)),
     feasible: issues.length === 0,
     issues,
