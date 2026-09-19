@@ -10,7 +10,7 @@ import { mercatorToGeo } from '../sim/terrain';
 import { layerCovers } from './packFormat';
 import { contourStepM, hillshade, reliefRgb } from './reliefTint';
 import { decodeTerrarium } from './terrainData';
-import { activePack, activePackNow, attribution, imageryFallback, imagerySource, packImageryUrl, packImageryZooms, terrainTile, tileEnv } from './tileSource';
+import { activePack, activePackNow, attribution, imageryFallback, imagerySource, packImageryUrl, packImageryZooms, S2_ATTRIBUTION, SAVED_MAX_ZOOM, SAVED_MIN_ZOOM, savedImagery, terrainTile, tileEnv } from './tileSource';
 import type { NoReturn, ReachResult } from '../sim/reach';
 import { ReachLayer } from './reachLayer';
 
@@ -149,14 +149,30 @@ const ll = (p: GeoPoint) => L.latLng(p.lat, p.lon);
 class ImageryLayer extends L.TileLayer {
   constructor(options: L.TileLayerOptions) {
     super(IMAGERY, { ...options, subdomains: ESRI_HOSTS });
-    // Тайла в пакете не оказалось — один раз в сеть, если она есть.
+    // Тайла в пакете не оказалось — один раз в сеть, если она есть. Esri не ответил — сохранённый
+    // снимок Sentinel-2 (если район скачан), с его подписью на карте.
     this.on('tileerror', (e: L.TileErrorEvent) => {
       const img = e.tile as HTMLImageElement;
       if (img.dataset['pack'] && imageryFallback()) {
         delete img.dataset['pack'];
         img.src = L.Util.template(IMAGERY, { s: ESRI_HOSTS[hostOf(e.coords)], x: e.coords.x, y: e.coords.y, z: e.coords.z });
+      } else if (!img.dataset['saved']) {
+        img.dataset['saved'] = '1';
+        void savedTileUrl(e.coords).then((url) => {
+          if (!url) return;
+          img.onload = () => URL.revokeObjectURL(url);
+          img.src = url;
+          this.savedShown();
+        });
       }
     });
+  }
+
+  private savedNoted = false;
+  private savedShown() {
+    if (this.savedNoted) return;
+    this.savedNoted = true;
+    (this as unknown as { _map?: L.Map })._map?.attributionControl?.addAttribution(`Без ответа Esri — ${S2_ATTRIBUTION}`);
   }
 
   override getTileUrl(c: L.Coords): string {
@@ -175,6 +191,41 @@ class ImageryLayer extends L.TileLayer {
 }
 
 const hostOf = (c: L.Coords) => (c.x + c.y) % ESRI_HOSTS.length;
+
+/** Сохранённый снимок ровно этого тайла — ссылкой на Blob (для <img>), или null. */
+async function savedTileUrl(c: L.Coords): Promise<string | null> {
+  const blob = await savedImagery(c.z, c.x, c.y);
+  return blob ? URL.createObjectURL(blob) : null;
+}
+
+/**
+ * Сохранённые снимки Sentinel-2 (без сети): тайл или участок ближайшего сохранённого предка,
+ * крупнее z14 — растянутый. Нет ничего — прозрачно (виден рельеф снизу).
+ */
+class SavedLayer extends L.GridLayer {
+  override createTile(c: L.Coords, done: L.DoneCallback): HTMLElement {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 256;
+    void (async () => {
+      for (let z = Math.min(c.z, SAVED_MAX_ZOOM); z >= SAVED_MIN_ZOOM; z--) {
+        const k = 2 ** (c.z - z);
+        const x = Math.floor(c.x / k);
+        const y = Math.floor(c.y / k);
+        const blob = await savedImagery(z, x, y);
+        if (!blob) continue;
+        const bmp = await createImageBitmap(blob);
+        const s = 256 / k;
+        const ctx = canvas.getContext('2d')!;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(bmp, (c.x - x * k) * s, (c.y - y * k) * s, s, s, 0, 0, 256, 256);
+        bmp.close();
+        break;
+      }
+      done(undefined, canvas);
+    })().catch(() => done(undefined, canvas));
+    return canvas;
+  }
+}
 
 /** Без сети, тайла в пакете нет: участок снимка ближайшего предка из пакета или пусто. */
 function ancestorTile(c: L.Coords, done: L.DoneCallback): HTMLElement {
@@ -427,19 +478,21 @@ export class Map2D {
     }).addTo(this.map);
     // Пока рисуется зона или ставится ретранслятор, щелчки идут им, а не маршруту.
     this.map.on('click', (e: L.LeafletMouseEvent) =>
-      this.draw ? this.drawClick(e.latlng) : this.relayPlace ? this.relayClick(e.latlng) : this.onClick?.({ lat: e.latlng.lat, lon: e.latlng.lng }),
+      this.ruler ? this.rulerClick(e.latlng) : this.draw ? this.drawClick(e.latlng) : this.relayPlace ? this.relayClick(e.latlng) : this.onClick?.({ lat: e.latlng.lat, lon: e.latlng.lng }),
     );
     this.map.on('zoomend', () => this.updateMarks());
   }
 
   /**
    * С сетью — снимки (из пакета, где он их покрывает, иначе Esri) и подписи Esri, как прежде.
-   * Без сети — тонированный рельеф пакета (вне его — пусто с сеткой) и поверх снимки пакета, если есть.
+   * Без сети — тонированный рельеф пакета (вне его — пусто с сеткой), поверх — сохранённые снимки
+   * Sentinel-2 (скачанный район) и снимки пакета, если есть.
    */
   private addBaseLayers() {
     const offline = tileEnv().offline;
     const a = attribution();
     if (offline) new ReliefLayer({ maxZoom: 19, attribution: a.terrain }).addTo(this.map);
+    if (offline) new SavedLayer({ maxZoom: 19, attribution: S2_ATTRIBUTION }).addTo(this.map);
     const zs = packImageryZooms();
     if (!offline || zs) new ImageryLayer({ maxZoom: 19, maxNativeZoom: offline ? zs!.max : 19, attribution: a.imagery ?? '' }).addTo(this.map);
     if (!offline) L.tileLayer(LABELS, { maxZoom: 19, maxNativeZoom: 19, subdomains: ESRI_HOSTS }).addTo(this.map);
@@ -866,6 +919,89 @@ export class Map2D {
         if (!this.draw && !this.relayPlace) this.onRelayContext?.(i);
       });
     });
+  }
+
+  private ruler: { a: L.LatLng | null; line: L.Polyline; label: L.Marker | null; onDone: (a: GeoPoint, b: GeoPoint) => void } | null = null;
+  private rulerShown: L.LayerGroup | null = null;
+  private mark: L.CircleMarker | null = null;
+
+  /** Идёт измерение линейкой: щелчки по карте — её концы. */
+  get measuring(): boolean {
+    return this.ruler !== null;
+  }
+
+  /** Линейка: два щелчка — концы; по ходу — расстояние и азимут у курсора; Esc — отмена. */
+  startRuler(onDone: (a: GeoPoint, b: GeoPoint) => void) {
+    this.cancelRuler();
+    this.clearRuler();
+    this.ruler = { a: null, line: L.polyline([], { color: '#ff922b', weight: 3, dashArray: '8 6', interactive: false }).addTo(this.map), label: null, onDone };
+    this.map.getContainer().style.cursor = 'crosshair';
+    this.map.on('mousemove', this.rulerMove);
+    document.addEventListener('keydown', this.rulerKey);
+  }
+
+  cancelRuler() {
+    const r = this.ruler;
+    if (!r) return;
+    this.ruler = null;
+    r.line.remove();
+    r.label?.remove();
+    this.map.getContainer().style.cursor = '';
+    this.map.off('mousemove', this.rulerMove);
+    document.removeEventListener('keydown', this.rulerKey);
+  }
+
+  /** Убрать измеренную линию с карты. */
+  clearRuler() {
+    this.rulerShown?.remove();
+    this.rulerShown = null;
+  }
+
+  private rulerText(a: L.LatLng, b: L.LatLng): string {
+    const d = a.distanceTo(b);
+    const y = Math.sin(((b.lng - a.lng) * Math.PI) / 180) * Math.cos((b.lat * Math.PI) / 180);
+    const x = Math.cos((a.lat * Math.PI) / 180) * Math.sin((b.lat * Math.PI) / 180) - Math.sin((a.lat * Math.PI) / 180) * Math.cos((b.lat * Math.PI) / 180) * Math.cos(((b.lng - a.lng) * Math.PI) / 180);
+    const az = ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+    return `${d >= 1000 ? `${(d / 1000).toFixed(2).replace('.', ',')} км` : `${Math.round(d)} м`} · ${Math.round(az)}°`;
+  }
+
+  private readonly rulerMove = (e: L.LeafletMouseEvent) => {
+    const r = this.ruler;
+    if (!r) return;
+    const text = r.a ? `${this.rulerText(r.a, e.latlng)} · щелчок — конец` : 'Линейка: щелчок — начало, Esc — отмена';
+    if (r.a) r.line.setLatLngs([r.a, e.latlng]);
+    const at = this.map.containerPointToLatLng(this.map.latLngToContainerPoint(e.latlng).add([0, -22]));
+    if (r.label) {
+      r.label.setLatLng(at);
+      r.label.setIcon(labelIcon(text, '#ff922b'));
+    } else r.label = L.marker(at, { interactive: false, keyboard: false, icon: labelIcon(text, '#ff922b') }).addTo(this.map);
+  };
+
+  private readonly rulerKey = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') this.cancelRuler();
+  };
+
+  private rulerClick(p: L.LatLng) {
+    const r = this.ruler!;
+    if (!r.a) {
+      r.a = p;
+      return;
+    }
+    const a = r.a;
+    this.cancelRuler();
+    this.rulerShown = L.layerGroup([
+      L.polyline([a, p], { color: '#ff922b', weight: 3, interactive: false }),
+      L.circleMarker(a, { radius: 4, color: '#ff922b', fillOpacity: 1, interactive: false }),
+      L.circleMarker(p, { radius: 4, color: '#ff922b', fillOpacity: 1, interactive: false }),
+      L.marker(L.latLng((a.lat + p.lat) / 2, (a.lng + p.lng) / 2), { interactive: false, keyboard: false, icon: labelIcon(this.rulerText(a, p), '#ff922b') }),
+    ]).addTo(this.map);
+    r.onDone({ lat: a.lat, lon: a.lng }, { lat: p.lat, lon: p.lng });
+  }
+
+  /** Точка замера дальномера: кружок с подписью; null — убрать. */
+  setRangeMark(p: GeoPoint | null, label = '') {
+    this.mark?.remove();
+    this.mark = p ? L.circleMarker(ll(p), { radius: 7, color: '#ff922b', weight: 2, fillOpacity: 0.25, interactive: false }).bindTooltip(label, { permanent: true, direction: 'top', offset: [0, -8] }).addTo(this.map) : null;
   }
 
   /** Идёт установка ретранслятора: щелчки по карте не добавляют точки маршрута. */

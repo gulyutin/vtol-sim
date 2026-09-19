@@ -8,8 +8,10 @@
  * Отладка: ?offline=1 в адресе — как offline: true у настольного приложения (внешних запросов
  * тайлов нет вовсе, всё из пакета или «нет данных»).
  *
- * Лицензии: в постоянный кэш (Cache API) идёт только рельеф Terrarium. Снимки Esri — только
- * обычный HTTP-кэш браузера: хранить их для работы без сети без лицензии ArcGIS нельзя.
+ * Лицензии: в постоянный кэш (Cache API) идут рельеф Terrarium и снимки Sentinel-2 cloudless 2017
+ * (EOX, CC BY 4.0 — хранить можно, с подписью). Снимки Esri — только обычный HTTP-кэш браузера:
+ * хранить их для работы без сети без лицензии ArcGIS нельзя. В сети — Esri (детальнее), без сети —
+ * сохранённый Sentinel-2 (10 м на пиксель, до SAVED_MAX_ZOOM; крупнее — растягивается предок).
  */
 import { activeRegion } from '../game/regions';
 import { chooseSources, layerCovers, parseManifest, type PackManifest } from './packFormat';
@@ -35,6 +37,13 @@ export interface TileEnv {
 
 const TERRARIUM = (z: number, x: number, y: number) => `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`;
 const TERRAIN_CACHE = 'vtol-sim-terrain-v1';
+/** Снимки для работы без сети: Sentinel-2 cloudless 2017 от EOX (CC BY 4.0). */
+export const S2_URL = (z: number, x: number, y: number) => `https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2017_3857/default/g/${z}/${y}/${x}.jpg`;
+export const S2_ATTRIBUTION = 'EOxCloudless https://cloudless.eox.at by EOX IT Services GmbH (Contains modified Copernicus Sentinel data 2017), CC BY 4.0';
+const SAVED_CACHE = 'vtol-sim-s2-v1';
+/** Уровни сохраняемых снимков: 10 м на пиксель — это примерно z14. */
+export const SAVED_MIN_ZOOM = 8;
+export const SAVED_MAX_ZOOM = 14;
 /** Пакет лежит рядом (диск или локальный сервер): отвечает быстро — ждать дольше незачем. */
 const PACK_TIMEOUT_MS = 8000;
 
@@ -228,15 +237,85 @@ export async function clearViewedCache(): Promise<void> {
 
 // --- снимки ---
 
-/** Откуда снимок (z, x, y): 'pack' — из пакета, 'net' — Esri по сети, null — данных нет (без запросов). */
-export function imagerySource(z: number, x: number, y: number): 'pack' | 'net' | null {
+export type ImageryOrigin = 'pack' | 'net' | 'saved';
+
+/**
+ * Откуда снимок (z, x, y): 'pack' — из пакета, 'net' — Esri по сети, 'saved' — сохранённый
+ * Sentinel-2 (без сети), null — данных нет (без запросов).
+ */
+export function imagerySource(z: number, x: number, y: number): ImageryOrigin | null {
   const s = chooseSources({ inPack: layerCovers(activePackNow()?.manifest.imagery, z, x, y), offline: tileEnv().offline });
-  return s[0] === 'pack' || s[0] === 'net' ? s[0] : null;
+  if (s[0] === 'pack' || s[0] === 'net') return s[0];
+  return z >= SAVED_MIN_ZOOM && z <= SAVED_MAX_ZOOM ? 'saved' : null;
 }
 
-/** Куда идти, если тайла не оказалось в пакете: в сеть или никуда. */
-export function imageryFallback(): 'net' | null {
-  return tileEnv().offline ? null : 'net';
+/** Куда идти, если тайла не оказалось в пакете: в сеть, в сохранённые снимки или никуда. */
+export function imageryFallback(z = SAVED_MAX_ZOOM): ImageryOrigin | null {
+  return tileEnv().offline ? (z >= SAVED_MIN_ZOOM && z <= SAVED_MAX_ZOOM ? 'saved' : null) : 'net';
+}
+
+async function savedCache(): Promise<Cache | null> {
+  try {
+    return typeof caches === 'undefined' ? null : await caches.open(SAVED_CACHE);
+  } catch {
+    return null;
+  }
+}
+
+/** Сохранённый снимок Sentinel-2 (z, x, y) или null — не скачан. */
+export async function savedImagery(z: number, x: number, y: number): Promise<Blob | null> {
+  if (z < SAVED_MIN_ZOOM || z > SAVED_MAX_ZOOM) return null;
+  const hit = await (await savedCache())?.match(S2_URL(z, x, y));
+  return hit ? await hit.blob() : null;
+}
+
+/** Скачать снимок Sentinel-2 в постоянный кэш; fresh — скачан сейчас, bytes — его размер. */
+export async function saveImageryTile(z: number, x: number, y: number, signal?: AbortSignal): Promise<{ bytes: number; fresh: boolean }> {
+  const c = await savedCache();
+  if (!c) throw new Error('Cache API недоступен — сохранить снимки нельзя');
+  const url = S2_URL(z, x, y);
+  const hit = await c.match(url);
+  if (hit) return { bytes: Number(hit.headers.get('Content-Length') ?? 0), fresh: false };
+  const res = await fetch(url, signal ? { signal } : {});
+  if (res.status === 404) return { bytes: 0, fresh: false };
+  if (!res.ok) throw new Error(`Снимок ${z}/${x}/${y}: HTTP ${res.status}`);
+  const blob = await res.blob();
+  await c.put(url, new Response(blob, { headers: { 'Content-Type': 'image/jpeg', 'Content-Length': String(blob.size) } }));
+  return { bytes: blob.size, fresh: true };
+}
+
+/** Есть ли снимок в кэше (без чтения). */
+export async function hasSavedImagery(z: number, x: number, y: number): Promise<boolean> {
+  return !!(await (await savedCache())?.match(S2_URL(z, x, y)));
+}
+
+/** Скачать тайл рельефа в кэш (для работы без сети); bytes — скачано сейчас (0 — уже был). */
+export async function saveTerrainTile(z: number, x: number, y: number): Promise<number> {
+  const c = await terrainCache();
+  if (!c) throw new Error('Cache API недоступен — сохранить рельеф нельзя');
+  const url = TERRARIUM(z, x, y);
+  if (await c.match(url)) return 0;
+  const blob = await (await fetchWithRetry(url, 3)).blob();
+  if (!(await hasMagic(blob, PNG_MAGIC))) throw new Error(`Рельеф ${z}/${x}/${y}: не PNG`);
+  await c.put(url, new Response(blob, { headers: { 'Content-Type': 'image/png' } }));
+  return blob.size;
+}
+
+/** Есть ли тайл рельефа в кэше. */
+export async function hasSavedTerrain(z: number, x: number, y: number): Promise<boolean> {
+  return !!(await (await terrainCache())?.match(TERRARIUM(z, x, y)));
+}
+
+/** Удалить сохранённые снимки и рельеф (всё, что качалось для работы без сети). */
+export async function clearSaved(): Promise<void> {
+  try {
+    if (typeof caches !== 'undefined') {
+      await caches.delete(SAVED_CACHE);
+      await caches.delete(TERRAIN_CACHE);
+    }
+  } catch {
+    // Нечего чистить.
+  }
 }
 
 export function packImageryUrl(z: number, x: number, y: number): string {
@@ -253,13 +332,14 @@ export function packImageryZooms(): { min: number; max: number } | null {
 export const isJpeg = (blob: Blob) => hasMagic(blob, JPEG_MAGIC);
 
 /** Подпись источников для карты и окна «Районы и карты». */
-export function attribution(): { imagery: string | null; terrain: string; osm: string } {
+export function attribution(): { imagery: string | null; saved: string; terrain: string; osm: string } {
   const pack = activePackNow()?.manifest;
   const offline = tileEnv().offline;
   const packImagery = pack?.imagery ? `Снимки: ${pack.imagery.source} (${pack.imagery.license})` : null;
   const esri = 'Снимки © Esri, Maxar, Earthstar Geographics';
   return {
     imagery: offline ? packImagery : packImagery ? `${packImagery}; вне пакета — ${esri}` : esri,
+    saved: `Снимки без сети: ${S2_ATTRIBUTION}`,
     terrain: 'Рельеф: AWS Terrain Tiles (SRTM и др.)',
     osm: '© участники OpenStreetMap (ODbL)',
   };

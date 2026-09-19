@@ -822,6 +822,11 @@ export class World {
     this.resize();
   }
 
+  /** В 3D видны сохранённые снимки Sentinel-2 (их подпись обязательна по лицензии CC BY). */
+  get savedImageryShown(): boolean {
+    return this.lod.savedShown;
+  }
+
   /** Сколько тайлов рельефа и снимков сейчас грузится: запись видео ждёт их, чтобы кадр не был мыльным. */
   tilesLoading(): number {
     // Счётчик загрузок по хостам — внутреннее поле TerrainLod; нет его — считаем, что всё загружено.

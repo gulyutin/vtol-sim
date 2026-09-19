@@ -386,3 +386,18 @@ export function formatBytes(n: number): string {
   }
   return `${v.toFixed(v < 10 ? 1 : 0).replace('.', ',')} ${units[i]}`;
 }
+
+/** Средний снимок Sentinel-2 cloudless (JPEG 256×256), байт — для оценки загрузки района. */
+export const AVG_SAVED_TILE_BYTES = 18_000;
+
+/**
+ * Что скачать для работы района без сети в браузере: рельеф уровня сетки (как loadTerrain) и
+ * снимки Sentinel-2 на уровнях imageryZooms — по области района с запасом REGION_MARGIN_M.
+ */
+export function offlinePlan(region: PackBounds, imageryZooms: number[]): { terrain: [number, number, number][]; imagery: [number, number, number][]; bytes: number } {
+  const b = expandBounds(region, REGION_MARGIN_M);
+  const tiles = (zs: number[]) => listTiles(levelsFor(zs, [b]));
+  const terrain = tiles([TERRAIN_GRID_ZOOM]);
+  const imagery = tiles(imageryZooms);
+  return { terrain, imagery, bytes: terrain.length * AVG_TERRAIN_TILE_BYTES + imagery.length * AVG_SAVED_TILE_BYTES };
+}

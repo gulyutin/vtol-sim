@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { flightRemarks } from '../src/game/remarks';
+import { flightRemarks, INSTRUCTOR_PREFIX } from '../src/game/remarks';
 import type { Recording, Sample } from '../src/game/recorder';
 
 const sample = (t: number, over: Partial<Sample>): Sample => ({
   t, east: 0, north: t * 20, up: 150, headingDeg: 0, pitchDeg: 0, bankDeg: 0, iasMs: 20, gsMs: 20, vzMs: 0, aglM: 150, powerW: 800, energyWh: 0, soc: 1, mode: 'auto', lift: 0, pusher: 0.5, ...over,
 });
-const rec = (samples: Sample[], events: { t: number; text: string }[] = []): Recording => ({ version: 1, meta: {} as Recording['meta'], samples, events });
+const rec = (samples: Sample[], events: { t: number; text: string; kind?: string }[] = []): Recording => ({ version: 1, meta: {} as Recording['meta'], samples, events });
 const plans = [{ path: [{ east: 0, north: 0, up: 150, leg: 0 }, { east: 0, north: 10000, up: 150, leg: 1 }], legLabels: ['Взлётный маршрут', 'Участок 1 → 2'] }];
 
 describe('замечания инструктора', () => {
@@ -47,5 +47,16 @@ describe('замечания инструктора', () => {
   it('чистый полёт — «замечаний нет»', () => {
     const s = Array.from({ length: 100 }, (_, i) => sample(i, {}));
     expect(flightRemarks({ rec: rec(s), plans })).toEqual([{ t: null, level: 'good', text: expect.stringContaining('Замечаний нет') }]);
+  });
+
+  it('замечания инструктора из пульта — со временем и уровнем', () => {
+    const s = Array.from({ length: 100 }, (_, i) => sample(i, {}));
+    const r = rec(s, [
+      { t: 30, text: `${INSTRUCTOR_PREFIX}поздно доложил о готовности`, kind: 'warn' },
+      { t: 60, text: `${INSTRUCTOR_PREFIX}чёткий доклад об отказе`, kind: 'info' },
+    ]);
+    const out = flightRemarks({ rec: r, plans });
+    expect(out.find((x) => x.t === 30)).toEqual({ t: 30, level: 'warn', text: 'T+0:30 инструктор: поздно доложил о готовности' });
+    expect(out.find((x) => x.t === 60)?.level).toBe('good');
   });
 });

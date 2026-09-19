@@ -114,6 +114,7 @@ export function protocolHtml(o: ProtocolInput): string {
   <tr><td>Задание</td><td>${esc(rec.meta.title)}</td></tr>
   <tr><td>Район</td><td>${esc(o.region)}</td></tr>
   <tr><td>Режим</td><td>${exam ? 'экзамен (особые случаи — без предупреждения)' : 'тренировка'}</td></tr>
+  ${rec.meta.ticket ? `<tr><td>Билет</td><td>${esc(rec.meta.ticket)} — отказы, цели и погода повторятся, если ввести этот номер в окне задания</td></tr>` : ''}
   <tr><td>Налёт / путь</td><td>${fmtT(sum.airborneS)} · ${(sum.distanceM / 1000).toFixed(1)} км · расход ${Math.round(sum.energyWh)} Вт·ч · мин. заряд ${Math.round(sum.minSoc * 100)} %</td></tr>
 </table>
 <div class="verdict ${adm.pass ? 'pass' : 'fail'}">Итог: ${a ? `${a.total} из 100 — ${esc(a.grade)}` : 'без оценки'}. ${adm.pass ? 'ДОПУЩЕН' : 'НЕ ДОПУЩЕН'} (${esc(adm.why)}; проходной — ${PASS_SCORE})</div>

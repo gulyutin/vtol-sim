@@ -14,6 +14,10 @@ export interface Remark {
   text: string;
 }
 
+/** Событие записи с замечанием инструктора (пульт инструктора пишет его так). */
+export const INSTRUCTOR_PREFIX = 'Замечание инструктора: ';
+const INSTRUCTOR_RE = /^Замечание инструктора: (.+)$/su;
+
 export interface RemarkInput {
   rec: Recording;
   /**
@@ -199,6 +203,12 @@ export function flightRemarks(input: RemarkInput): Remark[] {
   // 6. Ручное управление: слишком крутой крен.
   const steep = s.find((p) => (p.mode === 'manual' || p.mode === 'failsafe') && Math.abs(p.bankDeg) > MANUAL_BANK_DEG);
   if (steep) out.push({ t: steep.t, level: 'warn', text: `${at(steep.t)} крен ${Math.round(Math.abs(steep.bankDeg))}° в ручном управлении — круче ${MANUAL_BANK_DEG}° теряется высота и растёт скорость сваливания` });
+
+  // 7. Замечания инструктора, записанные в полёте (пульт инструктора) — как есть, со временем.
+  for (const e of rec.events) {
+    const m = INSTRUCTOR_RE.exec(e.text);
+    if (m) out.push({ t: e.t, level: e.kind === 'bad' ? 'bad' : e.kind === 'info' ? 'good' : 'warn', text: `${at(e.t)} инструктор: ${m[1]}` });
+  }
 
   if (!out.some((r) => r.level !== 'good')) out.push({ t: null, level: 'good', text: 'Замечаний нет: высота и линия пути по плану, связь без перерывов.' });
   return out.sort((a, b) => (a.t ?? Infinity) - (b.t ?? Infinity));

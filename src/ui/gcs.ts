@@ -24,6 +24,8 @@ export interface GcsHandlers {
   onScenario(id: string): void;
   onSettings(s: Settings): void;
   onForecastError(on: boolean): void;
+  /** Билет занятия: «номер» или «номер/день» — повторить; null — случайный на каждую попытку. */
+  onTicket?(text: string | null): void;
   onNewDay(): void;
   onCommand(c: GcsCommand): void;
   onControls(c: Partial<Controls>): void;
@@ -54,6 +56,12 @@ export interface GcsHandlers {
   onRegion?(id: string): void;
   /** Окно «Районы и карты»: пакеты районов для работы без сети. */
   onPacks?(): void;
+  /** Окно «Курс подготовки». */
+  onCourse?(): void;
+  /** Линейка на карте: два щелчка — профиль и видимость. */
+  onRuler?(): void;
+  /** Пульт инструктора в отдельном окне; true — открыт. */
+  onStation?(): boolean;
   /** Окно «Прогноз вылета»: задание по часам на реальный прогноз. */
   onForecast?(): void;
   /** Слой «Досягаемость» на карте: куда долетит и вернётся. */
@@ -159,6 +167,8 @@ export interface Alert {
 
 export interface Gcs {
   mapEl: HTMLElement;
+  /** Содержимое окна «Линейка» (рисует main.ts). */
+  rulerEl: HTMLElement;
   viewEl: HTMLElement;
   loadScenario(sc: Scenario, s: Settings, forecastError: boolean): void;
   /** alt — как показывать и править высоту точек (система высот задания); без него — над рельефом. */
@@ -185,6 +195,14 @@ export interface Gcs {
   setTheme(mode: 'auto' | 'dark' | 'light'): void;
   /** Выбрать источник погоды в списке (режим задаёт свою погоду). */
   setWeatherSource(src: string): void;
+  /** Режим (тренировка, штатный, сложные, зачёт) — выставить из кода, как будто выбрали в списке. */
+  setDifficulty(id: string): void;
+  /** Идёт упражнение курса: строка над заданием; null — убрать. */
+  setExercise(text: string | null): void;
+  /** Билет текущей попытки («номер/день»). */
+  setTicket(text: string): void;
+  /** Открыть окно (task, prep, …), как кнопкой. */
+  openWindow(id: string): void;
   /** Список районов; при одном районе и меньше выбор скрыт. */
   setRegions(list: RegionItem[], currentId: string): void;
   setZones(list: ZoneItem[]): void;
@@ -221,6 +239,7 @@ const ICON: Record<string, string> = {
   arm: '<path d="M12 3v8"/><path d="M6.8 6.8a7.5 7.5 0 1 0 10.4 0"/>',
   debrief: '<path d="M4 20V4M4 20h16"/><path d="M7 15l4-5 3 3 5-7"/>',
   instructor: '<circle cx="12" cy="7" r="3.2"/><path d="M5 20c1.2-4 3.8-6 7-6s5.8 2 7 6"/><path d="M12 14l-1.5 3 1.5 3 1.5-3z"/>',
+  course: '<path d="M3 8l9-4 9 4-9 4z"/><path d="M7 10v5c0 1.5 2.2 3 5 3s5-1.5 5-3v-5"/><path d="M21 8v6"/>',
   prep: '<path d="M10 6h10M10 12h10M10 18h10"/><path d="M3.5 6l1.5 1.5L7.5 5M3.5 12l1.5 1.5 2.5-2.5M3.5 18l1.5 1.5 2.5-2.5"/>',
   task: '<path d="M4 20 20 12 4 4v6l10 2-10 2z"/>',
   unload: '<rect x="4" y="11" width="16" height="9" rx="1"/><path d="M12 2v10M8 8l4 4 4-4"/>',
@@ -237,6 +256,7 @@ const ICON: Record<string, string> = {
   forecast: '<path d="M7 15a4 4 0 0 1-.6-8A5 5 0 0 1 16 7a3.5 3.5 0 0 1 1 7H7z"/><path d="M8 18l-1 2M12 18l-1 2M16 18l-1 2"/>',
   reach: '<circle cx="12" cy="12" r="9" stroke-dasharray="3 3"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5"/>',
   zones: '<path d="M4 7l7-4 9 4-2 11-8 3-6-6z"/><path d="M9 9l6 6M15 9l-6 6"/>',
+  ruler: '<path d="M3 17L17 3l4 4L7 21z"/><path d="M7 13l2 2M10 10l2 2M13 7l2 2"/>',
   clear: '<path d="M3 18c2-5 5-1 7-5s4-5 7-6" stroke-dasharray="2 3"/><path d="M15 14l6 6M21 14l-6 6"/>',
 };
 const icon = (k: string) => `<svg viewBox="0 0 24 24">${ICON[k]}</svg>`;
@@ -259,7 +279,7 @@ const button = (a: string, label: string, ic: string, extra = '') => `<button cl
 /** Группа кнопок с подписью. low — прижата к низу колонки. */
 const group = (cls: string, title: string, ...buttons: string[]) => `<div class="grp ${cls}"><i>${title}</i>${buttons.join('')}</div>`;
 /** Кнопки, открывающие одноимённые окна. */
-const WINDOWS = ['task', 'profile', 'prep', 'instructor', 'zones', 'telemetry', 'horizon', 'control', 'console', 'rc', 'batteries'];
+const WINDOWS = ['task', 'profile', 'prep', 'instructor', 'zones', 'telemetry', 'horizon', 'control', 'console', 'rc', 'batteries', 'ruler'];
 const ZONE_HINT = 'Выберите вид и нарисуйте на карте. Зона РЭБ — круг: щелчок — центр, второй щелчок — граница. Запретная зона — многоугольник: щелчки по вершинам, двойной щелчок — завершить. Правый щелчок по зоне — удалить.';
 
 /** Высота точек в таблице маршрута: показ и правка в системе высот задания. */
@@ -374,7 +394,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     <div class="tb-group tb-mission">
       <select class="tb scen" title="Задание">${scenarios.map((s) => `<option value="${s.id}">${s.title}</option>`).join('')}</select>
       <select class="tb region" hidden></select>
-      <button class="tb" data-a="packs" title="Районы и карты: пакеты для работы без сети" ${h.onPacks ? '' : 'hidden'}>🗺</button>
+      <button class="tb" data-a="packs" title="Районы и карты: скачать район для работы без сети" ${h.onPacks ? '' : 'hidden'}>🗺</button>
       <button class="tb" data-a="restart" title="Сбросить полёт и начать это задание сначала">⟲<span class="lbl">Начать заново</span></button>
     </div>
     <div class="tb-group tb-sim">
@@ -436,11 +456,13 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
           button('follow', 'Навигация', icon('nav'), 'title="Карта следует за аппаратом"'),
           button('target', 'Облёт точки', icon('target'), 'title="ОПЕР. ТОЧКА: щёлкните по карте — аппарат уйдёт к точке и будет кружить над ней. Esc — отмена"'),
           button('reach', 'Досягаемость', icon('reach'), `title="Куда долетит и вернётся: запас 25 %, 10 %, впритык, в один конец" ${h.onReach ? '' : 'hidden'}`),
+          button('ruler', 'Линейка', icon('ruler'), `title="Расстояние, азимут, профиль рельефа и прямая видимость между двумя точками" ${h.onRuler ? '' : 'hidden'}`),
           button('clear', 'Очистить', icon('clear'), 'title="Очистить траекторию на карте и в 3D"'),
         )}
         ${group(
           'trainer',
           'Тренажёр',
+          button('course', 'Курс', icon('course'), `title="Курс подготовки: упражнения с теорией и допуском, журнал налёта курсанта" ${h.onCourse ? '' : 'hidden'}`),
           button('instructor', 'Инструктор', icon('instructor'), 'title="Ввести особый случай"'),
           button('zones', 'Зоны', icon('zones'), `title="Запретные зоны и РЭБ" ${h.onZoneTool ? '' : 'hidden'}`),
           button('debrief', 'Разбор', icon('debrief'), 'title="Разбор полёта"'),
@@ -467,7 +489,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
     </section>
     <div class="splitter" title="Потяните, чтобы изменить доли"></div>
     <section class="view-pane">
-      <div class="view"></div>
+      <div class="view"><div class="view-attr" hidden></div></div>
       <div class="cam-dock" hidden><canvas></canvas></div>
       <div class="alerts" hidden></div>
       <select class="camera">
@@ -491,7 +513,8 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   ${win(
     'instructor',
     'Инструктор — особые случаи',
-    `<p class="hint">Отказ вводится сразу — как в таблице особых случаев РЛЭ. Оператор действует по порядку, разбор оценит реакцию.</p>
+    `<div class="row"><button class="small" data-a="station" title="Отдельное окно для второго монитора: карта с истинным местом и тем, что видит НСУ, отказы по условию, сообщения оператору, замечания в разбор">🖥 Пульт инструктора в отдельном окне…</button></div>
+    <p class="hint">Отказ вводится сразу — как в таблице особых случаев РЛЭ. Оператор действует по порядку, разбор оценит реакцию.</p>
     <ul class="inject">${FAILURES.map((f) => `<li><button class="small" data-inject="${f.id}">Ввести</button><div><b>${f.title}</b><small>${f.effect}</small></div></li>`).join('')}</ul>
     <div class="row"><button class="small" data-restore="link">Восстановить связь</button><button class="small" data-restore="gnss">Восстановить ГНСС</button></div>`,
     'width:380px',
@@ -516,6 +539,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   ${win('console', 'Консоль', '<ul class="log"></ul>', 'width:320px')}
   ${win('rc', 'Пульт ДУ', '<div class="rc-setup"></div>', 'width:340px')}
   ${win('batteries', 'Аккумуляторы', '<div class="bat-panel"></div>', 'width:420px')}
+  ${win('ruler', 'Линейка — профиль и видимость', '<div class="ruler-body"><p class="hint">Щёлкните на карте начало и конец линии.</p></div>', 'width:460px')}
   ${win('profile', 'Рельеф вдоль маршрута', '<canvas class="prof" width="440" height="130"></canvas>', 'width:460px')}
   <div class="toast" hidden></div>`;
   root.appendChild(el);
@@ -691,6 +715,9 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   let weatherSource = 'scenario';
   let weatherSummary = '';
   let difficulty = 'train';
+  let exerciseText: string | null = null;
+  let ticketText = '';
+  let ticketFixed = false;
   let alertsKey = '';
   let armed = false;
   el.querySelectorAll<HTMLButtonElement>('[data-a]').forEach((b) =>
@@ -701,6 +728,9 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       else if (a === 'unload') h.onCommand('unload');
       else if (a === 'mode' || a === 'emergency' || a === 'settings') openMenu(a, b);
       else if (a === 'packs') h.onPacks?.();
+      else if (a === 'course') h.onCourse?.();
+      else if (a === 'ruler') h.onRuler?.();
+      else if (a === 'station') h.onStation?.();
       else if (a === 'forecast') h.onForecast?.();
       else if (a === 'sticks') b.classList.toggle('open', h.onSticks?.() ?? false);
       else if (a === 'theme') {
@@ -971,6 +1001,18 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       h.onSettings(current);
     });
     syncApproach();
+    const tk = taskBody.querySelector<HTMLInputElement>('[data-a="ticket"]')!;
+    const tkRandom = taskBody.querySelector<HTMLButtonElement>('[data-a="ticket-random"]')!;
+    tk.addEventListener('change', () => {
+      ticketFixed = true;
+      tkRandom.disabled = false;
+      h.onTicket?.(tk.value);
+    });
+    tkRandom.addEventListener('click', () => {
+      ticketFixed = false;
+      tkRandom.disabled = true;
+      h.onTicket?.(null);
+    });
     const err = taskBody.querySelector<HTMLInputElement>('[data-a="error"]')!;
     err.addEventListener('change', () => h.onForecastError(err.checked));
     const diff = taskBody.querySelector<HTMLSelectElement>('[data-a="diff"]')!;
@@ -991,6 +1033,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
 
   const api: Gcs = {
     mapEl: q<HTMLElement>('.map'),
+    rulerEl: q<HTMLElement>('.ruler-body'),
     viewEl: q<HTMLElement>('.view'),
 
     loadScenario(sc, s, forecastError) {
@@ -1000,11 +1043,13 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       const survey = sc.kind === 'survey';
       isSurvey = survey;
       taskBody.innerHTML = `
+        <div class="exercise" ${exerciseText ? '' : 'hidden'}>${exerciseText ?? ''}</div>
         <div class="brief"><b>${sc.title}</b><p>${sc.briefing}</p></div>
         <label class="select"><span>Режим</span><select data-a="diff">
           ${DIFFICULTY.map((d) => `<option value="${d.id}" ${d.id === difficulty ? 'selected' : ''}>${d.title}</option>`).join('')}
         </select></label>
         <p class="hint dsum">${DIFFICULTY.find((d) => d.id === difficulty)?.description ?? ''}</p>
+        <div class="ticket-row" ${h.onTicket ? '' : 'hidden'}><label class="select"><span>Билет</span><input data-a="ticket" value="${ticketText}" title="Номер билета задаёт отказы, людей и очаги, погоду в полёте. Введите номер (или «номер/день») из протокола — занятие повторится" inputmode="numeric"></label><button class="small" data-a="ticket-random" title="Случайный билет на каждую попытку" ${ticketFixed ? '' : 'disabled'}>Случайный</button></div>
         ${
           survey
             ? `<details open><summary>Съёмка</summary>
@@ -1199,6 +1244,33 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       weatherSummary = text;
       const p = taskBody.querySelector<HTMLElement>('.wsum');
       if (p) p.textContent = text;
+    },
+
+    setTicket(text) {
+      ticketText = text;
+      const i = taskBody.querySelector<HTMLInputElement>('[data-a="ticket"]');
+      if (i && document.activeElement !== i) i.value = text;
+    },
+
+    openWindow(id) {
+      toggle(id, true);
+    },
+
+    setDifficulty(id) {
+      difficulty = id;
+      const sel = taskBody.querySelector<HTMLSelectElement>('[data-a="diff"]');
+      if (sel) sel.value = id;
+      const sum = taskBody.querySelector<HTMLElement>('.dsum');
+      if (sum) sum.textContent = DIFFICULTY.find((d) => d.id === id)?.description ?? '';
+    },
+
+    setExercise(text) {
+      exerciseText = text;
+      const b = taskBody.querySelector<HTMLElement>('.exercise');
+      if (b) {
+        b.hidden = !text;
+        b.textContent = text ?? '';
+      }
     },
 
     setWeatherSource(src) {

@@ -173,6 +173,8 @@ interface Geometry {
 /** Сборка ортофотоплана: onProgress 0…1; итог — картинка, подпись и имя файла. */
 export interface OrthoHost {
   build(onProgress: (share: number) => void): Promise<{ url: string; text: string; fileName: string }>;
+  /** Кадры с геометками для Metashape (ZIP). */
+  exportFrames?(onProgress: (share: number) => void): Promise<{ blob: Blob; fileName: string; count: number }>;
 }
 
 export class Debrief {
@@ -255,6 +257,7 @@ export class Debrief {
           <button class="db-btn" data-db="video" hidden>Сохранить видео…</button>
           <button class="db-btn" data-db="protocol" title="Протокол проверки оператора: баллы, замечания, график, траектория, допуск, подписи — сохранить в PDF">Протокол (PDF)…</button>
           <button class="db-btn" data-db="ortho" hidden title="Склеить кадры съёмки в ортофото: где не хватило перекрытия, где смаз и недодержка">Ортофотоплан…</button>
+          <button class="db-btn" data-db="frames" hidden title="Кадры съёмки с координатами в EXIF и reference.csv — для Agisoft Metashape, Pix4D, OpenDroneMap">Кадры для Metashape (ZIP)</button>
           <button class="db-btn" data-db="import">${importTitle}</button>
           <input type="file" class="db-file" multiple hidden>
         </div>
@@ -325,6 +328,9 @@ export class Debrief {
           break;
         case 'ortho':
           void this.buildOrtho();
+          break;
+        case 'frames':
+          void this.exportFrames();
           break;
         case 'protocol':
           if (this.rec && !openProtocol({ rec: this.rec, ...(this.assessment ? { assessment: this.assessment } : {}), remarks: this.remarks, chartUrl: this.canvas.toDataURL('image/png'), region: this.regionName }))
@@ -479,6 +485,7 @@ export class Debrief {
   setOrthoHost(host: OrthoHost | null): void {
     this.orthoHost = host;
     this.q<HTMLElement>('[data-db="ortho"]').hidden = !host;
+    this.q<HTMLElement>('[data-db="frames"]').hidden = !host?.exportFrames;
     if (!host) this.q<HTMLElement>('.db-ortho').hidden = true;
   }
 
@@ -510,6 +517,38 @@ export class Debrief {
       text.textContent = r.text;
     } catch (e) {
       text.textContent = `Не собрался: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      prog.hidden = true;
+      this.orthoBusy = false;
+    }
+  }
+
+  private async exportFrames() {
+    const host = this.orthoHost;
+    if (!host?.exportFrames || this.orthoBusy) return;
+    this.orthoBusy = true;
+    const box = this.q<HTMLElement>('.db-ortho');
+    box.hidden = false;
+    const prog = box.querySelector<HTMLElement>('.dv-progress')!;
+    const bar = prog.querySelector<HTMLElement>('i')!;
+    const pct = prog.querySelector<HTMLElement>('.dv-pct')!;
+    const text = box.querySelector<HTMLElement>('.do-text')!;
+    prog.hidden = false;
+    text.textContent = 'Кадры снимаются заново камерой нагрузки…';
+    try {
+      const r = await host.exportFrames((share) => {
+        bar.style.width = `${Math.round(share * 100)}%`;
+        pct.textContent = `${Math.round(share * 100)} %`;
+      });
+      const url = URL.createObjectURL(r.blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = r.fileName;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      text.textContent = `${r.count} кадров с координатами (${(r.blob.size / 1e6).toFixed(1).replace('.', ',')} МБ) — ${r.fileName}. В Metashape: Add Photos из папки images, привязка — из EXIF или Import Reference → reference.csv.`;
+    } catch (e) {
+      text.textContent = `Кадры не выгрузились: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
       prog.hidden = true;
       this.orthoBusy = false;

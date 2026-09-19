@@ -4,7 +4,7 @@ import { mercatorPixel, mercatorToGeo } from '../sim/terrain';
 import type { Site, Terrain } from '../sim/types';
 import { reliefRgb } from './reliefTint';
 import type { Bounds } from './terrainData';
-import { imageryFallback, imagerySource, packImageryUrl } from './tileSource';
+import { imageryFallback, imagerySource, packImageryUrl, savedImagery, SAVED_MAX_ZOOM, SAVED_MIN_ZOOM, type ImageryOrigin } from './tileSource';
 import {
   ancestorUv,
   hostIndex,
@@ -24,6 +24,10 @@ export const IMAGERY_ATTRIBUTION =
 const IMAGERY_HOSTS = ['server.arcgisonline.com', 'services.arcgisonline.com'];
 /** Снимки из пакета района — ещё один «сервер» очереди, со своими местами (tileSource.ts). */
 const PACK_HOST = IMAGERY_HOSTS.length;
+/** Сохранённые снимки Sentinel-2 (Cache API) — своя очередь. */
+const SAVED_HOST = PACK_HOST + 1;
+/** Esri не отвечает столько раз подряд — пробуем сохранённый снимок. */
+const NET_TRIES_BEFORE_SAVED = 2;
 const imageryUrl = (host: number, z: number, x: number, y: number) =>
   host === PACK_HOST ? packImageryUrl(z, x, y) : `https://${IMAGERY_HOSTS[host]}/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
 
@@ -54,7 +58,7 @@ interface TileNode {
   x: number;
   y: number;
   /** Откуда брать снимок: пакет или сеть. */
-  origin: 'pack' | 'net' | null;
+  origin: ImageryOrigin | null;
   parent: TileNode | null;
   center: THREE.Vector3;
   sizeM: number;
@@ -182,7 +186,9 @@ export class TerrainLod {
   private shown: TileNode[] = [];
   /** Тайлы без своего снимка, нужные в этом кадре. */
   private wantList: TileNode[] = [];
-  private readonly inflight = [...IMAGERY_HOSTS, 'pack'].map(() => 0);
+  private readonly inflight = [...IMAGERY_HOSTS, 'pack', 'saved'].map(() => 0);
+  /** Показан хоть один сохранённый снимок Sentinel-2 — нужна его подпись в 3D-окне. */
+  savedShown = false;
   private frame = 0;
   private split = 2.6;
   private detail = true;
@@ -416,7 +422,7 @@ export class TerrainLod {
     const candidates: Candidate<TileNode>[] = this.wantList.map((n) => ({
       item: n,
       priority: n.priority,
-      host: n.origin === 'pack' ? PACK_HOST : hostIndex(n.x, n.y, IMAGERY_HOSTS.length),
+      host: n.origin === 'pack' ? PACK_HOST : n.origin === 'saved' ? SAVED_HOST : hostIndex(n.x, n.y, IMAGERY_HOSTS.length),
       notBefore: n.retryAt,
     }));
     for (const c of pickRequests(candidates, this.inflight, REQUESTS_PER_HOST, now)) void this.load(c.item, c.host);
@@ -431,10 +437,31 @@ export class TerrainLod {
     // Тайла не оказалось в пакете (или он испорчен): в сеть, если она есть, иначе «нет данных» —
     // без повторов: локальный файл от повтора не появится.
     const packMiss = () => {
-      n.origin = imageryFallback();
+      n.origin = imageryFallback(n.z);
       n.state = n.origin ? 'idle' : 'nodata';
     };
+    const savedOk = n.z >= SAVED_MIN_ZOOM && n.z <= SAVED_MAX_ZOOM;
     try {
+      if (host === SAVED_HOST) {
+        // Сохранённый снимок: нет в кэше — без сети «нет данных» (растянется предок), в сети — снова Esri.
+        const blob = await savedImagery(n.z, n.x, n.y);
+        if (!blob) {
+          n.origin = imageryFallback(n.z) === 'net' ? 'net' : null;
+          n.state = n.origin ? 'idle' : 'absent';
+          if (n.origin) n.retryAt = performance.now() + retryDelayMs(n.tries, Math.random());
+          return;
+        }
+        const bitmap = await createImageBitmap(blob, { imageOrientation: 'flipY' });
+        if (this.disposed) {
+          bitmap.close();
+          n.state = 'idle';
+          return;
+        }
+        n.material = this.createMaterial(bitmap);
+        n.state = 'ready';
+        this.savedShown = true;
+        return;
+      }
       const res = await fetch(imageryUrl(host, n.z, n.x, n.y), { signal: abort.signal });
       if (fromPack && !res.ok) {
         packMiss();
@@ -461,9 +488,19 @@ export class TerrainLod {
         packMiss();
         return;
       }
+      if (host === SAVED_HOST) {
+        n.origin = imageryFallback(n.z) === 'net' ? 'net' : null;
+        n.state = n.origin ? 'idle' : 'absent';
+        return;
+      }
       // Сеть, сервер или обрыв по времени — повтор с растущей паузой; место в очереди свободно сразу.
+      // Esri не отвечает — следующая попытка из сохранённых снимков (если район скачан).
       n.tries++;
       n.retryAt = performance.now() + retryDelayMs(n.tries, Math.random());
+      if (savedOk && n.tries >= NET_TRIES_BEFORE_SAVED) {
+        n.origin = 'saved';
+        n.retryAt = 0;
+      }
       n.state = 'idle';
     } finally {
       clearTimeout(timer);

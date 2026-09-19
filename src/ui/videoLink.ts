@@ -254,6 +254,8 @@ export interface OsdData {
   linkQuality: number;
   latencyS: number;
   frozen: boolean;
+  /** Последний замер дальномера — строкой. */
+  range?: string;
 }
 
 const pad2 = (n: number) => String(Math.floor(n)).padStart(2, '0');
@@ -267,7 +269,7 @@ export function osdText(d: OsdData): { tl: string; tr: string; bl: string; br: s
     tl: `● ЗАП ${fmtT(d.flightS)}\n${d.channel} · ${d.mode}`,
     tr: `СВЯЗЬ ${Math.round(d.linkQuality * 100)}% ${bars}\nЗАДЕРЖКА ${Math.round(d.latencyS * 1000)} мс`,
     bl: `H ${Math.round(d.aglM)} м (${Math.round(d.altM)} абс)\nV ${d.speedMs.toFixed(1)} м/с  К ${String(Math.round(d.headingDeg) % 360).padStart(3, '0')}°`,
-    br: `АЗ ${d.panDeg >= 0 ? '+' : ''}${Math.round(d.panDeg)}°  УМ ${Math.round(d.tiltDeg)}°  ×${d.zoom.toFixed(1)}\nЦЕНТР ${c}`,
+    br: `${d.range ? `${d.range}\n` : ''}АЗ ${d.panDeg >= 0 ? '+' : ''}${Math.round(d.panDeg)}°  УМ ${Math.round(d.tiltDeg)}°  ×${d.zoom.toFixed(1)}\nЦЕНТР ${c}`,
   };
 }
 

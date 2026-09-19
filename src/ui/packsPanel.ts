@@ -1,13 +1,15 @@
 /*
  * Окно «Районы и карты»: какие пакеты районов установлены (район, размер, снимки — есть ли, их
  * источник и лицензия, дата), есть ли сейчас сеть, покрыт ли пакетом активный район и откуда
- * берутся рельеф, снимки и OSM. Только сведения: пакеты ставит установщик настольного
- * приложения или сборщик scripts/region-pack.mjs.
+ * берутся рельеф, снимки и OSM. Пакеты ставит установщик настольного приложения или сборщик
+ * scripts/region-pack.mjs; в браузере район скачивается здесь же («Работа без сети»: рельеф,
+ * снимки Sentinel-2, OSM — в память браузера).
  */
 import './packsPanel.css';
 import { activeRegion, REGION_PRESETS } from '../game/regions';
 import { expandBounds, formatBytes, packCoversBounds, REGION_MARGIN_M, type PackManifest } from './packFormat';
-import { activePack, attribution, probePack, tileEnv, viewedCacheTiles, type PackProbe, type TileEnv } from './tileSource';
+import { activePack, attribution, clearSaved, probePack, S2_ATTRIBUTION, tileEnv, viewedCacheTiles, type PackProbe, type TileEnv } from './tileSource';
+import { autoDownload, downloadableRegions, offlineQueue, regionPlan, regionSaved, setAutoDownload, storageUse } from './regionDownload';
 
 /** Что показывает окно — и для значка в интерфейсе (например, «без сети» на верхней панели). */
 export interface PacksStatus {
@@ -96,7 +98,7 @@ function render(s: PacksStatus): string {
   const imagery = {
     pack: `из пакета: ${esc(a.imagery ?? '')}`,
     'pack+net': `из пакета, вне него — Esri по сети`,
-    net: 'Esri по сети (в кэш для работы без сети не сохраняются)',
+    net: 'Esri по сети; без сети — сохранённые снимки Sentinel-2 (если район скачан)',
     none: '<span class="warn">нет</span> — 3D и карта в цветах рельефа',
   }[active.imagery];
   const osm = { pack: 'из пакета', app: 'с приложением', none: 'нет у района' }[active.osm];
@@ -120,7 +122,7 @@ function render(s: PacksStatus): string {
       <dt>Рельеф</dt><dd>${terrain}</dd>
       <dt>Снимки</dt><dd>${imagery}</dd>
       <dt>Дома и дороги</dt><dd>${osm}</dd>
-      <dt>Кэш просмотренного</dt><dd>${cache}</dd>
+      <dt>Кэш рельефа</dt><dd>${cache}</dd>
     </dl>
     <h4>Пакеты районов</h4>
     <div class="tbl"><table>
@@ -136,9 +138,11 @@ export function createPacksPanel(parent: HTMLElement = document.body): PacksPane
   el.className = 'win packs-win';
   el.dataset['win'] = 'packs';
   el.hidden = true;
-  el.innerHTML = `<div class="win-title"><span>Районы и карты</span><button class="x" title="Закрыть">✕</button></div><div class="win-body">Проверяю пакеты…</div>`;
+  el.innerHTML = `<div class="win-title"><span>Районы и карты</span><button class="x" title="Закрыть">✕</button></div><div class="win-body"><div class="offline"></div><div class="info">Проверяю пакеты…</div></div>`;
   parent.appendChild(el);
-  const body = el.querySelector<HTMLElement>('.win-body')!;
+  const body = el.querySelector<HTMLElement>('.info')!;
+  const off = el.querySelector<HTMLElement>('.offline')!;
+  const offline = offlineSection(off);
   const title = el.querySelector<HTMLElement>('.win-title')!;
 
   const panel: PacksPanel = {
@@ -149,6 +153,7 @@ export function createPacksPanel(parent: HTMLElement = document.body): PacksPane
     open() {
       el.hidden = false;
       void panel.refresh();
+      void offline.refresh();
     },
     close() {
       if (el.hidden) return;
@@ -192,4 +197,88 @@ export function createPacksPanel(parent: HTMLElement = document.body): PacksPane
     window.addEventListener('pointerup', up);
   });
   return panel;
+}
+
+const mb = (n: number) => `${(n / 1e6).toFixed(n < 1e7 ? 1 : 0).replace('.', ',')} МБ`;
+
+/**
+ * «Работа без сети»: скачать открытый район или все, ход загрузки, сколько уже сохранено,
+ * занятое место, фоновая докачка, очистка. Обновляется по ходу загрузки, пока окно открыто.
+ */
+function offlineSection(root: HTMLElement): { refresh(): Promise<void> } {
+  const region = activeRegion();
+  root.innerHTML = `
+    <h4>Работа без сети</h4>
+    <p class="note">Рельеф, снимки Sentinel-2 (10 м на пиксель, без облаков) и дома с лесом района сохраняются в памяти браузера — тогда тренажёр работает и без интернета. В сети снимки по-прежнему детальные (Esri); без сети — сохранённые.</p>
+    <div class="off-row">
+      <button data-a="one">Скачать район «${esc(region.title)}»</button>
+      <button data-a="all">Скачать все районы</button>
+      <button data-a="stop" hidden>Остановить</button>
+      <label><input type="checkbox" data-a="auto"> докачивать открытый район в фоне</label>
+    </div>
+    <div class="off-progress" hidden><progress max="1" value="0"></progress> <span></span></div>
+    <dl class="off-info">
+      <dt>Этот район</dt><dd data-f="saved">…</dd>
+      <dt>Занято браузером</dt><dd data-f="storage">…</dd>
+    </dl>
+    <p class="note">${esc(S2_ATTRIBUTION)}. <button class="linkish" data-a="clear">Удалить сохранённое</button></p>`;
+  const q = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+  const auto = q<HTMLInputElement>('[data-a="auto"]');
+  auto.checked = autoDownload();
+  auto.addEventListener('change', () => {
+    setAutoDownload(auto.checked);
+    if (auto.checked) offlineQueue.add([region]);
+  });
+  const plan = regionPlan(region);
+  let savedText = '…';
+  const refresh = async () => {
+    const [saved, use] = await Promise.all([regionSaved(region), storageUse()]);
+    const full = saved.have === saved.total;
+    savedText = full ? `<span class="ok">сохранён</span> (${saved.total} тайлов)` : saved.have ? `<span class="warn">сохранён частично</span>: ${saved.have} из ${saved.total} тайлов` : `не сохранён — около ${mb(plan.bytes)}`;
+    q('[data-f="saved"]').innerHTML = savedText;
+    q('[data-f="storage"]').innerHTML = use ? `${mb(use.usage)} из ${mb(use.quota)}${use.persisted ? ' · браузер не сотрёт при нехватке места' : ''}` : 'браузер не сообщает';
+    q<HTMLButtonElement>('[data-a="one"]').textContent = full ? `Проверить район «${region.title}»` : saved.have ? `Докачать район «${region.title}»` : `Скачать район «${region.title}» (~${mb(plan.bytes)})`;
+  };
+  const show = () => {
+    const s = offlineQueue.state;
+    const net = !tileEnv().offline;
+    q<HTMLButtonElement>('[data-a="one"]').disabled = !net || s.running;
+    q<HTMLButtonElement>('[data-a="all"]').disabled = !net || s.running;
+    q<HTMLButtonElement>('[data-a="stop"]').hidden = !s.running;
+    const bar = q('.off-progress');
+    const p = s.progress;
+    bar.hidden = !p && !s.last;
+    q<HTMLProgressElement>('progress').hidden = !p;
+    if (p) q<HTMLProgressElement>('progress').value = p.total ? p.done / p.total : 0;
+    q('.off-progress span').textContent = p
+      ? `${p.region}: ${p.done} из ${p.total}${p.bytes ? ` · ${mb(p.bytes)}` : ''}${p.failed ? ` · ошибок ${p.failed}` : ''}${s.queued.length ? ` · дальше: ${s.queued.join(', ')}` : ''}`
+      : s.last
+        ? `${s.last.region}: ${s.last.text}`
+        : '';
+    if (!net && !s.running) q('.off-progress span').textContent = 'Нет сети — скачать нельзя; работают уже сохранённые районы.';
+    if (!net) bar.hidden = false;
+  };
+  let wasRunning = false;
+  offlineQueue.onChange(() => {
+    show();
+    if (wasRunning && !offlineQueue.state.running && !root.closest('[hidden]')) void refresh();
+    wasRunning = offlineQueue.state.running;
+  });
+  root.addEventListener('click', (e) => {
+    const a = (e.target as HTMLElement).closest<HTMLElement>('[data-a]')?.dataset['a'];
+    if (a === 'one') offlineQueue.add([region]);
+    else if (a === 'all') offlineQueue.add([region, ...downloadableRegions().filter((r) => r.id !== region.id)]);
+    else if (a === 'stop') offlineQueue.cancel();
+    else if (a === 'clear' && confirm('Удалить сохранённые рельеф и снимки всех районов? Без сети они станут недоступны.')) {
+      offlineQueue.cancel();
+      void clearSaved().then(refresh);
+    }
+  });
+  show();
+  return {
+    refresh: async () => {
+      show();
+      await refresh().catch(() => undefined);
+    },
+  };
 }

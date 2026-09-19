@@ -16,8 +16,16 @@ import { RcSticks } from './ui/rcSticks';
 import { SearchMode } from './ui/searchMode';
 import { loadLastLog, saveLastLog } from './ui/logStore';
 import { placeOsm } from './ui/placeOsm';
-import { osmUrlFor } from './ui/tileSource';
+import { osmUrlFor, S2_ATTRIBUTION, tileEnv } from './ui/tileSource';
 import { createPacksPanel } from './ui/packsPanel';
+import { createCoursePanel } from './ui/coursePanel';
+import { InstructorStation } from './ui/instructorStation';
+import { INSTRUCTOR_PREFIX } from './game/remarks';
+import { activeStudent, judgeExercise, loadCourse, recordFlight, saveCourse, type Exercise } from './game/course';
+import { summarize } from './game/recorder';
+import { bearingDeg, lineOfSight, lineProfile } from './game/profile';
+import { exportFrames } from './ui/frameExport';
+import { autoDownload, offlineQueue } from './ui/regionDownload';
 import { blocked, preflightChecks, type Check } from './game/preflight';
 import { actualWeather, PRECIPITATION_NAME, weatherPreset, type WeatherPresetKind } from './game/weather';
 import { fetchForecast, fetchLiveWeather, type LiveWeather } from './game/liveWeather';
@@ -29,7 +37,7 @@ import { FlightRecorder, poseOf, stateAt, type Recording } from './game/recorder
 import { assessFlight, FAILURE_TITLES, findDifficulty, planFailures, saveResult, type Assessment, type DifficultyId, type FailureEvent } from './game/scoring';
 import { Debrief, openRecordingFiles } from './ui/debrief';
 import { PilotInput } from './ui/pilotInput';
-import { failureInfo, linkLossText, type FailureId } from './sim/failures';
+import { FAILURES, failureInfo, linkLossText, type FailureId } from './sim/failures';
 import type { Alert } from './ui/gcs';
 import { AIRCRAFT } from './sim/aircraft';
 import { LiveFlight, MODE_NAMES, type Controls } from './sim/flight';
@@ -140,6 +148,13 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   let settings: Settings = { ...scenario.defaults };
   let forecastError = true;
   let daySeed = 1;
+  /** Билет занятия (случайный на каждую попытку или заданный) — см. resetFlight. */
+  let ticket = 1;
+  let ticketFixed: number | null = null;
+  /** Номер билета для записи и протокола: «номер/день» — день задаёт ошибку прогноза и турбулентность. */
+  const ticketText = () => `${ticket}/${daySeed}`;
+  /** Зерно k-й случайности занятия из номера билета. */
+  const ticketSeed = (k: number) => (Math.imul(ticket, 0x9e3779b1) ^ Math.imul(k, 0x85ebca6b)) >>> 1;
   let forecast!: Weather;
   let actual!: Weather;
   // Наземные группы: расчёт у НСУ, спасатели и пожарные к отметкам (groundTeams.ts).
@@ -260,6 +275,12 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   // Режим: тренировка, штатный, сложный, зачёт — погода, обязательная подготовка, отказы.
   let difficultyId: DifficultyId = 'train';
   let failurePlan: FailureEvent[] = [];
+  /** Идёт упражнение курса (выставлено окном «Курс»); ручная смена задания или режима — прерывает. */
+  let exercise: Exercise | null = null;
+  /** Пульт инструктора (создаётся ниже, когда готовы полёт и запись). */
+  let station: InstructorStation | undefined;
+  /** Сообщение руководителя полётов оператору — тревогой на НСУ до until (performance.now). */
+  let rpMessage: { text: string; until: number } | null = null;
   let injected: FailureEvent[] = [];
   let takeoffT = 0;
   let endT: number | null = null;
@@ -365,7 +386,10 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   const gcs = createGcs(app, SCENARIOS, {
     onScenario(id) {
       const sc = SCENARIOS.find((x) => x.id === id);
-      if (sc && !started) loadScenario(sc);
+      if (sc && !started) {
+        endExercise('выбрано другое задание');
+        loadScenario(sc);
+      }
     },
     onAreaDraw: () => drawSurveyArea(),
     onSettings(s) {
@@ -393,6 +417,20 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     },
     onNewDay() {
       daySeed++;
+      replan();
+    },
+    onTicket(text) {
+      if (started) return gcs.log(flight.state.t, 'Билет меняется до взлёта', 'warn');
+      if (text === null) {
+        ticketFixed = null;
+        gcs.log(0, 'Билет — случайный на каждую попытку');
+      } else {
+        const m = /^\s*(\d{1,6})\s*(?:[/\-·]\s*(\d{1,4}))?\s*$/u.exec(text);
+        if (!m) return gcs.log(0, 'Билет: номер или «номер/день», например 48213/3', 'warn');
+        ticketFixed = +m[1]!;
+        if (m[2]) daySeed = +m[2];
+        gcs.log(0, `Билет ${ticketFixed}/${daySeed}: отказы, цели и погода — как в этом билете`);
+      }
       replan();
     },
     onCommand: command,
@@ -448,21 +486,28 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       if (err) gcs.log(s.t, err, 'warn');
     },
     onInject(id) {
-      const s = flight.state;
-      flight.inject(id as FailureId);
-      injected.push({ t: s.t, id });
-      rec.event(s.t, `Отказ (инструктор): ${failureInfo(id as FailureId).title}`, 'bad');
+      injectFailure(id);
+    },
+    onStation() {
+      return station?.toggle() ?? false;
     },
     onRestore(id) {
-      const s = flight.state;
-      if (!flight.restore(id)) return;
-      // В зоне помех отказ снят, но связь или ГНСС вернутся только после выхода из неё.
-      const jammed = (id === 'link' ? s.ew.linkJam : s.ew.gnssJam) >= EW_EFFECT_THRESHOLD;
-      const text = `${id === 'link' ? 'Отказ связи снят' : 'Отказ ГНСС снят'}${jammed ? ' — но борт в зоне помех: восстановится после выхода из неё' : ''}`;
-      gcs.log(s.t, text);
-      rec.event(s.t, text, 'info');
+      restoreFailure(id);
+    },
+    onCourse() {
+      coursePanel.toggle();
+    },
+    onRuler() {
+      rulerEnds = null;
+      showRuler();
+      gcs.openWindow('ruler');
+      map.startRuler((a, b) => {
+        rulerEnds = { a, b };
+        showRuler();
+      });
     },
     onDifficulty(id) {
+      endExercise('изменён режим');
       const d = findDifficulty(id);
       difficultyId = d.id;
       // Тренировка — погода как в задании; остальные режимы задают свою.
@@ -637,7 +682,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   // Камера на подвесе: в поиске и патруле — тепловизор, в перелёте, облёте и доставке — дневная по кнопке.
   const pipEl = gcs.viewEl.parentElement!.querySelector<HTMLElement>('.pip')!;
   const gimbal = new Gimbal();
-  const gwin = new GimbalWindow(pipEl, gcs.viewEl, gimbal, { onClick: (x, y, shift) => gimbalClick(x, y, shift) });
+  const gwin = new GimbalWindow(pipEl, gcs.viewEl, gimbal, { onClick: (x, y, shift) => gimbalClick(x, y, shift), onRange: () => rangeShot() });
   /** Поле зрения дневной камеры подвеса без зума, °. */
   const DAY_FOV_DEG = 40;
   let gimbalLabelFrame = 0;
@@ -652,6 +697,14 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   // Нижняя половина правой части — кадр камеры подвеса (setDock, presentDock).
   const viewPane = gcs.viewEl.parentElement!;
   const dockEl = viewPane.querySelector<HTMLElement>('.cam-dock')!;
+  // Подпись сохранённых снимков Sentinel-2 в 3D-окне — как только они появились (лицензия CC BY).
+  const viewAttr = viewPane.querySelector<HTMLElement>('.view-attr')!;
+  const attrTimer = setInterval(() => {
+    if (!world.savedImageryShown) return;
+    viewAttr.textContent = `Снимки: ${S2_ATTRIBUTION}`;
+    viewAttr.hidden = false;
+    clearInterval(attrTimer);
+  }, 2000);
   const dockCanvas = dockEl.querySelector('canvas')!;
   const dockCtx = dockCanvas.getContext('2d')!;
   let dockOn = false;
@@ -698,6 +751,25 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
         : buildPlaceOsm(),
     )
     .catch((e) => console.warn('Дома и лес не загрузились:', e));
+  // Открытый район — в память браузера для работы без сети (рельеф, снимки Sentinel-2, OSM): в фоне,
+  // когда сцена уже загрузилась; скачанное не качается повторно. Отключается в «Районы и карты».
+  const saveData = (navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData;
+  if (ACTIVE_REGION.id !== LOG_REGION_ID && autoDownload() && !tileEnv().offline && !saveData && !tileEnv().desktop)
+    setTimeout(() => {
+      let told = false;
+      const off = offlineQueue.onChange(() => {
+        const s = offlineQueue.state;
+        if (s.progress && s.progress.bytes > 0 && !told) {
+          told = true;
+          gcs.log(0, `Район «${ACTIVE_REGION.title}» сохраняется в памяти браузера для работы без сети — в фоне, ход в «Районы и карты»`);
+        }
+        if (!s.running) {
+          off();
+          if (told && s.last) gcs.log(0, `Район «${s.last.region}» для работы без сети: ${s.last.text}`);
+        }
+      });
+      offlineQueue.add([ACTIVE_REGION]);
+    }, 15_000);
 
   /** Дома, лес, дороги и вода места без готового файла — из OpenStreetMap в браузере (src/ui/placeOsm.ts). */
   function buildPlaceOsm(): Promise<void> {
@@ -729,8 +801,10 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   const map = new Map2D(gcs.mapEl, siteA);
   map.onZoneContext = (id) => applyZones(zones.filter((z) => z.id !== id));
   map.onRelayContext = (i) => applyRelays(relays.filter((_, k) => k !== i));
-  // Окно «Районы и карты»: пакеты для работы без сети.
+  // Окно «Районы и карты»: пакеты и скачивание районов для работы без сети.
   const packsPanel = createPacksPanel();
+  // Курс подготовки: упражнение выставляет задание, режим, погоду и отказы; итог — в журнал курсанта.
+  const coursePanel = createCoursePanel({ onStart: (ex) => startExercise(ex) });
   map.setZones(zones);
   world.setZones(zones);
   gcs.setZones(zoneItems());
@@ -1111,6 +1185,136 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     return { east: Math.sin(to) * w.speedMs, north: Math.cos(to) * w.speedMs };
   };
 
+  /** Снять отказ связи или ГНСС (инструктор). */
+  function restoreFailure(id: 'link' | 'gnss') {
+    const s = flight.state;
+    if (!flight.restore(id)) return;
+    // В зоне помех отказ снят, но связь или ГНСС вернутся только после выхода из неё.
+    const jammed = (id === 'link' ? s.ew.linkJam : s.ew.gnssJam) >= EW_EFFECT_THRESHOLD;
+    const text = `${id === 'link' ? 'Отказ связи снят' : 'Отказ ГНСС снят'}${jammed ? ' — но борт в зоне помех: восстановится после выхода из неё' : ''}`;
+    gcs.log(s.t, text);
+    rec.event(s.t, text, 'info');
+  }
+
+  /** Отказ от инструктора (окно «Инструктор» или пульт инструктора). */
+  function injectFailure(id: string) {
+    const s = flight.state;
+    flight.inject(id as FailureId);
+    injected.push({ t: s.t, id });
+    rec.event(s.t, `Отказ (инструктор): ${failureInfo(id as FailureId).title}`, 'bad');
+  }
+
+  // Пульт инструктора — отдельное окно: состояние, карта, отказы по условию, сообщения, замечания.
+  station = new InstructorStation({
+    failures: FAILURES.map((f) => ({ id: f.id, title: f.title })),
+    inject: (id) => injectFailure(id),
+    restore: (id) => restoreFailure(id),
+    message(text) {
+      const t = flight.state.t;
+      rpMessage = { text, until: performance.now() + 30_000 };
+      gcs.log(t, `Руководитель полётов: ${text}`, 'warn');
+      rec.event(t, `Руководитель полётов → оператору: ${text}`, 'info');
+    },
+    remark(text, level) {
+      const t = flight.state.t;
+      rec.event(t, `${INSTRUCTOR_PREFIX}${text}`, level === 'bad' ? 'bad' : level === 'good' ? 'info' : 'warn');
+    },
+    status() {
+      const s = flight.state;
+      const tele = flight.telemetry;
+      const student = activeStudent(loadCourse());
+      return {
+        t: s.t,
+        airborne: airborne(),
+        mode: s.mode,
+        modeName: MODE_NAMES[s.mode],
+        aglM: s.aglM,
+        iasMs: s.iasMs,
+        groundSpeedMs: s.groundSpeedMs,
+        soc: s.soc,
+        linkLost: s.linkLost,
+        linkQuality: s.linkQuality,
+        failures: s.failures.map((id) => failureInfo(id).title),
+        truth: { east: s.east, north: s.north, headingDeg: s.headingDeg },
+        gcs: { east: tele.east, north: tele.north },
+        windMs: s.wind.speedMs,
+        windFromDeg: s.wind.fromDeg,
+        task: scenario.title,
+        mode2: findDifficulty(difficultyId).title,
+        exercise: exercise?.title ?? null,
+        student: student?.name ?? null,
+        plan: mission.stages.map((st) => [st.takeoff, ...st.waypoints, st.landing].map((p) => toLocal(siteA, p))),
+        home: { east: 0, north: 0 },
+        landing: { east: flight.landing.east, north: flight.landing.north },
+        events: rec.recentEvents(12),
+      };
+    },
+  });
+
+  /** Начать упражнение курса: задание района нужного вида, режим, погода, заданные отказы. */
+  function startExercise(ex: Exercise) {
+    if (started) return gcs.log(flight.state.t, 'Упражнение начинается до взлёта — сначала «Начать заново»', 'warn');
+    const sc = SCENARIOS.find((s) => s.kind === ex.scenario);
+    if (!sc) return gcs.log(0, `В районе «${ACTIVE_REGION.title}» нет задания для упражнения «${ex.title}» — выберите другой район`, 'warn');
+    const d = findDifficulty(ex.difficulty);
+    difficultyId = d.id;
+    gcs.setDifficulty(d.id);
+    // Ветер упражнения — ползунками задания; без него — погода режима.
+    weatherSource = d.id === 'train' || ex.settings?.windSpeedMs !== undefined ? 'scenario' : d.weather;
+    gcs.setWeatherSource(weatherSource);
+    exercise = ex;
+    gcs.setExercise(`Курс: «${ex.title}» — зачёт от ${ex.pass.minScore} баллов`);
+    loadScenario(sc);
+    if (ex.settings) {
+      settings = { ...settings, ...ex.settings };
+      gcs.loadScenario(scenario, settings, forecastError);
+      replan();
+    }
+    gcs.openWindow('task');
+    const s = activeStudent(loadCourse());
+    gcs.log(0, `Упражнение «${ex.title}» (${s ? `курсант ${s.name}` : 'без курсанта — итог не засчитывается'}): ${ex.goal}`);
+  }
+
+  function endExercise(why: string) {
+    if (!exercise || started) return;
+    gcs.log(0, `Упражнение «${exercise.title}» прервано: ${why}`, 'warn');
+    exercise = null;
+    gcs.setExercise(null);
+  }
+
+  /** Итог полёта — в журнал курсанта; у упражнения — сдано или нет. */
+  function accountCourse(r: Recording, a: Assessment) {
+    const store = loadCourse();
+    const student = activeStudent(store);
+    const sum = summarize(r);
+    const crashed = !!sum.touchdown?.crashed || r.samples.some((x) => x.mode === 'crashed');
+    let landings = 0;
+    for (let i = 1; i < r.samples.length; i++) if (r.samples[i]!.mode === 'landed' && r.samples[i - 1]!.mode !== 'landed') landings++;
+    const verdict = exercise ? judgeExercise(exercise, a, crashed) : null;
+    if (exercise && verdict) {
+      const t = flight.state.t;
+      if (verdict.passed) gcs.log(t, `Упражнение «${exercise.title}» сдано${student ? '' : ' (без курсанта — не засчитано)'}`, 'info');
+      else gcs.log(t, `Упражнение «${exercise.title}» не сдано: ${verdict.reasons.join('; ')}`, 'warn');
+    }
+    if (!student) return;
+    recordFlight(student, {
+      at: recStartedAt,
+      ...(exercise ? { exerciseId: exercise.id } : {}),
+      task: scenario.title,
+      region: ACTIVE_REGION.title,
+      difficulty: findDifficulty(difficultyId).title,
+      airborneS: sum.airborneS,
+      distanceKm: sum.distanceM / 1000,
+      landings,
+      failures: injected.map((f) => FAILURE_TITLES[f.id] ?? f.id),
+      score: a.total,
+      passed: verdict ? verdict.passed : null,
+      crashed,
+    });
+    saveCourse(store);
+    coursePanel.refresh();
+  }
+
   function resetFlight() {
     rec.reset();
     recStartedAt = new Date().toISOString();
@@ -1119,7 +1323,11 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     injected = [];
     lastAssessment = null;
     // Отказы разыгрываются заново на каждую попытку — зачёт не выучить наизусть.
-    failurePlan = planFailures(findDifficulty(difficultyId), Math.floor(Math.random() * 2 ** 31), planned.durationS);
+    station?.reset();
+    // Билет: номер задаёт отказы, людей и очаги, погоду в полёте; тот же номер — то же занятие.
+    ticket = ticketFixed ?? 1 + Math.floor(Math.random() * 99_999);
+    gcs.setTicket(ticketText());
+    failurePlan = exercise?.failures ? exercise.failures.map((f) => ({ ...f })) : planFailures(findDifficulty(difficultyId), ticketSeed(1), planned.durationS);
     frames = [];
     // Подвес — к началу задания: в поиске и патруле тепловизор под наклоном задания, иначе — вперёд-вниз.
     const thermal = scenario.kind === 'search' || scenario.kind === 'fire';
@@ -1146,7 +1354,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
                 sendTeam(m, 'rescue', t);
               },
             },
-            { difficulty: difficultyId, seed: Math.floor(Math.random() * 2 ** 31) },
+            { difficulty: difficultyId, seed: ticketSeed(2) },
           )
         : null;
     // Пожары — тоже заново на каждую попытку.
@@ -1179,7 +1387,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
                 sound.alarm(reveal && good ? 'prepStep' : 'shutter');
               },
             },
-            { difficulty: difficultyId, seed: Math.floor(Math.random() * 2 ** 31), wind: windAt(actual, 10) },
+            { difficulty: difficultyId, seed: ticketSeed(3), wind: windAt(actual, 10) },
           )
         : null;
     announced = false;
@@ -1193,7 +1401,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     const wxKind = settings.weatherEvent ?? 'none';
     const pts = mission.stages.flatMap((p) => p.waypoints).map((p) => toLocal(siteA, p));
     const target = pts.length ? { east: pts.reduce((a, p) => a + p.east, 0) / pts.length, north: pts.reduce((a, p) => a + p.north, 0) / pts.length } : { east: 0, north: 0 };
-    wxEvent = wxKind === 'none' ? null : new WeatherEvent(wxKind, actual, { seed: daySeed * 131 + Math.floor(Math.random() * 1000), target });
+    wxEvent = wxKind === 'none' ? null : new WeatherEvent(wxKind, actual, { seed: daySeed * 131 + (ticketSeed(4) % 1000), target });
     wxNotes.clear();
     wxKey = '';
     wxAt = 0;
@@ -1390,6 +1598,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       source: 'sim',
       landing: { east: flight.landing.east, north: flight.landing.north },
       difficulty: difficultyId,
+      ticket: ticketText(),
       zones,
     });
   }
@@ -1431,6 +1640,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       durationS: s.t,
     });
     gcs.log(s.t, `Оценка: ${a.total} из 100 — ${a.grade}`, a.total >= 60 ? 'info' : 'warn');
+    accountCourse(r, a);
     openDebrief(r, a, ctx, true);
   }
 
@@ -1456,6 +1666,15 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
                   `Кадров ${shot.length}, годных ${shot.filter((f) => f.ok).length}${blur ? `, смаз ${blur}` : ''}${dark ? `, недодержка ${dark}` : ''}. ` +
                   `Пиксель ортофото ${fmt(o.pixelM * 100, 0)} см. ${gap ? `Без покрытия ${gap} % участка — тёмные пятна внутри жёлтой границы.` : 'Участок покрыт целиком.'}`;
                 return { url: o.canvas.toDataURL('image/png'), text, fileName: `orthophoto-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.png` };
+              } finally {
+                videoBusy = false;
+              }
+            },
+            exportFrames: async (onProgress) => {
+              if (videoBusy) throw new Error('идёт запись видео');
+              videoBusy = true;
+              try {
+                return await exportFrames({ world, frames: [...frames], cam, site: siteA, startedAt: new Date(r.meta.startedAt), make: 'VTOL-sim', onProgress });
               } finally {
                 videoBusy = false;
               }
@@ -1776,6 +1995,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
         airborne() && tele.groundSpeedMs > 3 ? fromLocal(siteA, tele.east + Math.sin(tr) * ahead, tele.north + Math.cos(tr) * ahead) : undefined,
       );
       const alerts: Alert[] = [];
+      if (rpMessage && performance.now() < rpMessage.until) alerts.push({ level: 'warn', text: `РУКОВОДИТЕЛЬ ПОЛЁТОВ: ${rpMessage.text}` });
       if (s.linkLost) alerts.push({ level: 'bad', text: `НЕТ СВЯЗИ с бортом ${fmtTime(s.t - tele.t)} — ${linkLossText(settings.linkLossAction, settings.linkLossTimeoutS)}` });
       for (const id of s.failures) {
         const f = failureInfo(id);
@@ -2148,6 +2368,101 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     return { lost: s.linkLost, quality: s.linkLost ? 0 : s.link.quality, loss: s.link.loss };
   }
 
+  /** Последний замер дальномера — в служебной информации видео 15 с. */
+  let lrf: { text: string; until: number } | null = null;
+
+  /** Лазерный дальномер подвеса: дальность до точки в перекрестии, её координаты и высота. */
+  function rangeShot() {
+    const t = flight.state.t;
+    const f = searchMode?.frame ?? fireMode?.frame ?? (airborne() ? gimbal.frame(flight.state, DAY_FOV_DEG) : null);
+    if (!f) return gcs.log(t, 'Дальномер: аппарат на земле', 'warn');
+    const dir = { east: f.look.east - f.eye.east, north: f.look.north - f.eye.north, up: f.look.up - f.eye.up };
+    const hit = marchToGround(f.eye, dir, (e, n) => world.groundAt(e, n), 10000);
+    if (!hit) {
+      lrf = { text: 'ДАЛ ---- (нет отражения)', until: performance.now() + 15_000 };
+      return gcs.log(t, 'Дальномер: нет отражения — перекрестие выше горизонта или дальше 10 км', 'warn');
+    }
+    const slant = Math.hypot(hit.east - f.eye.east, hit.north - f.eye.north, hit.up - f.eye.up);
+    const horiz = Math.hypot(hit.east - f.eye.east, hit.north - f.eye.north);
+    const az = ((Math.atan2(hit.east - f.eye.east, hit.north - f.eye.north) * 180) / Math.PI + 360) % 360;
+    const g = fromLocal(siteA, hit.east, hit.north);
+    const alt = siteA.elevationM + hit.up;
+    const text = `Дальномер: ${Math.round(slant)} м (по горизонтали ${Math.round(horiz)} м), азимут ${Math.round(az)}°, точка ${g.lat.toFixed(5)}° ${g.lon.toFixed(5)}°, высота ${Math.round(alt)} м`;
+    gcs.log(t, text);
+    rec.event(t, text, 'cmd');
+    map.setRangeMark(g, `${Math.round(slant)} м · ${Math.round(alt)} м`);
+    lrf = { text: `ДАЛ ${Math.round(slant)} м  ГОР ${Math.round(horiz)} м  ВЫС ${Math.round(alt)} м`, until: performance.now() + 15_000 };
+  }
+
+  /** Линейка: профиль рельефа и прямая видимость между концами; высоты антенн — в окне. */
+  let rulerEnds: { a: GeoPoint; b: GeoPoint } | null = null;
+  let rulerH = { a: 3, b: 150 };
+  function showRuler() {
+    const el = gcs.rulerEl;
+    if (!rulerEnds) {
+      el.innerHTML = '<p class="hint">Щёлкните на карте начало и конец линии. Esc — отмена.</p>';
+      return;
+    }
+    const { a, b } = rulerEnds;
+    const prof = lineProfile(a, b, (p) => terrain.elevationM(p));
+    const sight = lineOfSight(prof, rulerH.a, rulerH.b);
+    const len = prof[prof.length - 1]!.d;
+    const az = bearingDeg(a, b);
+    const hMax = Math.max(...prof.map((p) => p.h));
+    const km = (m: number) => (m >= 1000 ? `${(m / 1000).toFixed(2).replace('.', ',')} км` : `${Math.round(m)} м`);
+    el.innerHTML = `
+      <table class="kv"><tr><td>Расстояние</td><td>${km(len)}</td></tr>
+      <tr><td>Азимут / обратный</td><td>${Math.round(az)}° / ${Math.round((az + 180) % 360)}°</td></tr>
+      <tr><td>Высота начала / конца</td><td>${Math.round(prof[0]!.h)} м / ${Math.round(prof[prof.length - 1]!.h)} м (наибольшая ${Math.round(hMax)} м)</td></tr>
+      <tr><td>Прямая видимость</td><td>${sight.clear ? `<b class="ok">есть</b>, запас ${Math.round(sight.clearanceM)} м` : `<b class="bad">нет</b> — рельеф выше луча на ${Math.round(-sight.clearanceM)} м в ${km(sight.worstD)} от начала`}</td></tr></table>
+      <div class="ruler-h"><label>Антенна в начале, м <input type="number" min="0" max="3000" step="1" data-rh="a" value="${rulerH.a}"></label><label>В конце (аппарат), м <input type="number" min="0" max="3000" step="10" data-rh="b" value="${rulerH.b}"></label></div>
+      <canvas class="ruler-chart" width="880" height="260"></canvas>
+      <p class="hint">Высоты — над рельефом. Земля с рефракцией (k = 4/3) «поднимается» к середине трассы: на 30 км — около 13 м. Связь с аппаратом за грядой — выше или через ретранслятор.</p>`;
+    el.querySelectorAll<HTMLInputElement>('[data-rh]').forEach((i) =>
+      i.addEventListener('change', () => {
+        rulerH = { ...rulerH, [i.dataset['rh']!]: Math.max(0, +i.value || 0) };
+        showRuler();
+      }),
+    );
+    const c = el.querySelector<HTMLCanvasElement>('canvas')!;
+    const g = c.getContext('2d')!;
+    const W = c.width;
+    const H = c.height;
+    const bulge = (d: number) => (d * (len - d)) / (2 * (4 / 3) * 6_371_000);
+    const za = prof[0]!.h + rulerH.a;
+    const zb = prof[prof.length - 1]!.h + rulerH.b;
+    const lo = Math.min(...prof.map((p) => p.h)) - 10;
+    const hi = Math.max(za, zb, ...prof.map((p) => p.h + bulge(p.d))) + 20;
+    const x = (d: number) => 40 + ((W - 50) * d) / (len || 1);
+    const y = (h: number) => H - 24 - ((H - 34) * (h - lo)) / (hi - lo || 1);
+    g.clearRect(0, 0, W, H);
+    g.fillStyle = 'rgba(134, 142, 150, 0.45)';
+    g.beginPath();
+    g.moveTo(x(0), y(lo));
+    for (const p of prof) g.lineTo(x(p.d), y(p.h + bulge(p.d)));
+    g.lineTo(x(len), y(lo));
+    g.closePath();
+    g.fill();
+    g.strokeStyle = sight.clear ? '#2f9e44' : '#e03131';
+    g.lineWidth = 2;
+    g.beginPath();
+    g.moveTo(x(0), y(za));
+    g.lineTo(x(len), y(zb));
+    g.stroke();
+    if (!sight.clear) {
+      g.fillStyle = '#e03131';
+      g.beginPath();
+      g.arc(x(sight.worstD), y(za + ((zb - za) * sight.worstD) / (len || 1) - sight.clearanceM), 5, 0, Math.PI * 2);
+      g.fill();
+    }
+    g.fillStyle = '#868e96';
+    g.font = '16px system-ui';
+    g.fillText(`${Math.round(hi)} м`, 2, 16);
+    g.fillText(`${Math.round(lo)} м`, 2, H - 28);
+    g.fillText('0', x(0) - 4, H - 4);
+    g.fillText(km(len), x(len) - 60, H - 4);
+  }
+
   /** Служебная информация видео: полётные данные, подвес, точка рельефа в центре кадра, связь. */
   function osdData(f: { eye: Point3; look: Point3 }, channel: string): OsdData {
     const s = flight.state;
@@ -2169,6 +2484,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
       linkQuality: s.linkLost ? 0 : s.link.quality,
       latencyS: vlink.latencyS,
       frozen: vlink.frozen,
+      ...(lrf && performance.now() < lrf.until ? { range: lrf.text } : {}),
     };
   }
 
@@ -2293,6 +2609,31 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     });
   }
 }
+
+// Приложение без сети: сервис-воркер хранит страницу и файлы сборки (public/sw.js). Только в
+// собранной версии в браузере — у настольного приложения свои файлы.
+// Файлы, загруженные до его установки (первый запуск), кладём в тот же кэш сами.
+if (import.meta.env.PROD && 'serviceWorker' in navigator && !tileEnv().desktop)
+  window.addEventListener('load', () => {
+    navigator.serviceWorker
+      .register(`${import.meta.env.BASE_URL}sw.js`)
+      .then(() => navigator.serviceWorker.ready)
+      .then(async () => {
+        const c = await caches.open('vtol-sim-app-v1');
+        const base = new URL(import.meta.env.BASE_URL, location.origin).href;
+        const built = await fetch(`${base}offline-assets.json`)
+          .then((r) => (r.ok ? (r.json() as Promise<string[]>) : []))
+          .catch(() => [] as string[]);
+        const urls = [location.origin + location.pathname, ...built.map((f) => base + f), ...performance.getEntriesByType('resource').map((e) => e.name)].filter(
+          (u) => u.startsWith(location.origin) && !u.includes('/packs/'),
+        );
+        await Promise.all([...new Set(urls)].map(async (u) => (await c.match(u, { ignoreVary: true })) ?? c.add(u).catch(() => undefined)));
+        // Файлы прошлых сборок (в списке этой их нет) — удалить.
+        const keep = new Set(built.map((f) => base + f));
+        if (keep.size) for (const r of await c.keys()) if (r.url.startsWith(`${base}assets/`) && !keep.has(r.url)) await c.delete(r);
+      })
+      .catch((e: unknown) => console.warn('Сервис-воркер не установился:', e));
+  });
 
 start().catch((e: unknown) => {
   app.innerHTML = `<div class="loading">Не удалось запустить: ${e instanceof Error ? e.message : String(e)}</div>`;

@@ -8,6 +8,7 @@ import {
   layerCovers,
   levelsFor,
   missionGeometry,
+  offlinePlan,
   packCoversBounds,
   parseManifest,
   parseZooms,
@@ -201,5 +202,20 @@ describe('разбор manifest.json', () => {
     const noLicense = { format: 'jpg', levels: levelsFor([10], [AREA]), tiles: 1, bytes: 1, source: 'X' };
     expect(() => parseManifest(manifest({ imagery: noLicense as unknown as PackManifest['imagery'] }))).toThrow(/imagery\.license/);
     expect(() => parseManifest({ ...manifest(), terrain: { levels: [{ minZoom: 12, maxZoom: 10, areas: [AREA] }], tiles: 1, bytes: 1, source: 'a', license: 'b' } })).toThrow(/уровни/);
+  });
+});
+
+describe('район для работы без сети', () => {
+  const region = { south: 67.55, north: 67.7, west: 33.5, east: 33.9 };
+  it('рельеф — уровень сетки, снимки — по уровням, с запасом 3 км, без повторов', () => {
+    const p = offlinePlan(region, [8, 9, 10, 11, 12, 13, 14]);
+    expect(new Set(p.terrain.map(([z]) => z))).toEqual(new Set([12]));
+    expect(new Set(p.imagery.map(([z]) => z))).toEqual(new Set([8, 9, 10, 11, 12, 13, 14]));
+    expect(new Set(p.imagery.map((t) => t.join('/'))).size).toBe(p.imagery.length);
+    const z14 = p.imagery.filter(([z]) => z === 14).length;
+    // Около 23 × 18 км с запасом — на z14 (≈ 1 км тайл на 67°) несколько сотен тайлов.
+    expect(z14).toBeGreaterThan(200);
+    expect(z14).toBeLessThan(1500);
+    expect(p.bytes).toBeGreaterThan(p.imagery.length * 10_000);
   });
 });

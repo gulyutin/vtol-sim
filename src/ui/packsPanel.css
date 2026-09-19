@@ -86,3 +86,51 @@
   font-size: 11px;
   word-break: break-all;
 }
+
+.packs-win .off-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+  margin: 6px 0;
+}
+
+.packs-win .off-row label {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  color: var(--muted);
+}
+
+.packs-win .off-progress {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 4px 0 8px;
+  font-size: 12px;
+}
+
+.packs-win .off-progress progress {
+  width: 180px;
+  flex: none;
+}
+
+.packs-win .off-info {
+  margin-bottom: 4px;
+}
+
+.packs-win .offline {
+  padding-bottom: 8px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid #d6d6d6;
+}
+
+.packs-win button.linkish {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+}

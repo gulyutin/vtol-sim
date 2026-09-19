@@ -106,6 +106,8 @@ export interface GimbalWindowHandlers {
   onClick(clientX: number, clientY: number, shift: boolean): void;
   /** Переключили канал: ИК или RGB (дневная камера). */
   onChannel?(ir: boolean): void;
+  /** Замер дальномером по перекрестию. */
+  onRange?(): void;
 }
 
 /**
@@ -139,6 +141,7 @@ export class GimbalWindow {
       <span class="pip-seg"><button data-g="rgb" title="Дневная камера (RGB)">RGB</button><button data-g="ir" title="Тепловизор">ИК</button></span>
       <button data-g="palette" title="Палитра тепловизора — щелчок переключает">Белый — горячо</button>
       <button data-g="track" title="Щелчок по кадру — сопровождение цели (Shift+щелчок — всегда)">Сопровождение</button>
+      <button data-g="lrf" title="Лазерный дальномер: дальность до точки в перекрестии, её координаты и высота">Дальномер</button>
       <button data-g="reset" title="Подвес вперёд-вниз, зум ×1, без сопровождения">Сброс</button>
       <output></output>`;
     pip.appendChild(this.bar);
@@ -152,6 +155,7 @@ export class GimbalWindow {
         this.ir = b.dataset.g === 'ir';
         this.h.onChannel?.(this.ir);
       }
+      if (b.dataset.g === 'lrf') this.h.onRange?.();
       if (b.dataset.g === 'palette') {
         const i = THERMAL_PALETTES.findIndex((p) => p.id === this.palette);
         this.palette = THERMAL_PALETTES[(i + 1) % THERMAL_PALETTES.length]!.id;

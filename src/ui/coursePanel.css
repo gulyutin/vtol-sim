@@ -1,0 +1,245 @@
+/* Окно «Курс подготовки» (coursePanel.ts): поверх всего, по центру сверху. */
+.win.course-win {
+  position: fixed;
+  left: 50%;
+  top: 48px;
+  transform: translateX(-50%);
+  width: min(920px, calc(100% - 16px));
+  max-height: calc(100% - 64px);
+  display: flex;
+  flex-direction: column;
+  z-index: 1100;
+  font-size: 13px;
+}
+
+.win.course-win[hidden] {
+  display: none;
+}
+
+.course-win .win-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.course-win .cw-top {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  align-items: center;
+}
+
+.course-win .cw-top label {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.course-win .cw-tabs {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+}
+
+.course-win .cw-tabs button.on {
+  border-color: var(--accent, #1c7ed6);
+  color: var(--accent, #1c7ed6);
+  font-weight: 600;
+}
+
+.course-win .cw-totals {
+  margin: 8px 0;
+  color: var(--muted);
+}
+
+.course-win .cw-totals b {
+  color: var(--fg, inherit);
+}
+
+.course-win .cw-pane[data-pane='ex'] {
+  display: grid;
+  grid-template-columns: minmax(200px, 250px) 1fr;
+  gap: 12px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.course-win .cw-pane[hidden] {
+  display: none !important;
+}
+
+.course-win .cw-list {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-right: 4px;
+}
+
+.course-win .cw-mod {
+  margin: 8px 0 2px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.course-win .cw-mod:first-child {
+  margin-top: 0;
+}
+
+.course-win .cw-ex {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  text-align: left;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.course-win .cw-ex:hover {
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.course-win .cw-ex.sel {
+  border-color: var(--accent, #1c7ed6);
+  background: rgba(28, 126, 214, 0.1);
+}
+
+.course-win .cw-ex.locked span:first-child {
+  opacity: 0.55;
+}
+
+.course-win .cw-detail {
+  overflow-y: auto;
+  padding-right: 6px;
+}
+
+.course-win .cw-detail h3 {
+  margin: 2px 0 4px;
+  font-size: 16px;
+}
+
+.course-win .cw-detail h4 {
+  margin: 12px 0 6px;
+  font-size: 13px;
+}
+
+.course-win .cw-detail p {
+  margin: 0 0 8px;
+  line-height: 1.45;
+}
+
+.course-win .cw-goal {
+  font-weight: 600;
+}
+
+.course-win .cw-pass {
+  padding: 6px 8px;
+  border-left: 3px solid var(--accent, #1c7ed6);
+  background: rgba(28, 126, 214, 0.07);
+}
+
+.course-win .cw-q {
+  margin-bottom: 10px;
+}
+
+.course-win .cw-qt {
+  font-weight: 600;
+  margin-bottom: 3px;
+}
+
+.course-win .cw-opt {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 2px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.course-win .cw-opt.right {
+  background: rgba(47, 158, 68, 0.16);
+}
+
+.course-win .cw-opt.wrong {
+  background: rgba(201, 42, 42, 0.16);
+}
+
+.course-win .cw-why {
+  margin: 3px 0 0 22px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.course-win .cw-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 10px 0 4px;
+}
+
+.course-win .cw-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.course-win .ok {
+  color: #2f9e44;
+  font-weight: 600;
+}
+
+.course-win .warn {
+  color: #e67700;
+  font-weight: 600;
+}
+
+.course-win .bad {
+  color: #e03131;
+  font-weight: 600;
+}
+
+.course-win .cw-pane[data-pane='log'] {
+  overflow: auto;
+}
+
+.course-win .cw-log-actions {
+  margin-bottom: 6px;
+}
+
+.course-win table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.course-win th,
+.course-win td {
+  padding: 4px 6px;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.3);
+  text-align: left;
+  vertical-align: top;
+}
+
+.course-win th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+@media (max-width: 640px) {
+  .course-win .cw-pane[data-pane='ex'] {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+  .course-win .cw-list {
+    max-height: 30vh;
+  }
+}

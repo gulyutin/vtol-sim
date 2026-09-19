@@ -74,6 +74,8 @@ export interface RecordingMeta {
   /** Точка посадки задания в локальных метрах — для промаха в разборе. */
   landing?: { east: number; north: number };
   difficulty?: string;
+  /** Билет занятия «номер/день»: тот же билет — те же отказы, цели и погода. */
+  ticket?: string;
   /** Запретные зоны и зоны РЭБ на конец полёта — чтобы нарисовать их в разборе. */
   zones?: Zone[];
   /**
@@ -231,6 +233,11 @@ export class FlightRecorder {
 
   event(t: number, text: string, kind: EventKind = 'info'): void {
     this.events.push({ t: round(t, 2), text, kind });
+  }
+
+  /** Последние n событий, новые первыми — для ленты пульта инструктора. */
+  recentEvents(n: number): RecordingEvent[] {
+    return this.events.slice(-n).reverse();
   }
 
   toRecording(meta: RecordingMeta): Recording {
