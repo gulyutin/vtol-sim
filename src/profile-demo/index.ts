@@ -12,6 +12,7 @@ const PAYLOAD_REF_KG = 1.0;
 
 export const PROFILE: Profile = {
   title: 'VTOL-симулятор миссии',
+  pageTitle: 'Тренажёр VTOL · Практика полета',
   modelName: 'aircraft',
   osmUrl,
 

@@ -632,7 +632,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     },
   }, { regions: [...REGIONS], regionId: ACTIVE_REGION.id });
 
-  document.title = PROFILE.title;
+  document.title = PROFILE.pageTitle ?? PROFILE.title;
   const quality = QUALITY[loadQuality()];
   // Экранный пульт — поверх 3D-вида, виден в ФЭЙЛСЕЙФе; настоящий пульт — окно «Пульт ДУ» в настройках.
   const rc = new RcSticks(gcs.viewEl.parentElement!, {

@@ -292,6 +292,8 @@ export interface RegionSpec {
 export interface Profile {
   /** Заголовок окна. */
   title: string;
+  /** Заголовок вкладки браузера, если отличается от title. */
+  pageTitle?: string;
   /** Модель аппарата: public/models/<modelName>.glb. */
   modelName: string;
   /** Дома, леса и полосы района (src/sim/osm.ts): адрес файла, `import url from './osm.bin?url'`. */
