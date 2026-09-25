@@ -1,3 +1,7 @@
+/* Токены сайта «Практика полета» (копия web/tokens.css) — в слое ниже стилей НСУ:
+   одноимённые переменные (--text, --accent) остаются за симулятором. */
+@import './brand/tokens.css' layer(brand);
+
 :root {
   --bar: #dcdcdc;
   --btn: rgba(236, 236, 236, 0.94);
@@ -56,6 +60,69 @@ body,
   background: var(--bar);
   border-bottom: 1px solid #b5b5b5;
   z-index: 1001;
+}
+
+/* Логотип школы слева в строке состояния; тёмная тема — инверсный, узкий экран — только знак */
+.brand {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding-right: var(--space-1);
+  text-decoration: none;
+}
+
+.brand img {
+  width: auto;
+}
+
+.brand-logo {
+  display: block;
+  height: 28px;
+}
+
+.brand-mark {
+  height: 24px;
+}
+
+.brand-dark,
+.brand-mark,
+:root[data-theme='dark'] .brand-light {
+  display: none;
+}
+
+:root[data-theme='dark'] .brand-dark {
+  display: block;
+}
+
+.brand-product {
+  padding-left: var(--space-3);
+  border-left: 1px solid var(--line);
+  /* .label из tokens.css */
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.3;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.brand:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+@media (max-width: 639.98px) {
+  :root .brand .brand-logo,
+  .brand-product {
+    display: none;
+  }
+  .brand .brand-mark {
+    display: block;
+  }
 }
 
 .tb {

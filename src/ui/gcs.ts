@@ -12,6 +12,9 @@ import { footprintM, type Coverage, type Frame, type SurveyCamera, type SurveyPl
 import type { MissionResult, Wind } from '../sim/types';
 import { drawAttitude, drawProfile, type ProfileData } from './instruments';
 import type { CameraMode } from './scene';
+import logoUrl from './brand/pp-logo-horizontal.svg';
+import logoInverseUrl from './brand/pp-logo-horizontal-inverse.svg';
+import markUrl from './brand/pp-mark.svg';
 
 /*
  * Интерфейс в духе НСУ: строка состояния сверху, кнопки по краям карты, плавающие окна.
@@ -391,6 +394,12 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
 
   el.innerHTML = `
   <header class="topbar">
+    <a class="brand" href="https://praktikapoleta.ru" target="_blank" rel="noopener" title="Практика полета — сайт школы">
+      <img class="brand-logo brand-light" src="${logoUrl}" alt="Практика полета" height="28">
+      <img class="brand-logo brand-dark" src="${logoInverseUrl}" alt="Практика полета" height="28">
+      <img class="brand-mark" src="${markUrl}" alt="Практика полета" height="24">
+      <span class="brand-product">Тренажёр VTOL</span>
+    </a>
     <div class="tb-group tb-mission">
       <select class="tb scen" title="Задание">${scenarios.map((s) => `<option value="${s.id}">${s.title}</option>`).join('')}</select>
       <select class="tb region" hidden></select>
