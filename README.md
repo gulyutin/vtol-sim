@@ -2,8 +2,6 @@
 
 A browser-based simulator and operator trainer for a "4+1" VTOL aircraft: four lift rotors plus a pusher propeller. It takes off and lands vertically and flies its route like an airplane. The interface follows a ground control station (GCS): a map with satellite imagery, a 3D view of the aircraft, telemetry and instruments.
 
-**Play:** https://gulyutin.github.io/vtol-sim/
-
 The in-app interface is in Russian.
 
 ## Missions
