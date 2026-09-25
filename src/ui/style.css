@@ -143,6 +143,12 @@ button.tb {
   cursor: pointer;
 }
 
+/* Режим включён (⛶ во весь экран). */
+button.tb.on {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
 .tb-group {
   display: flex;
   align-items: center;

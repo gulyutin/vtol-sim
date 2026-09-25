@@ -4,6 +4,7 @@ import { SEASONS, type SeasonId } from '../game/season';
 import { WEATHER_EVENTS, type WeatherEventKind } from '../sim/weatherEvent';
 import { EMERGENCY_COMMANDS, MODE_NAMES, type Command, type Controls, type LiveState } from '../sim/flight';
 import { CAMERAS } from '../sim/payload';
+import { createFullscreenMode } from './fullscreen';
 import { loadQuality, QUALITY, type Quality } from './quality';
 import { PREP_STEPS, type Preparation, type PrepStepId } from '../game/preparation';
 import { DIFFICULTY } from '../game/scoring';
@@ -15,6 +16,9 @@ import type { CameraMode } from './scene';
 import logoUrl from './brand/pp-logo-horizontal.svg';
 import logoInverseUrl from './brand/pp-logo-horizontal-inverse.svg';
 import markUrl from './brand/pp-mark.svg';
+
+/** Кнопка ⛶ в шапке: подсказка, пока режим выключен. */
+const FULLSCREEN_TITLE = 'Во весь экран: без адресной строки и вкладок браузера, экран не гаснет (Esc — выйти)';
 
 /*
  * Интерфейс в духе НСУ: строка состояния сверху, кнопки по краям карты, плавающие окна.
@@ -417,6 +421,7 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
       <span class="batt" title="Заряд и напряжение (оценка без просадки)">🔋 <b data-v="soc">100%</b> <small data-v="volt">50,4 В</small></span>
       <span class="power" title="Мощность">⚡ <b data-v="power">0</b> Вт</span>
       <span class="time" data-v="time">T+0:00</span>
+      <button class="tb" data-a="fullscreen" title="${FULLSCREEN_TITLE}">⛶</button>
       <button class="tb" data-a="settings" title="Настройки: графика, звук, голос">⚙</button>
     </div>
   </header>
@@ -729,10 +734,18 @@ export function createGcs(root: HTMLElement, scenarios: readonly Scenario[], h: 
   let ticketFixed = false;
   let alertsKey = '';
   let armed = false;
+  const fsButton = q<HTMLButtonElement>('[data-a="fullscreen"]');
+  const fullscreen = createFullscreenMode((on, awake) => {
+    fsButton.classList.toggle('on', on);
+    fsButton.title = on
+      ? `Выйти из режима во весь экран (Esc)${awake ? '; экран не гаснет' : awake === false ? '; браузер не дал запретить гашение экрана' : ''}`
+      : FULLSCREEN_TITLE;
+  });
   el.querySelectorAll<HTMLButtonElement>('[data-a]').forEach((b) =>
     b.addEventListener('click', () => {
       const a = b.dataset.a!;
-      if (a === 'arm') h.onCommand(armed ? 'disarm' : 'arm');
+      if (a === 'fullscreen') fullscreen.toggle();
+      else if (a === 'arm') h.onCommand(armed ? 'disarm' : 'arm');
       else if (a === 'takeoff') h.onCommand('takeoff');
       else if (a === 'unload') h.onCommand('unload');
       else if (a === 'mode' || a === 'emergency' || a === 'settings') openMenu(a, b);

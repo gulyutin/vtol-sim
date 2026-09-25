@@ -67,7 +67,7 @@ Wind near terrain: updrafts on windward slopes, downdrafts and rotor turbulence 
 
 Quality is set in the top bar (low / medium / high); choose low on weak laptops and phones.
 
-When the gimbal camera is on, the right side splits in half: the 3D view on top, the camera picture below (⤢ gives the camera the whole side). ⚙ → "Second screen" opens the gimbal video (with its on-screen display) or the 3D view in a separate browser window for a second monitor. ⚙ → "Theme" switches the GCS to a dark theme for night flights (auto — dark after sunset).
+When the gimbal camera is on, the right side splits in half: the 3D view on top, the camera picture below (⤢ gives the camera the whole side). ⚙ → "Second screen" opens the gimbal video (with its on-screen display) or the 3D view in a separate browser window for a second monitor. ⚙ → "Theme" switches the GCS to a dark theme for night flights (auto — dark after sunset). ⛶ in the top bar puts the page in full screen without the browser's address bar and tabs and keeps the screen from going dark (Screen Wake Lock) until you leave with Esc or the same button.
 
 ## Working offline
 
