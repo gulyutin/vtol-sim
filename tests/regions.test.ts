@@ -16,7 +16,7 @@ import type { GeoPoint } from '../src/sim/types';
  */
 
 /** Высота площадки над морем, м; у домашнего района — условная. */
-const SITE_ELEVATION_M: Record<string, number> = { home: 250, elbrus: 1876, khibiny: 231, baikal: 488, shotozero: 100 };
+const SITE_ELEVATION_M: Record<string, number> = { home: 250, elbrus: 1876, khibiny: 231, baikal: 488, shotozero: 100, irkutsk: 475 };
 /** Дополнительные районы профиля (PROFILE.regions) — условная высота. */
 const siteElevationM = (id: string) => SITE_ELEVATION_M[id] ?? 200;
 

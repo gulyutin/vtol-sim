@@ -5,7 +5,9 @@ import { THERMAL_PALETTES, type ThermalPalette } from './thermal';
  * Камера на подвесе: азимут относительно носа, наклон ниже горизонта и зум; сопровождение —
  * подвес держит точку на земле или движущуюся цель, пока аппарат летит. Окно подвеса — рамка
  * .pip под 3D-видом: перетаскивание поворачивает подвес, колёсико — зум, кнопки — во весь экран,
- * ИК или дневной канал, сопровождение, сброс. Сам кадр рисует World (renderPip / renderThermal).
+ * ИК или дневной канал, сопровождение, сброс. С клавиатуры — как ручкой оператора (GIMBAL_KEYS):
+ * стрелки (или IJKL) поворачивают с постоянной угловой скоростью, пропорциональной полю зрения —
+ * на большом зуме подвес идёт медленно и точно; +/− — зум. Сам кадр рисует World (renderPip / renderThermal).
  * Координаты — локальные метры от площадки: восток, север, up — над уровнем площадки.
  */
 
@@ -45,6 +47,44 @@ export interface GimbalFrame {
 /** Пределы подвеса: наклон от чуть выше горизонта до отвесно вниз, зум. */
 export const GIMBAL_TILT: readonly [number, number] = [-10, 90];
 export const GIMBAL_ZOOM: readonly [number, number] = [1, 20];
+/**
+ * Скорость поворота с клавиатуры: доля поля зрения в секунду — кадр проходит свою высоту за
+ * ~1,4 с на любом зуме; удержание дольше GIMBAL_KEY_RAMP_S — вдвое быстрее, Shift — втрое.
+ */
+export const GIMBAL_KEY_FOV_PER_S = 0.7;
+const GIMBAL_KEY_RAMP_S = 1;
+/** Зум с клавиатуры — во столько раз за секунду удержания. */
+const GIMBAL_KEY_ZOOM_PER_S = 2.5;
+/** Короткое нажатие — шаг: доля поля зрения и зум. Дальше, если держать, — плавно. */
+const GIMBAL_KEY_NUDGE_FOV = 0.05;
+const GIMBAL_KEY_NUDGE_ZOOM = 1.1;
+
+/**
+ * Клавиши подвеса (физические, как PilotInput: русская раскладка не мешает). Стрелки — у ручки
+ * ФЭЙЛСЕЙФа, когда пилотируют с клавиатуры (arrowsTaken); IJKL — всегда подвес.
+ */
+const PAN_TILT: Record<string, [number, number]> = {
+  ArrowLeft: [-1, 0],
+  ArrowRight: [1, 0],
+  ArrowUp: [0, -1],
+  ArrowDown: [0, 1],
+  KeyJ: [-1, 0],
+  KeyL: [1, 0],
+  KeyI: [0, -1],
+  KeyK: [0, 1],
+};
+const ZOOM_KEYS: Record<string, number> = { Equal: 1, NumpadAdd: 1, PageUp: 1, Minus: -1, NumpadSubtract: -1, PageDown: -1 };
+const ARROWS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']);
+
+/** Подсказка по клавишам — в title кадра и в строке под 3D-видом. */
+export const GIMBAL_KEYS_HINT = 'стрелки или IJKL — поворот (Shift — быстрее), +/− — зум, Enter — сопровождение по перекрестию, R — дальномер, V — ИК/RGB, F — во весь экран, Home — сброс';
+
+/** Ввод в поле, список, редактор — клавиши его, не подвеса. */
+function typing(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName);
+}
+
 /** Камера под фюзеляжем — чуть ниже центра аппарата, м. */
 const CAMERA_BELOW_M = 0.4;
 
@@ -127,6 +167,15 @@ export class GimbalWindow {
   private shownDay = false;
   private hasIr = false;
   private marks = false;
+  /** Нажатые клавиши поворота и зума и с какого времени, с (performance.now). */
+  private readonly held = new Map<string, number>();
+  /**
+   * Стрелки заняты ручкой: ФЭЙЛСЕЙФ с клавиатуры (PilotInput) — подвесу остаются IJKL.
+   * Ставит главный цикл каждый кадр.
+   */
+  arrowsTaken = false;
+  /** Shift держат — поворот с клавиатуры втрое быстрее. */
+  private shift = false;
 
   constructor(
     private readonly pip: HTMLElement,
@@ -143,7 +192,7 @@ export class GimbalWindow {
       <button data-g="track" title="Щелчок по кадру — сопровождение цели (Shift+щелчок — всегда)">Сопровождение</button>
       <button data-g="lrf" title="Лазерный дальномер: дальность до точки в перекрестии, её координаты и высота">Дальномер</button>
       <button data-g="reset" title="Подвес вперёд-вниз, зум ×1, без сопровождения">Сброс</button>
-      <output></output>`;
+      <output title="С клавиатуры: ${GIMBAL_KEYS_HINT}"></output>`;
     pip.appendChild(this.bar);
     this.bar.addEventListener('pointerdown', (e) => e.stopPropagation());
     this.bar.addEventListener('click', (e) => {
@@ -168,7 +217,7 @@ export class GimbalWindow {
     this.launcher = document.createElement('button');
     this.launcher.className = 'gimbal-btn';
     this.launcher.textContent = 'Подвес';
-    this.launcher.title = 'Окно камеры на подвесе — дневная (RGB) и тепловизор: поворот — перетаскиванием, зум — колёсиком';
+    this.launcher.title = `Окно камеры на подвесе — дневная (RGB) и тепловизор: поворот — перетаскиванием, зум — колёсиком; с клавиатуры: ${GIMBAL_KEYS_HINT}`;
     this.launcher.hidden = true;
     this.launcher.addEventListener('click', () => {
       this.shownDay = !this.shownDay;
@@ -214,8 +263,71 @@ export class GimbalWindow {
       { passive: false },
     );
     window.addEventListener('keydown', (e) => {
+      this.shift = e.shiftKey;
       if (e.key === 'Escape' && this.full) this.setFull(false);
+      else this.onKey(e);
     });
+    window.addEventListener('keyup', (e) => {
+      this.shift = e.shiftKey;
+      this.held.delete(e.code);
+    });
+    window.addEventListener('blur', () => {
+      this.held.clear();
+      this.shift = false;
+    });
+  }
+
+  /** Клавиши подвеса — пока окно подвеса активно и фокус не в поле ввода (карта ловит стрелки сама). */
+  private onKey(e: KeyboardEvent) {
+    if (!this.pip.classList.contains('gimbal') || e.defaultPrevented || typing(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
+    const c = e.code;
+    if (c in PAN_TILT || c in ZOOM_KEYS) {
+      if (ARROWS.has(c) && this.arrowsTaken) return;
+      if (!this.held.has(c)) {
+        this.held.set(c, performance.now() / 1000);
+        const pt = PAN_TILT[c];
+        const step = GIMBAL_KEY_NUDGE_FOV * this.lastFovDeg;
+        if (pt) this.gimbal.turn(pt[0] * step, pt[1] * step);
+        else this.gimbal.zoomBy(GIMBAL_KEY_NUDGE_ZOOM ** ZOOM_KEYS[c]!);
+      }
+    } else if (e.repeat) return;
+    else if (c === 'Enter' || c === 'NumpadEnter') {
+      // Сопровождение того, что в перекрестии: щелчок в центр кадра с Shift (всегда сопровождение).
+      const box = this.pip.getBoundingClientRect();
+      this.h.onClick(box.left + box.width / 2, box.top + box.height / 2, true);
+    } else if (c === 'KeyR') this.h.onRange?.();
+    else if (c === 'KeyV' && this.hasIr) {
+      this.ir = !this.ir;
+      this.h.onChannel?.(this.ir);
+    } else if (c === 'KeyF') this.setFull(!this.full);
+    else if (c === 'Home') this.gimbal.reset(this.gimbal.tiltDeg > 60 ? 90 : 30);
+    else return;
+    // Стрелки иначе прокручивают страницу, Enter нажимает кнопку в фокусе.
+    e.preventDefault();
+    this.sync();
+  }
+
+  /** Поворот и зум удерживаемыми клавишами; каждый кадр, dt — с. */
+  tick(dt: number) {
+    if (!this.held.size) return;
+    if (!this.pip.classList.contains('gimbal')) return this.held.clear();
+    const now = performance.now() / 1000;
+    let pan = 0;
+    let tilt = 0;
+    let zoom = 0;
+    let heldS = 0;
+    for (const [code, since] of this.held) {
+      const pt = PAN_TILT[code];
+      if (pt && !(ARROWS.has(code) && this.arrowsTaken)) {
+        pan += pt[0];
+        tilt += pt[1];
+        heldS = Math.max(heldS, now - since);
+      } else zoom += ZOOM_KEYS[code] ?? 0;
+    }
+    const rate = GIMBAL_KEY_FOV_PER_S * this.lastFovDeg * (heldS > GIMBAL_KEY_RAMP_S ? 2 : 1) * (this.shift ? 3 : 1) * dt;
+    if (pan || tilt) this.gimbal.turn(Math.sign(pan) * rate, Math.sign(tilt) * rate);
+    if (zoom) this.gimbal.zoomBy(GIMBAL_KEY_ZOOM_PER_S ** (Math.sign(zoom) * dt));
+    this.sync();
   }
 
   /** Поле зрения последнего кадра, ° — для перевода перетаскивания в углы. */

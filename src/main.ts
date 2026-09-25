@@ -1828,6 +1828,8 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
     // «Фэйлсейф» — ручное управление с ПДУ: стик каждый кадр, время без ускорения.
     const manual = flight.state.mode === 'failsafe';
     pilot.enableKeyboard(manual);
+    // Стрелки — у ручки, пока пилотируют с клавиатуры; подвесу тогда — IJKL.
+    gwin.arrowsTaken = manual && pilot.source !== 'gamepad';
     const src = pilot.source === 'gamepad' ? (pilot.device()?.standard ? 'геймпад' : 'пульт USB') : pilot.source === 'keyboard' ? 'клавиатура' : null;
     rc.show(manual, src, airborne());
     const shown = manual || rc.userShown ? rc.merge(pilot.poll()) : null;
@@ -2057,7 +2059,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
           : fireMode?.active
           ? channelLabel(fireMode.label())
           : dayGimbal()
-          ? `${gwin.ir ? 'Тепловизор' : 'Дневная камера'} подвеса · тянуть — поворот, колёсико — зум, щелчок — сопровождение`
+          ? `${gwin.ir ? 'Тепловизор' : 'Дневная камера'} подвеса · тянуть или стрелки — поворот, колёсико или +/− — зум, щелчок или Enter — сопровождение`
           : pip
           ? lastFrame
             ? `Кадр ${frames.length} · ${fmt(lastFrame.aglM)} м · GSD ${fmt(lastFrame.gsdM * 100, 2)} см · смаз ${fmt(lastFrame.blurPx, 2)} px · ISO ${fmt(lastFrame.iso)}${lastFrame.ok ? '' : ` · БРАК: ${lastFrame.reason}`}`
@@ -2070,6 +2072,7 @@ function run(terrain: Terrain, bounds: Bounds, relief: TerrainRelief) {
   function draw(dt: number) {
     // Поиск и патруль: окно подвеса с тепловизором вместо окна фотокамеры.
     const thermalMode = searchMode?.active ? searchMode : fireMode?.active ? fireMode : null;
+    gwin.tick(dt);
     const day = dayGimbal();
     const frame = thermalMode?.frame ?? day;
     const aspect = thermalMode ? thermalMode.aspect : 4 / 3;

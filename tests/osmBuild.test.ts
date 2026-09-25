@@ -43,6 +43,7 @@ describe('области запросов', () => {
       ...numbered('дороги', 9),
       ...numbered('вода', 4),
       'реки',
+      ...numbered('площадки', 4),
     ]);
     // Запас 3 км вокруг области.
     const [e0, n0, e1, n1] = plan.area;
@@ -187,10 +188,18 @@ const WATER: OverpassElement[] = [way(50, closed(LAKE), { natural: 'water' }), w
 // Река через озеро зигзагом — точки не выпадают при упрощении и не лежат на берегу.
 const RIVER = Array.from({ length: 9 }, (_, i): [number, number] => [1850 + i * 100, -800 + (i % 2) * 20]);
 const WATERWAYS: OverpassElement[] = [way(60, line(RIVER), { waterway: 'river' })];
+const PAVED: OverpassElement[] = [
+  way(70, closed(box(300, 300, 60, 40)), { amenity: 'parking', surface: 'asphalt' }),
+  way(71, closed(box(400, 300, 60, 40)), { amenity: 'parking', parking: 'underground' }),
+  way(72, closed(box(500, 300, 60, 40)), { amenity: 'parking', surface: 'grass' }),
+  way(73, closed(box(600, 300, 5, 5)), { amenity: 'parking' }),
+  way(74, closed(box(700, 300, 80, 80)), { place: 'square' }),
+];
 
 /** Ответ по тексту запроса; каждый квадрат получает всё — повторы на стыках убирает сборка. */
 function fake(q: string): OverpassElement[] {
   if (q.includes('way["building"]')) return BUILDINGS;
+  if (q.includes('"amenity"="parking"')) return PAVED;
   if (q.includes('nwr["man_made"')) return STRUCTURES;
   if (q.includes('"landuse"="forest"')) return FORESTS;
   if (q.includes('"aeroway"="runway"')) return RUNWAYS;
@@ -209,8 +218,8 @@ describe('сборка и запись', () => {
       async (q) => fake(q),
       (done, total, label) => progress.push(`${done}/${total} ${label}`),
     );
-    expect(progress[0]).toBe('0/24 дома 1/4');
-    expect(progress.at(-1)).toBe('24/24 готово');
+    expect(progress[0]).toBe('0/28 дома 1/4');
+    expect(progress.at(-1)).toBe('28/28 готово');
     expect(stats).toEqual({ dropped: 1, landmarks: 1, structures: 1, roadsDropped: 1, inside: 3 });
 
     const { bytes, sizes } = encodeOsm(data);
@@ -268,6 +277,11 @@ describe('сборка и запись', () => {
         expect(me > 2050 && me < 2350).toBe(false);
       }
     }
+
+    // Асфальт площадями: подземная, травяная и крошечная парковки пропущены.
+    expect(osm.paved).toHaveLength(2);
+    const r = osm.paved[0]!.rings[0]!;
+    for (let i = 0; i < r.length; i += 2) expect(r[i]! >= 299.9 && r[i]! <= 360.1 && r[i + 1]! >= 299.9 && r[i + 1]! <= 340.1).toBe(true);
   });
 
   it('коридор: дома у траектории далеко от площадки остаются, в стороне — нет; реки — с водой', async () => {

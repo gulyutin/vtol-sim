@@ -14,6 +14,8 @@
  *   дорога:  u8 класс, u8 флаги (1 — твёрдое покрытие, 2 — мост, 4 — освещена), varint ширина в дм, точки — осевая
  *   вода:    u8 kind, varint колец, по кольцу точки — первое внешнее, дальше дыры
  *   река:    u8 kind, varint ширина в дм, точки — осевая (только вне площадей воды)
+ *   дальше, если файл не кончился: u32 площадок, площадка: varint колец, по кольцу точки — асфальт и
+ *   плитка площадями (парковки, перроны, вертолётные площадки, площади); в файлах до 2026-09 раздела нет
  * varint — беззнаковый LEB128, zz — zigzag (0, −1, 1, −2, … → 0, 1, 2, 3, …). Разности вдвое
  * короче абсолютных i32: в том же объёме помещаются дороги и вода.
  *
@@ -83,6 +85,12 @@ export interface OsmWaterway {
   line: Float32Array;
 }
 
+/** Площадь с твёрдым покрытием: парковка, перрон, площадь — там не растут трава и деревья. */
+export interface OsmPaved {
+  /** Внешнее кольцо и дыры. */
+  rings: Float32Array[];
+}
+
 export interface OsmData {
   buildings: OsmBuilding[];
   forests: OsmForest[];
@@ -90,6 +98,7 @@ export interface OsmData {
   roads: OsmRoad[];
   water: OsmWater[];
   waterways: OsmWaterway[];
+  paved: OsmPaved[];
 }
 
 export const BUILDING_KINDS: readonly BuildingKind[] = ['house', 'apartments', 'industrial', 'other'];
@@ -295,7 +304,12 @@ function parseV2(b: Uint8Array): OsmData {
     const widthM = varint() / 10;
     waterways.push({ kind, widthM, line: points() });
   }
-  return { buildings, forests, runways, roads, water, waterways };
+  const paved: OsmPaved[] = [];
+  if (o < len) {
+    const np = u32();
+    for (let i = 0; i < np; i++) paved.push({ rings: rings() });
+  }
+  return { buildings, forests, runways, roads, water, waterways, paved };
 }
 
 function parseV1(buf: ArrayBuffer): OsmData {
@@ -354,5 +368,5 @@ function parseV1(buf: ArrayBuffer): OsmData {
     runways.push({ widthM, paved, line: points(n) });
   }
 
-  return { buildings, forests, runways, roads: [], water: [], waterways: [] };
+  return { buildings, forests, runways, roads: [], water: [], waterways: [], paved: [] };
 }

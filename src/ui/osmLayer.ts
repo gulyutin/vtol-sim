@@ -224,7 +224,10 @@ const TREE_PROJECT = /* glsl */ `vec4 mvPosition = vec4(transformed, 1.0);
 mvPosition = modelViewMatrix * mvPosition;
 gl_Position = projectionMatrix * mvPosition;`;
 
-/** Маска леса: 0 — нет, 1 — хвойный, 2 — лиственный, 3 — смешанный. */
+/**
+ * Маска леса: 0 — нет, 1 — хвойный, 2 — лиственный, 3 — смешанный. bare — в тех же ячейках 1, где
+ * земля закрыта: дома, дороги, полосы, асфальт площадями — там не растёт трава.
+ */
 interface ForestMask {
   e0: number;
   n0: number;
@@ -232,11 +235,12 @@ interface ForestMask {
   w: number;
   h: number;
   data: Uint8Array;
+  bare: Uint8Array;
 }
 
-/** Заливка колец (чёт-нечет — дыры пустые) значением code по центрам ячеек маски. */
-function fillRings(mask: ForestMask, rings: readonly Float32Array[], code: number) {
-  const { e0: minE, n0: minN, cell, w, h, data: d } = mask;
+/** Заливка колец (чёт-нечет — дыры пустые) значением code по центрам ячеек маски (или слоя d). */
+function fillRings(mask: ForestMask, rings: readonly Float32Array[], code: number, d: Uint8Array = mask.data) {
+  const { e0: minE, n0: minN, cell, w, h } = mask;
   let fMin = Infinity, fMax = -Infinity;
   for (const r of rings) {
     for (let i = 1; i < r.length; i += 2) {
@@ -376,11 +380,17 @@ function buildForestMask(data: OsmData): ForestMask | null {
   while (Math.ceil((maxE - minE) / cell + 1) * Math.ceil((maxN - minN) / cell + 1) > MASK_MAX_CELLS) cell *= 1.5;
   const w = Math.ceil((maxE - minE) / cell) + 1;
   const h = Math.ceil((maxN - minN) / cell) + 1;
-  const mask: ForestMask = { e0: minE, n0: minN, cell, w, h, data: new Uint8Array(w * h) };
+  const mask: ForestMask = { e0: minE, n0: minN, cell, w, h, data: new Uint8Array(w * h), bare: new Uint8Array(w * h) };
   const d = mask.data;
+  const bare = mask.bare;
 
   for (const f of data.forests) fillRings(mask, f.rings, f.leaf === 'needle' ? 1 : f.leaf === 'broad' ? 2 : 3);
   for (const wa of data.water) fillRings(mask, wa.rings, 0);
+  // Парковки и площади: ни деревьев, ни травы.
+  for (const p of data.paved) {
+    fillRings(mask, p.rings, 0);
+    fillRings(mask, p.rings, 1, bare);
+  }
 
   const clearBox = (e0: number, n0: number, e1: number, n1: number, keep?: (e: number, n: number) => boolean) => {
     const c0 = Math.max(0, Math.floor((e0 - minE) / cell)), c1 = Math.min(w - 1, Math.floor((e1 - minE) / cell));
@@ -403,6 +413,7 @@ function buildForestMask(data: OsmData): ForestMask | null {
       n1 = Math.max(n1, b.ring[i + 1]!);
     }
     if (e1 >= e0) clearBox(e0 - CLEAR_M, n0 - CLEAR_M, e1 + CLEAR_M, n1 + CLEAR_M);
+    fillRings(mask, [b.ring], 1, bare);
   }
   for (const rw of data.runways) {
     const reach = rw.widthM / 2 + CLEAR_M;
@@ -412,7 +423,8 @@ function buildForestMask(data: OsmData): ForestMask | null {
     }
   }
   // Просеки: шагом в полъячейки вдоль осевой — ячейки ближе половины ширины с запасом.
-  const corridor = (line: Float32Array, half: number) => {
+  // bareToo — и трава не растёт (дорога, полоса), иначе только деревья (ручей).
+  const corridor = (line: Float32Array, half: number, bareToo: boolean) => {
     const reach = half + ROAD_CLEAR_M;
     const step = cell / 2;
     for (let i = 0; i + 3 < line.length; i += 2) {
@@ -429,22 +441,24 @@ function buildForestMask(data: OsmData): ForestMask | null {
           for (let c = c0; c <= c1; c++) {
             const de = minE + (c + 0.5) * cell - e;
             if (de * de + dn * dn <= reach * reach) d[q * w + c] = 0;
+            if (bareToo && de * de + dn * dn <= half * half + (cell * cell) / 4) bare[q * w + c] = 1;
           }
         }
       }
     }
   };
-  for (const r of data.roads) corridor(r.line, r.widthM / 2);
-  for (const r of data.waterways) corridor(r.line, r.widthM / 2);
+  for (const r of data.roads) corridor(r.line, r.widthM / 2, true);
+  for (const r of data.waterways) corridor(r.line, r.widthM / 2, false);
+  for (const rw of data.runways) if (rw.paved) corridor(rw.line, rw.widthM / 2, true);
   clearBox(-SITE_CLEAR_M, -SITE_CLEAR_M, SITE_CLEAR_M, SITE_CLEAR_M, (e, nn) => e * e + nn * nn > SITE_CLEAR_M * SITE_CLEAR_M);
   return mask;
 }
 
-function maskAt(m: ForestMask, e: number, n: number): number {
+function maskAt(m: ForestMask, e: number, n: number, d: Uint8Array = m.data): number {
   const c = Math.floor((e - m.e0) / m.cell);
   const r = Math.floor((n - m.n0) / m.cell);
   if (c < 0 || r < 0 || c >= m.w || r >= m.h) return 0;
-  return m.data[r * m.w + c]!;
+  return d[r * m.w + c]!;
 }
 
 // --- полосы ---
@@ -698,8 +712,9 @@ export class OsmLayer {
     if (mask) {
       const q = this.quality as QualitySettings & { farTreeRadiusM?: number; farTreeSpacingM?: number; groundCover?: boolean };
       const at = (e: number, n: number) => maskAt(mask, e, n);
+      const bareAt = (e: number, n: number) => maskAt(mask, e, n, mask.bare) === 1;
       this.farForest.update(ce, cn, q.treeRadiusM, q.farTreeRadiusM ?? 0, q.farTreeSpacingM ?? 32, at, this.groundAt, performance.now() + FAR_BUDGET_MS);
-      if (q.groundCover) this.cover.update(ce, cn, camera.y - this.groundAt(ce, cn), u.osmSnow.value, at, this.groundAt, this.isWater);
+      if (q.groundCover) this.cover.update(ce, cn, camera.y - this.groundAt(ce, cn), u.osmSnow.value, at, this.groundAt, (e, n) => bareAt(e, n) || this.isWater(e, n));
       else this.cover.grass.visible = this.cover.bushes.visible = false;
     }
     this.lastUpdateMs = performance.now() - t0;

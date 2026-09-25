@@ -194,7 +194,20 @@ describe('parseOsm, версия 2', () => {
     const w = new Writer();
     w.magic('OSM2');
     for (let i = 0; i < 6; i++) w.u32(0);
-    expect(parseOsm(w.buffer())).toEqual({ buildings: [], forests: [], runways: [], roads: [], water: [], waterways: [] });
+    expect(parseOsm(w.buffer())).toEqual({ buildings: [], forests: [], runways: [], roads: [], water: [], waterways: [], paved: [] });
+  });
+
+  it('раздел площадок в конце — необязательный', () => {
+    const w = new Writer();
+    w.magic('OSM2');
+    for (let i = 0; i < 6; i++) w.u32(0);
+    w.u32(1);
+    w.varint(1); // колец
+    w.varint(3); // точек
+    for (const v of [0, 0, 100, 0, 0, 50]) w.zz(v); // разности в дм: (0, 0), (+10 м, 0), (0, +5 м)
+    const d = parseOsm(w.buffer());
+    expect(d.paved).toHaveLength(1);
+    expect(Array.from(d.paved[0]!.rings[0]!)).toEqual([0, 0, 10, 0, 10, 5]);
   });
 
   it('большие разности и отрицательные координаты — без потери точности', () => {

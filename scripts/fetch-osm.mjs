@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
- * Дома, леса, взлётные полосы, дороги и вода из OpenStreetMap (Overpass API) → двоичный osm.bin профиля.
+ * Дома, леса, взлётные полосы, дороги, вода и асфальт площадями (парковки, площади) из OpenStreetMap (Overpass API) → двоичный osm.bin профиля.
  *
  *   node scripts/fetch-osm.mjs --site <lat>,<lon> --bounds <south>,<west>,<north>,<east> --out <file.bin> [--cache <папка>]
  *
@@ -87,7 +87,7 @@ async function overpass(query, label) {
 
 // --- сборка и запись ---
 const { data, stats } = await buildOsm({ site: { lat: lat0, lon: lon0 }, bounds: { south, west, north, east }, minBuildingArea, buildingsRadiusM, overrides }, overpass);
-const { buildings, forests, runways, roads, water, waterways } = data;
+const { buildings, forests, runways, roads, water, waterways, paved } = data;
 const { bytes, sizes } = encodeOsm(data);
 mkdirSync(dirname(args.out), { recursive: true });
 writeFileSync(args.out, bytes);
@@ -100,5 +100,7 @@ console.log(`Полосы: ${runways.length} (с твёрдым покрытие
 console.log(`Дороги: ${roads.length}, ${km(roads)} км (${count(roads, ['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'unclassified', 'residential', 'service', 'track', 'rail'], 'cls')}), мостов: ${roads.filter((r) => r.flags & 2).length}, отброшено: ${stats.roadsDropped}`);
 console.log(`Вода: ${water.length} (${count(water, ['lake', 'river', 'reservoir', 'basin'], 'kind')})`);
 console.log(`Реки и ручьи: ${waterways.length}, ${km(waterways)} км (${count(waterways, ['river', 'stream', 'canal'], 'kind')}), отрезков внутри площадей воды: ${stats.inside}`);
+const m2 = paved.reduce((s, p) => s + p.rings.reduce((a, r, i) => a + (i ? -1 : 1) * Math.abs(r.reduce((t, _, k) => (k % 2 ? t : t + r[k] * r[(k + 3) % r.length] - r[(k + 2) % r.length] * r[k + 1]), 0)) / 200, 0), 0);
+console.log(`Площадки с покрытием (парковки, перроны, площади): ${paved.length}, ${(m2 / 1e4).toFixed(0)} га`);
 console.log(`Разделы, КБ: ${Object.entries(sizes).map(([k, v]) => `${k} ${(v / 1024).toFixed(0)}`).join(', ')}`);
 console.log(`Файл: ${args.out}, ${(bytes.length / 1024 / 1024).toFixed(2)} МБ`);

@@ -24,7 +24,7 @@ import type { GeoPoint } from './types';
 
 export const OVERPASS_ENDPOINTS: readonly string[] = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter', 'https://overpass.private.coffee/api/interpreter'];
 /** Версия сборки: меняется — кэш браузера (src/ui/placeOsm.ts) собирает заново. */
-export const OSM_BUILD_VERSION = 1;
+export const OSM_BUILD_VERSION = 2;
 
 const R = 6371000;
 const RAD = Math.PI / 180;
@@ -104,7 +104,7 @@ export type OsmProgress = (done: number, total: number, label: string) => void;
 /** Прямоугольник в локальных метрах: [восток0, север0, восток1, север1]. */
 export type Rect = [number, number, number, number];
 
-export type OsmJobKind = 'buildings' | 'structures' | 'forests' | 'runways' | 'roads' | 'water' | 'waterways';
+export type OsmJobKind = 'buildings' | 'structures' | 'forests' | 'runways' | 'roads' | 'water' | 'waterways' | 'paved';
 export interface OsmJob {
   kind: OsmJobKind;
   label: string;
@@ -152,6 +152,9 @@ interface WaterwayRec {
   widthDm: number;
   line: number[];
 }
+interface PavedRec {
+  rings: number[][];
+}
 export interface OsmBuildData {
   buildings: BuildingRec[];
   forests: ForestRec[];
@@ -159,6 +162,7 @@ export interface OsmBuildData {
   roads: RoadRec[];
   water: WaterRec[];
   waterways: WaterwayRec[];
+  paved: PavedRec[];
 }
 export interface OsmBuildStats {
   /** Отброшено мелких построек (--min-building-area). */
@@ -796,6 +800,15 @@ function place(opts: OsmBuildOptions) {
     `);out geom;`,
   );
   if (!track) add('waterways', 'реки', [area], (bb) => `[out:json][timeout:180];way["waterway"~"^(river|stream|canal)$"](${bb});out tags geom;`, false);
+  // Асфальт площадями — там, где дома: парковки, перроны, вертолётные площадки, площади. Трава и
+  // деревья на них не растут. Большой город — четырьмя квадратами, как дома.
+  add('paved', 'площадки', r > 7000 ? tiles(hull, 2) : [hull], (bb) =>
+    `[out:json][timeout:180];(` +
+    `way["amenity"="parking"](${bb});relation["amenity"="parking"]["type"="multipolygon"](${bb});` +
+    `way["aeroway"~"^(apron|helipad)$"](${bb});` +
+    `way["highway"="pedestrian"]["area"="yes"](${bb});way["place"="square"](${bb});relation["place"="square"]["type"="multipolygon"](${bb});` +
+    `);out geom;`,
+  );
   const plan: OsmPlan = { corridor: !!track, jobs, area };
 
   // --- разбор ---
@@ -1121,6 +1134,31 @@ function place(opts: OsmBuildOptions) {
     return out;
   }
 
+  /** Парковки и площади с твёрдым покрытием; подземные и многоэтажные — это дома. */
+  function paved(els: readonly OverpassElement[]): PavedRec[] {
+    const prep = (raw: number[]) => {
+      const q = quantize(simplifyRing(clipRect(raw, AREA_E0, AREA_N0, AREA_E1, AREA_N1), 1), true);
+      if (q.length / 2 < 3) return null;
+      return Math.abs(signedArea(q.map((v) => v / 10))) >= 100 ? q : null;
+    };
+    const out: PavedRec[] = [];
+    for (const el of els) {
+      const t = el.tags ?? {};
+      if (/^(underground|multi-storey|rooftop)$/.test(t.parking ?? '') || UNPAVED.has(t.surface ?? '')) continue;
+      for (const p of polygonsOf(el)) {
+        const outer = prep(p.outer);
+        if (!outer) continue;
+        const rings = [outer];
+        for (const h of p.holes) {
+          const hole = prep(h);
+          if (hole) rings.push(hole);
+        }
+        out.push({ rings });
+      }
+    }
+    return out;
+  }
+
   /** Все запросы по очереди → записи файла. */
   async function run(overpass: OverpassQuery, onProgress?: OsmProgress): Promise<{ data: OsmBuildData; stats: OsmBuildStats }> {
     let done = 0;
@@ -1165,8 +1203,9 @@ function place(opts: OsmBuildOptions) {
     const lineEls = track ? waterEls.filter(isWaterwayLine) : [];
     for (const job of of('waterways')) lineEls.push(...(await fetchOne(job)));
     const waterwayRecs = waterways(lineEls, waterRecs);
+    const pavedRecs = paved(await fetchTiled(of('paved')));
     onProgress?.(jobs.length, jobs.length, 'готово');
-    return { data: { buildings, forests: forestRecs, runways: runwayRecs, roads, water: waterRecs, waterways: waterwayRecs }, stats: { ...stats } };
+    return { data: { buildings, forests: forestRecs, runways: runwayRecs, roads, water: waterRecs, waterways: waterwayRecs, paved: pavedRecs }, stats: { ...stats } };
   }
 
   return { plan, run };
@@ -1285,5 +1324,9 @@ export function encodeOsm(d: OsmBuildData): { bytes: Uint8Array<ArrayBuffer>; si
     w.points(r.line);
   }
   section('реки');
+  // Необязательный раздел в конце: старые файлы без него читаются как прежде.
+  w.u32(d.paved.length);
+  for (const r of d.paved) w.rings(r.rings);
+  section('площадки');
   return { bytes: w.bytes(), sizes };
 }
